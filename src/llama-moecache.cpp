@@ -36,6 +36,10 @@ struct layer_state {
     std::vector<uint32_t> miss_ring; // [n_expert * admit]
     std::vector<uint8_t>  miss_pos;  // [n_expert]
     uint32_t              tok_clock = 0;
+
+    // prompt warm-up: routing counts of the large batches since the last step()
+    std::vector<uint32_t> warm_cnt; // [n_expert]
+    bool                  warm_seen = false;
 };
 
 struct upload_job {
@@ -54,6 +58,7 @@ struct moe_cache {
     uint64_t n_miss      = 0;
     uint64_t n_upload    = 0;
     uint64_t n_evict     = 0;
+    uint64_t n_warm      = 0; // uploads scheduled by the prompt warm-up (included in n_upload)
     uint64_t upload_bytes = 0;
 
     std::mutex mtx; // guards layer bookkeeping (observe runs during graph exec)
@@ -138,6 +143,29 @@ void moe_obs_cb(int32_t il, const struct ggml_tensor * ids, void * ud) {
     }
 }
 
+// custom op over the top-k ids of a large batch (runs on the CPU backend, one task)
+void moe_warm_obs_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    moe_cache * mc = g_cache;
+    const size_t idx = (size_t) (uintptr_t) ud;
+    if (ith != 0 || !mc || idx >= mc->layers.size() || a->type != GGML_TYPE_I32 || !ggml_is_contiguous(a)) {
+        return;
+    }
+    layer_state & ls = mc->layers[idx];
+
+    const int32_t * ids = (const int32_t *) a->data;
+    const int64_t   n   = ggml_nelements(a);
+
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    for (int64_t i = 0; i < n; ++i) {
+        if (ids[i] >= 0 && ids[i] < (int32_t) ls.warm_cnt.size()) {
+            ls.warm_cnt[ids[i]]++;
+        }
+    }
+    ls.warm_seen = true;
+}
+
 size_t upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, int32_t slot) {
     const size_t sz = src->nb[2];
     GGML_ASSERT(dst_c->nb[2] == sz);
@@ -173,6 +201,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     mc->params.max_inserts = std::max(1, params.max_inserts);
     mc->params.admit       = std::min(255, std::max(1, params.admit));
     mc->params.window      = std::max(1, params.window);
+    mc->params.warm        = params.warm <= 0 ? 0 : std::max(5, params.warm); // 1-4 tokens belong to the cache chain
     const int32_t n_slots = params.n_slots;
 
     // collect the host-resident expert layers, grouped by the buffer type of the device that
@@ -311,6 +340,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
         ls.expert_in_flight.assign(n_expert, false);
         ls.miss_ring.assign((size_t) n_expert*mc->params.admit, 0);
         ls.miss_pos.assign(n_expert, 0);
+        ls.warm_cnt.assign(n_expert, 0);
 
         {
             ggml_tensor * const dst[3] = { ls.pub.up_s_c, ls.pub.gate_s_c, ls.pub.down_s_c };
@@ -364,6 +394,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
 
     LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, admit %d misses / %d tokens, %.1f MiB device memory\n",
             __func__, mc->layers.size(), n_slots, mc->params.max_inserts, mc->params.admit, mc->params.window, vram/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: MoE expert cache prompt warm-up: %s (batches >= %d tokens)\n", __func__, mc->params.warm ? "on" : "off", mc->params.warm);
 }
 
 bool llama_moe_cache_active() {
@@ -379,6 +410,20 @@ const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * key) {
         return nullptr;
     }
     return &g_cache->layers[it->second].pub;
+}
+
+ggml_tensor * llama_moe_cache_build_warm_obs(ggml_context * ctx, const ggml_tensor * key, ggml_tensor * selected_experts) {
+    moe_cache * mc = g_cache;
+    if (!mc || !key || mc->params.warm <= 0 || selected_experts->ne[1] < mc->params.warm) {
+        return nullptr;
+    }
+    auto it = mc->by_key.find(key);
+    if (it == mc->by_key.end()) {
+        return nullptr;
+    }
+    // the top-k ids are a strided view of the argsort
+    ggml_tensor * ids = ggml_cont(ctx, selected_experts);
+    return ggml_map_custom1(ctx, ids, moe_warm_obs_op, 1, (void *) (uintptr_t) it->second);
 }
 
 void llama_moe_cache_step() {
@@ -409,6 +454,95 @@ void llama_moe_cache_step() {
     // 2) schedule new uploads: evict at a sync point (clear the victim's table entry now),
     //    then hand the slice copies to the worker
     bool queued = false;
+
+    // victim for `id`: an empty non-in-flight slot if any, else the LRU non-in-flight slot whose expert is not in
+    // `keep`. Evicts, marks the upload in flight and queues it; false when no slot can be taken
+    auto place = [&](size_t li, int32_t id, const std::vector<bool> * keep) -> bool {
+        layer_state & ls = mc->layers[li];
+
+        int32_t  slot = -1;
+        uint64_t best = UINT64_MAX;
+        for (int32_t s = 0; s < mc->params.n_slots; ++s) {
+            if (ls.slot_in_flight[s]) {
+                continue;
+            }
+            if (ls.slot_expert[s] < 0) { slot = s; break; }
+            if (keep && (*keep)[ls.slot_expert[s]]) {
+                continue;
+            }
+            if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
+        }
+        if (slot < 0) {
+            return false;
+        }
+
+        const int32_t victim = ls.slot_expert[slot];
+        if (victim < 0) {
+            ls.n_free--;
+        } else {
+            ls.expert_slot[victim] = -1;
+            ls.slot_expert[slot]   = -1;
+            set_table_entry(ls.pub, victim, mc->params.n_slots);
+            mc->n_evict++;
+        }
+        ls.slot_in_flight[slot]  = true;
+        ls.expert_in_flight[id]  = true;
+
+        const llama_moe_cache_layer & pub = ls.pub;
+        mc->n_upload++;
+        mc->upload_bytes += pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
+
+        std::lock_guard<std::mutex> wlk(mc->wmtx);
+        mc->todo.push_back({li, id, slot});
+        queued = true;
+        return true;
+    };
+
+    // 2a) prompt warm-up: a large batch ran since the last step. Its most-routed experts take the slots, best
+    //     first, displacing cached experts the batch used less (or never); no insert budget, the worker drains
+    //     the queue while decoding starts, and a slot only counts once its upload is published
+    uint64_t n_warm = 0;
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        layer_state & ls = mc->layers[li];
+        if (!ls.warm_seen) {
+            continue;
+        }
+        const int32_t n_expert = (int32_t) ls.warm_cnt.size();
+        const int32_t n_want   = std::min(mc->params.n_slots, n_expert);
+
+        std::vector<int32_t> order(n_expert);
+        for (int32_t e = 0; e < n_expert; ++e) {
+            order[e] = e;
+        }
+        std::partial_sort(order.begin(), order.begin() + n_want, order.end(), [&](int32_t a, int32_t b) {
+            return ls.warm_cnt[a] != ls.warm_cnt[b] ? ls.warm_cnt[a] > ls.warm_cnt[b] : a < b;
+        });
+
+        std::vector<bool> keep(n_expert, false);
+        for (int32_t i = 0; i < n_want && ls.warm_cnt[order[i]] > 0; ++i) {
+            keep[order[i]] = true;
+        }
+        for (int32_t i = 0; i < n_want && ls.warm_cnt[order[i]] > 0; ++i) {
+            const int32_t id = order[i];
+            if (ls.expert_slot[id] >= 0 || ls.expert_in_flight[id]) {
+                continue;
+            }
+            if (!place(li, id, &keep)) {
+                break;
+            }
+            n_warm++;
+        }
+
+        std::fill(ls.warm_cnt.begin(), ls.warm_cnt.end(), 0);
+        std::fill(ls.miss_ring.begin(), ls.miss_ring.end(), 0); // the admission history predates the new contents
+        ls.warm_seen = false;
+    }
+    if (n_warm > 0) {
+        mc->n_warm += n_warm;
+        LLAMA_LOG_INFO("moe-cache: prompt warm-up: %" PRIu64 " uploads\n", n_warm);
+    }
+
+    // 2b) gated admissions observed by the cache chain
     for (size_t li = 0; li < mc->layers.size(); ++li) {
         layer_state & ls = mc->layers[li];
 
@@ -418,40 +552,9 @@ void llama_moe_cache_step() {
             if (ls.expert_slot[id] >= 0 || ls.expert_in_flight[id]) {
                 continue;
             }
-
-            // victim: an empty non-in-flight slot if any, else the LRU non-in-flight slot
-            int32_t  slot = -1;
-            uint64_t best = UINT64_MAX;
-            for (int32_t s = 0; s < mc->params.n_slots; ++s) {
-                if (ls.slot_in_flight[s]) {
-                    continue;
-                }
-                if (ls.slot_expert[s] < 0) { slot = s; break; }
-                if (ls.slot_last_use[s] < best) { best = ls.slot_last_use[s]; slot = s; }
-            }
-            if (slot < 0) {
+            if (!place(li, id, nullptr)) {
                 break; // every slot is in flight; try again next step
             }
-
-            const int32_t victim = ls.slot_expert[slot];
-            if (victim < 0) {
-                ls.n_free--;
-            } else {
-                ls.expert_slot[victim] = -1;
-                ls.slot_expert[slot]   = -1;
-                set_table_entry(ls.pub, victim, mc->params.n_slots);
-                mc->n_evict++;
-            }
-            ls.slot_in_flight[slot]  = true;
-            ls.expert_in_flight[id]  = true;
-
-            const llama_moe_cache_layer & pub = ls.pub;
-            mc->n_upload++;
-            mc->upload_bytes += pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
-
-            std::lock_guard<std::mutex> wlk(mc->wmtx);
-            mc->todo.push_back({li, id, slot});
-            queued = true;
             --budget;
         }
         ls.pending.clear();
@@ -462,8 +565,8 @@ void llama_moe_cache_step() {
 
     if (mc->n_steps % 256 == 0) {
         const uint64_t n = mc->n_hit + mc->n_miss;
-        LLAMA_LOG_INFO("moe-cache: steps %" PRIu64 " | hit rate %.1f%% | uploads %" PRIu64 " (%.1f MiB, %.2f MiB/step) | evictions %" PRIu64 "\n",
+        LLAMA_LOG_INFO("moe-cache: steps %" PRIu64 " | hit rate %.1f%% | uploads %" PRIu64 " (%.1f MiB, %.2f MiB/step) | evictions %" PRIu64 " | warm-up uploads %" PRIu64 "\n",
                 mc->n_steps, n ? 100.0*mc->n_hit/n : 0.0, mc->n_upload, mc->upload_bytes/1024.0/1024.0,
-                mc->upload_bytes/1024.0/1024.0/mc->n_steps, mc->n_evict);
+                mc->upload_bytes/1024.0/1024.0/mc->n_steps, mc->n_evict, mc->n_warm);
     }
 }

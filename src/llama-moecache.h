@@ -18,12 +18,17 @@
 //  - admission is gated: an expert is uploaded only after `admit` misses within the last
 //    `window` tokens of its layer. Ungated admission churns (uploads ~= evictions) and
 //    saturates PCIe; eviction is plain LRU.
+//  - the cache chain only serves (and the CPU op only observes) batches of 1-4 tokens, so a prompt
+//    would teach the cache nothing. Batches of at least `warm` tokens therefore report their routing
+//    through a CPU custom op, and the next step() re-ranks every slot by that frequency (experts the
+//    batch never used keep their slots only as filler). The uploads are asynchronous like any other.
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
 #include <cstdint>
 
 struct llama_model;
+struct ggml_context;
 struct ggml_tensor;
 
 struct llama_moe_cache_params {
@@ -31,6 +36,7 @@ struct llama_moe_cache_params {
     int32_t max_inserts = 2;  // max expert uploads per layer per decode step
     int32_t window      = 16; // admission window, in tokens
     int32_t admit       = 3;  // misses within the window before an expert is uploaded (1 = ungated)
+    int32_t warm        = 32; // batches of at least this many tokens re-rank the slots by their routing (0 = disabled)
 };
 
 struct llama_moe_cache_layer {
@@ -72,6 +78,11 @@ bool llama_moe_cache_active();
 // key = the layer's gate_up_exps tensor when fused, else its up_exps tensor.
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * key);
+
+// graph hook for a batch that is too large for the cache chain: a CPU node that reports the batch's top-k
+// expert ids [n_expert_used, n_tokens] to the cache. The caller expands it into the graph and pins it to the
+// CPU backend. nullptr when this tensor has no cached layer, warm-up is disabled or the batch is too small
+ggml_tensor * llama_moe_cache_build_warm_obs(ggml_context * ctx, const ggml_tensor * key, ggml_tensor * selected_experts);
 
 // publish finished uploads and schedule new ones. Call between graph executions only,
 // after the backend has been synchronized.

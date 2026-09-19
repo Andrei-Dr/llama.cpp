@@ -389,6 +389,7 @@ extern "C" {
         int32_t  n_moe_cache_inserts; // max expert uploads per layer per decode step
         int32_t  n_moe_cache_window;  // admission window in tokens
         int32_t  n_moe_cache_admit;   // misses within the window before an expert is uploaded (1 = ungated)
+        int32_t  n_moe_cache_warm;    // batches of at least this many tokens re-rank the slots by their routing (0 = disabled)
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

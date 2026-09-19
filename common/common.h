@@ -454,6 +454,7 @@ struct common_params {
     int32_t n_moe_cache_inserts   = 2;    // max expert uploads per layer per decode step
     int32_t n_moe_cache_window    = 16;   // admission window in tokens
     int32_t n_moe_cache_admit     = 3;    // misses within the window before an expert is uploaded (1 = ungated)
+    int32_t n_moe_cache_warm      = 32;   // batches of at least this many tokens re-rank the slots by their routing (0 = disabled)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

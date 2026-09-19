@@ -2167,10 +2167,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // small batches only: the device chain must stay inside the MMVQ mul_mat_id window (6 tokens for
         // IQ3_S on Turing), the one CUDA path that tolerates the repeated dummy slot id
         constexpr int64_t mc_max_tokens = 4;
-        if (n_tokens >= 1 && n_tokens <= mc_max_tokens && il >= 0 && mc_gated && down_exps &&
+        const bool mc_ok = n_tokens >= 1 && il >= 0 && mc_gated && down_exps &&
             !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
-            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && !weight_before_ffn && loras->empty()) {
+            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && !weight_before_ffn && loras->empty();
+        if (mc_ok && n_tokens <= mc_max_tokens) {
             mcache = llama_moe_cache_lookup(gate_up_exps ? gate_up_exps : up_exps);
+        } else if (mc_ok) {
+            // too large for the cache chain (a prompt): report the routing so the next step can warm the slots
+            ggml_tensor * mc_warm = llama_moe_cache_build_warm_obs(ctx0, gate_up_exps ? gate_up_exps : up_exps, selected_experts);
+            if (mc_warm) {
+                cb(mc_warm, "ffn_moe_cache_warm_obs", il);
+                ggml_backend_sched_set_tensor_backend(sched, mc_warm, backend_cpu);
+                ggml_build_forward_expand(gf, mc_warm);
+            }
         }
     }
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
