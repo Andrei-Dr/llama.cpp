@@ -352,6 +352,15 @@ extern "C" {
     // Returns the old callback for chaining
     GGML_API ggml_abort_callback_t ggml_set_abort_callback(ggml_abort_callback_t callback);
 
+    struct ggml_tensor;
+
+    // MoE expert-routing observation callback: invoked by the CPU mul_mat_id (thread 0) with the layer
+    // index and the op's expert-id tensor (I32 [n_expert_used, n_tokens]), for ops that carry an expert
+    // cache table in src[3] and have op_params[1] set (op_params[2] = layer). Drives the llama MoE expert cache.
+    typedef void (*ggml_moe_obs_cb_t)(int32_t il, const struct ggml_tensor * ids, void * ud);
+    GGML_API void            ggml_set_moe_obs_callback(ggml_moe_obs_cb_t cb, void * ud);
+    GGML_API ggml_moe_obs_cb_t ggml_get_moe_obs_callback(void ** ud);
+
     GGML_NORETURN GGML_ATTRIBUTE_FORMAT(3, 4)
     GGML_API void ggml_abort(const char * file, int line, const char * fmt, ...);
 
@@ -665,6 +674,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_SCHED_BARRIER = 32, // ...starts a new ggml-backend scheduler split; if the next split runs on another backend and
+                                             //    takes no input from this one, its inputs are copied first so both backends run concurrently
     };
 
     enum ggml_tri_type {

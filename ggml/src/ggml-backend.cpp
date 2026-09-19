@@ -779,6 +779,8 @@ struct ggml_backend_sched_split {
     struct ggml_tensor ** inputs;
     int n_inputs;
     int inputs_capacity;
+    // the split starts at a GGML_TENSOR_FLAG_SCHED_BARRIER node (see ggml_backend_sched_compute_splits)
+    bool barrier;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -1309,6 +1311,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_start = 0;
         split->n_inputs = 0;
+        split->barrier = false;
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
@@ -1341,6 +1344,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
             }
 
+            // an explicit barrier: lets the scheduler synchronize the work before it on its own
+            const bool barrier = (node->flags & GGML_TENSOR_FLAG_SCHED_BARRIER) != 0;
+            if (barrier && node_backend_id == cur_backend_id && i > split->i_start) {
+                need_new_split = true;
+            }
+
             if (node_backend_id != cur_backend_id || need_new_split) {
                 split->i_end = i;
                 i_split++;
@@ -1358,6 +1367,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->backend_id = node_backend_id;
                 split->i_start = i;
                 split->n_inputs = 0;
+                split->barrier = barrier;
                 cur_backend_id = node_backend_id;
             }
 
@@ -1653,22 +1663,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-        struct ggml_backend_sched_split * split = &splits[split_id];
-        int split_backend_id = split->backend_id;
+    // copy the input tensors of a split to its backend
+    std::vector<bool> inputs_copied(sched->n_splits, false);
+    auto copy_split_inputs = [&](int i_split) {
+        if (inputs_copied[i_split]) {
+            return;
+        }
+        inputs_copied[i_split] = true;
+
+        struct ggml_backend_sched_split * split = &splits[i_split];
+        const int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
-        // ensure the previous split's async work has completed before we start
-        // this split, the allocator may have reused buffer regions across splits
-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
-            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
-            }
-        }
-
-        // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1792,6 +1798,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
+            }
+        }
+    };
+
+    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+        struct ggml_backend_sched_split * split = &splits[split_id];
+        int split_backend_id = split->backend_id;
+        ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        // ensure the previous split's async work has completed before we start
+        // this split, the allocator may have reused buffer regions across splits
+        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+        }
+
+        copy_split_inputs(split_id);
+
+        // barrier split: when the next split runs on another backend and consumes nothing computed here, copy
+        // its inputs BEFORE this split is enqueued. The copy only waits for the work submitted so far, and the
+        // next backend then computes concurrently with this split instead of after it.
+        if (split->barrier && split_id + 1 < sched->n_splits) {
+            struct ggml_backend_sched_split * next = &splits[split_id + 1];
+            bool independent = next->backend_id != split_backend_id;
+            for (int i = 0; independent && i < next->n_inputs; i++) {
+                const ggml_tensor * inp = next->inputs[i];
+                for (int j = 0; j < split->graph.n_nodes; j++) {
+                    if (split->graph.nodes[j] == inp || split->graph.nodes[j] == inp->view_src) {
+                        independent = false;
+                        break;
+                    }
+                }
+            }
+            if (independent) {
+                copy_split_inputs(split_id + 1);
             }
         }
 
