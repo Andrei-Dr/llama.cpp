@@ -396,7 +396,27 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n_rs_seq = needs_rs_seq ? draft.n_max : 0u;
+
+        // n-gram drafts are rolled back through the same recurrent snapshots: a draft longer than n_rs_seq takes the
+        // checkpoint + replay path instead. Each unit replicates the whole recurrent state on the device, so long
+        // n-gram ceilings only count up to a small bound and keep the checkpoint path beyond it
+        constexpr uint32_t n_rs_seq_ngram_max = 8;
+        for (const auto t : types) {
+            uint32_t n = 0;
+            switch (t) {
+                case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  n = ngram_simple.size_m;  break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   n = ngram_map_k.size_m;   break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: n = ngram_map_k4v.size_m; break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     n = (uint32_t) std::max(0, ngram_mod.n_max); break;
+                default: break;
+            }
+            if (n <= n_rs_seq_ngram_max) {
+                n_rs_seq = std::max(n_rs_seq, n);
+            }
+        }
+
+        return n_rs_seq;
     }
 };
 
