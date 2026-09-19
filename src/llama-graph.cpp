@@ -2172,8 +2172,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && !weight_before_ffn && loras->empty();
         if (mc_ok && n_tokens <= mc_max_tokens) {
             mcache = llama_moe_cache_lookup(gate_up_exps ? gate_up_exps : up_exps);
-        } else if (mc_ok) {
-            // too large for the cache chain (a prompt): report the routing so the next step can warm the slots
+        } else if (mc_ok && ubatch.n_seqs_unq == 1) {
+            // too large for the cache chain and a single sequence, i.e. a prompt: report the routing so the next step
+            // can warm the slots. A multi-sequence decode batch can be as large, but re-ranking on it every step would thrash
             ggml_tensor * mc_warm = llama_moe_cache_build_warm_obs(ctx0, gate_up_exps ? gate_up_exps : up_exps, selected_experts);
             if (mc_warm) {
                 cb(mc_warm, "ffn_moe_cache_warm_obs", il);
