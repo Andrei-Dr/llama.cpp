@@ -2108,7 +2108,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // cache-aware routing (--moe-expert-cache-bias, off by default, NOT exact): in the batches the expert cache serves, a
     // cached expert competes for the top-k with its probability scaled up. The expert WEIGHTS below still come from the
     // true probs, so this only swaps near-tie experts toward the ones that are already on the device
-    if (selected_experts_in == nullptr && n_tokens >= 1 && n_tokens <= 4 && il >= 0 && (gate_up_exps || up_exps)) {
+    // (only for plain non-negative router probs: a selection bias or raw logits can be negative, where scaling up would demote)
+    const bool mc_sel_ok = exp_probs_b == nullptr && selection_probs == probs &&
+        (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX || gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID);
+    if (mc_sel_ok && selected_experts_in == nullptr && n_tokens >= 1 && n_tokens <= 4 && il >= 0 && (gate_up_exps || up_exps)) {
         const llama_moe_cache_layer * mc_sel = llama_moe_cache_lookup(gate_up_exps ? gate_up_exps : up_exps);
         if (mc_sel && mc_sel->sel_scale) {
             selection_probs = ggml_mul(ctx0, selection_probs, mc_sel->sel_scale);
