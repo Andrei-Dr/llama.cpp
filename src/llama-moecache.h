@@ -37,6 +37,7 @@ struct llama_moe_cache_params {
     int32_t window      = 16; // admission window, in tokens
     int32_t admit       = 3;  // misses within the window before an expert is uploaded (1 = ungated)
     int32_t warm        = 32; // batches of at least this many tokens re-rank the slots by their routing (0 = disabled)
+    float   bias        = 0;  // cache-aware routing: a cached expert's selection score is its router prob * (1 + bias); 0 = exact routing
 };
 
 struct llama_moe_cache_layer {
@@ -62,6 +63,9 @@ struct llama_moe_cache_layer {
     ggml_tensor * up_s_c   = nullptr;
     ggml_tensor * gate_s_c = nullptr;
     ggml_tensor * down_s_c = nullptr;
+
+    // cache-aware routing (bias > 0 only): F32 [n_expert], 1 + bias for cached experts, 1 otherwise; nullptr when off
+    ggml_tensor * sel_scale = nullptr;
 
     // expert id -> slot (or n_slots when uncached); I32 [1, n_expert]
     ggml_tensor * dev_table  = nullptr;

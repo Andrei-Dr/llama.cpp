@@ -100,6 +100,7 @@ llama_context::llama_context(
         mc_params.window      = params.n_moe_cache_window;
         mc_params.admit       = params.n_moe_cache_admit;
         mc_params.warm        = params.n_moe_cache_warm;
+        mc_params.bias        = params.moe_cache_bias;
         llama_moe_cache_init(model, mc_params);
     }
 
@@ -3691,6 +3692,7 @@ llama_context_params llama_context_default_params() {
         /*.n_moe_cache_window          =*/ 16,
         /*.n_moe_cache_admit           =*/ 3,
         /*.n_moe_cache_warm            =*/ 32,
+        /*.moe_cache_bias              =*/ 0.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

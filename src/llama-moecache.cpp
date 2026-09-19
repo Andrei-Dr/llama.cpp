@@ -82,6 +82,7 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+float       g_cache_bias = 0.0f; // set once in init, before any table entry is written
 std::mutex  g_init_mtx;
 bool        g_init_done = false;
 
@@ -176,6 +177,10 @@ size_t upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert
 
 void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
     const int32_t v = slot_or_dummy;
+    if (pub.sel_scale) {
+        const float s = slot_or_dummy == pub.n_slots ? 1.0f : 1.0f + g_cache_bias;
+        ggml_backend_tensor_set(pub.sel_scale, &s, (size_t) expert*sizeof(float), sizeof(float));
+    }
     ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
     ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
 }
@@ -202,6 +207,8 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     mc->params.admit       = std::min(255, std::max(1, params.admit));
     mc->params.window      = std::max(1, params.window);
     mc->params.warm        = params.warm <= 0 ? 0 : std::max(5, params.warm); // 1-4 tokens belong to the cache chain
+    mc->params.bias        = std::max(0.0f, params.bias);
+    g_cache_bias           = mc->params.bias;
     const int32_t n_slots = params.n_slots;
 
     // collect the host-resident expert layers, grouped by the buffer type of the device that
@@ -263,7 +270,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
 
     auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<size_t> & idxs, bool tables_only) -> bool {
         ggml_init_params ip = {
-            /*.mem_size  =*/ ggml_tensor_overhead()*(idxs.size()*8 + 8),
+            /*.mem_size  =*/ ggml_tensor_overhead()*(idxs.size()*10 + 8),
             /*.mem_buffer=*/ nullptr,
             /*.no_alloc  =*/ true,
         };
@@ -296,6 +303,10 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
                         ggml_format_name(*dst[i], "moe_cache_scale%d.%d", i, pub.il);
                     }
                 }
+            }
+            if (mc->params.bias > 0.0f) {
+                pub.sel_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+                ggml_format_name(pub.sel_scale, "moe_cache_sel.%d", pub.il);
             }
             pub.dev_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
             ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", pub.il);
@@ -351,6 +362,10 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
             }
         }
 
+        if (ls.pub.sel_scale) {
+            const std::vector<float> ones(n_expert, 1.0f);
+            ggml_backend_tensor_set(ls.pub.sel_scale, ones.data(), 0, n_expert*sizeof(float));
+        }
         std::vector<int32_t> dummy(n_expert, n_slots);
         ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
@@ -394,6 +409,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
 
     LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, admit %d misses / %d tokens, %.1f MiB device memory\n",
             __func__, mc->layers.size(), n_slots, mc->params.max_inserts, mc->params.admit, mc->params.window, vram/1024.0/1024.0);
+    LLAMA_LOG_INFO("%s: MoE expert cache-aware routing: %s (selection prob x %.2f for cached experts)\n", __func__, mc->params.bias > 0.0f ? "ON - outputs differ from exact routing" : "off", 1.0 + mc->params.bias);
     LLAMA_LOG_INFO("%s: MoE expert cache prompt warm-up: %s (batches >= %d tokens)\n", __func__, mc->params.warm ? "on" : "off", mc->params.warm);
 }
 

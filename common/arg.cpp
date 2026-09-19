@@ -2570,6 +2570,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_cache_warm = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WARM"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-bias"}, "F",
+        string_format("cache-aware routing: during decode a GPU-cached expert competes for the top-k with its router probability scaled by (1 + F); "
+                      "the expert weights still use the true probabilities. 0 = exact routing. Changes model outputs when > 0 (default: %.2f)", (double) params.moe_cache_bias),
+        [](common_params & params, const std::string & value) {
+            params.moe_cache_bias = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_BIAS"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
