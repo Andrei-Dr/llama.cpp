@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -76,6 +77,9 @@ struct moe_cache {
     std::thread             worker;
     std::mutex              wmtx;
     std::condition_variable wcv;
+    std::condition_variable dcv;            // signaled when the worker finishes a job (deterministic mode)
+    int                     n_busy = 0;     // jobs popped by the worker and not yet in `done` (under wmtx)
+    bool                    sync_publish = false; // LLAMA_MOE_CACHE_SYNC=1: step() waits for every scheduled upload
     std::deque<upload_job>  todo;
     std::vector<upload_job> done;
     bool                    stop = false;
@@ -207,6 +211,12 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     mc->params.admit       = std::min(255, std::max(1, params.admit));
     mc->params.window      = std::max(1, params.window);
     mc->params.warm        = params.warm <= 0 ? 0 : std::max(5, params.warm); // 1-4 tokens belong to the cache chain
+    // deterministic mode (test / paired-comparison use): uploads scheduled at step N are always published at step N+1, so
+    // which experts hit the cache is a function of the token history alone, not of PCIe timing. Costs decode speed.
+    {
+        const char * e = getenv("LLAMA_MOE_CACHE_SYNC");
+        mc->sync_publish = e && atoi(e) != 0;
+    }
     mc->params.bias        = std::max(0.0f, params.bias);
     g_cache_bias           = mc->params.bias;
     const int32_t n_slots = params.n_slots;
@@ -387,6 +397,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
                 }
                 j = mc->todo.front();
                 mc->todo.pop_front();
+                mc->n_busy++;
             }
             llama_moe_cache_layer & pub = mc->layers[j.layer_idx].pub;
             if (pub.gate_up_src) {
@@ -399,7 +410,9 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
             {
                 std::lock_guard<std::mutex> lk(mc->wmtx);
                 mc->done.push_back(j);
+                mc->n_busy--;
             }
+            mc->dcv.notify_all();
         }
     });
 
@@ -411,6 +424,9 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
             __func__, mc->layers.size(), n_slots, mc->params.max_inserts, mc->params.admit, mc->params.window, vram/1024.0/1024.0);
     LLAMA_LOG_INFO("%s: MoE expert cache-aware routing: %s (selection prob x %.2f for cached experts)\n", __func__, mc->params.bias > 0.0f ? "ON - outputs differ from exact routing" : "off", 1.0 + mc->params.bias);
     LLAMA_LOG_INFO("%s: MoE expert cache prompt warm-up: %s (batches >= %d tokens)\n", __func__, mc->params.warm ? "on" : "off", mc->params.warm);
+    if (mc->sync_publish) {
+        LLAMA_LOG_INFO("%s: MoE expert cache DETERMINISTIC publish (LLAMA_MOE_CACHE_SYNC): uploads wait for the next step\n", __func__);
+    }
 }
 
 bool llama_moe_cache_active() {
@@ -450,7 +466,10 @@ void llama_moe_cache_step() {
 
     // 1) publish completed uploads (sync point: no graph is executing)
     {
-        std::lock_guard<std::mutex> wlk(mc->wmtx);
+        std::unique_lock<std::mutex> wlk(mc->wmtx);
+        if (mc->sync_publish) {
+            mc->dcv.wait(wlk, [mc]() { return mc->todo.empty() && mc->n_busy == 0; });
+        }
         std::lock_guard<std::mutex> lk(mc->mtx);
         for (const auto & j : mc->done) {
             layer_state & ls = mc->layers[j.layer_idx];
