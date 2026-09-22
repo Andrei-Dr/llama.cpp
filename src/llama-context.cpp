@@ -799,6 +799,25 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+void llama_context::trim_device_pools() {
+    using trim_fn_t = void (*)(ggml_backend_t);
+    for (auto & be : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto fn = reg ? (trim_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_trim_pools") : nullptr;
+        if (fn) {
+            fn(be.get());
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        LLAMA_LOG_INFO("%s: %s free %.1f of %.1f MiB after the prefill buffers were released\n",
+                __func__, ggml_backend_dev_name(dev), free/1024.0/1024.0, total/1024.0/1024.0);
+    }
+}
+
 uint32_t llama_context::n_ubatch_eff() const {
     return moe_prefill_mode ? cparams.n_ubatch_prefill : cparams.n_ubatch;
 }
@@ -1792,6 +1811,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 moe_prefill_mode   = false;
                 sched_need_reserve = true;
                 sched_reserve();           // decode-sized buffers first: the slots need the VRAM back
+                trim_device_pools();       // and the prefill's temporaries (backend pools never shrink by themselves)
                 llama_moe_cache_resume();
             }
         }

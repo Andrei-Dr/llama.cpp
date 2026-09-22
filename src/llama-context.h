@@ -245,6 +245,9 @@ public:
     // the ubatch the scheduler is reserved for and batches are split at: n_ubatch_prefill in MoE prefill mode
     uint32_t n_ubatch_eff() const;
 
+    // release the backends' temporary pools (MoE prefill mode, between graphs only)
+    void trim_device_pools();
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
