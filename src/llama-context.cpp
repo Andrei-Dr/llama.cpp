@@ -259,6 +259,11 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    cparams.n_ubatch_prefill = std::min(cparams.n_batch, params.n_ubatch_prefill);
+    if (cparams.n_ubatch_prefill <= cparams.n_ubatch) {
+        cparams.n_ubatch_prefill = 0;
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);
@@ -321,6 +326,9 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch               = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
+    if (cparams.n_ubatch_prefill) {
+        LLAMA_LOG_INFO("%s: n_ubatch_prefill      = %u (MoE prefill mode)\n", __func__, cparams.n_ubatch_prefill);
+    }
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -606,7 +614,7 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_eff());
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -789,6 +797,10 @@ uint32_t llama_context::n_batch() const {
 
 uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
+}
+
+uint32_t llama_context::n_ubatch_eff() const {
+    return moe_prefill_mode ? cparams.n_ubatch_prefill : cparams.n_ubatch;
 }
 
 uint32_t llama_context::n_seq_max() const {
@@ -1762,6 +1774,29 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
+    // MoE prefill mode (--ubatch-prefill): the expert-cache slots are dead weight during a large batch (the cache chain only
+    // serves 1-4 token batches) and a large-ubatch compute buffer is dead weight during decode, so they share the VRAM.
+    // A batch larger than n_ubatch releases the slots and re-reserves the scheduler for n_ubatch_prefill (the compute buffer
+    // grows into the freed VRAM; the node budget grows with the ubatch too); the first small batch after it re-reserves for
+    // n_ubatch (freeing the prefill buffer) and restores the slots, which the prompt's routing then re-ranks (warm-up).
+    // Lazy in both directions: a prompt fed in several chunks switches once. Only the context that owns the cache toggles it.
+    if (cparams.n_ubatch_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && llama_moe_cache_owned_by(model)) {
+        const bool big = n_tokens_all > cparams.n_ubatch;
+        if (big != moe_prefill_mode) {
+            synchronize(); // nothing submitted earlier may still read the slots or the compute buffer
+            if (big) {
+                llama_moe_cache_suspend();
+                moe_prefill_mode   = true;
+                sched_need_reserve = true; // reserved below, into the released VRAM
+            } else {
+                moe_prefill_mode   = false;
+                sched_need_reserve = true;
+                sched_reserve();           // decode-sized buffers first: the slots need the VRAM back
+                llama_moe_cache_resume();
+            }
+        }
+    }
+
     sched_reserve();
 
     bool did_optimize = false;
@@ -1772,7 +1807,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+        mctx = memory->init_batch(*balloc, n_ubatch_eff(), output_all);
         if (!mctx) {
             return -2;
         }
@@ -3693,6 +3728,7 @@ llama_context_params llama_context_default_params() {
         /*.n_moe_cache_admit           =*/ 3,
         /*.n_moe_cache_warm            =*/ 32,
         /*.moe_cache_bias              =*/ 0.0f,
+        /*.n_ubatch_prefill            =*/ 0,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

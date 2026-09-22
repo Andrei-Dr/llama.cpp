@@ -242,6 +242,9 @@ private:
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
+    // the ubatch the scheduler is reserved for and batches are split at: n_ubatch_prefill in MoE prefill mode
+    uint32_t n_ubatch_eff() const;
+
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
@@ -347,6 +350,7 @@ private:
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;
+    bool moe_prefill_mode   = false; // MoE prefill mode active (see decode)
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

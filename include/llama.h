@@ -391,6 +391,8 @@ extern "C" {
         int32_t  n_moe_cache_admit;   // misses within the window before an expert is uploaded (1 = ungated)
         int32_t  n_moe_cache_warm;    // batches of at least this many tokens re-rank the slots by their routing (0 = disabled)
         float    moe_cache_bias;      // cache-aware routing: cached experts compete with their router prob scaled by (1 + bias); 0 = exact routing
+        uint32_t n_ubatch_prefill;    // MoE prefill mode: batches larger than n_ubatch run at this ubatch in the VRAM the cache slots
+                                      // release (0 = off; needs the MoE expert cache; capped at n_batch)
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;

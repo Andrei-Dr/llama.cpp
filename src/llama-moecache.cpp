@@ -80,6 +80,9 @@ struct moe_cache {
     std::condition_variable dcv;            // signaled when the worker finishes a job (deterministic mode)
     int                     n_busy = 0;     // jobs popped by the worker and not yet in `done` (under wmtx)
     bool                    sync_publish = false; // LLAMA_MOE_CACHE_SYNC=1: step() waits for every scheduled upload
+    std::vector<ggml_backend_buffer_type_t> ctx_bufts; // buffer type of each context in `ctxs` (host tables: CPU)
+    bool                    suspended = false;    // device slots released (prefill mode); lookups return nullptr
+    const llama_model *     owner     = nullptr;  // the model whose host-resident experts this cache mirrors
     std::deque<upload_job>  todo;
     std::vector<upload_job> done;
     bool                    stop = false;
@@ -195,6 +198,48 @@ bool on_host(const ggml_tensor * t) {
 
 } // namespace
 
+// every slot empty, every table entry -> the dummy slot, per-expert scale copies re-uploaded. Used at init and when the
+// device slots come back after prefill mode (fresh buffers). keep_warm keeps the routing counts a prefill collected, so
+// the next step() re-ranks the new slots by the prompt that was just processed.
+static void reset_slots(moe_cache * mc, bool keep_warm) {
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    const int32_t n_slots = mc->params.n_slots;
+    for (size_t idx = 0; idx < mc->layers.size(); ++idx) {
+        layer_state & ls = mc->layers[idx];
+        const int64_t n_expert = ls.pub.down_src->ne[2];
+        ls.slot_expert.assign(n_slots, -1);
+        ls.expert_slot.assign(n_expert, -1);
+        ls.slot_last_use.assign(n_slots, 0);
+        ls.slot_in_flight.assign(n_slots, false);
+        ls.n_free = n_slots;
+        ls.expert_in_flight.assign(n_expert, false);
+        ls.miss_ring.assign((size_t) n_expert*mc->params.admit, 0);
+        ls.miss_pos.assign(n_expert, 0);
+        ls.pending.clear();
+        if (!keep_warm) {
+            ls.warm_cnt.assign(n_expert, 0);
+            ls.warm_seen = false;
+        }
+
+        {
+            ggml_tensor * const dst[3] = { ls.pub.up_s_c, ls.pub.gate_s_c, ls.pub.down_s_c };
+            for (int i = 0; i < 3; ++i) {
+                if (ls.scale_src[i]) {
+                    ggml_backend_tensor_set(dst[i], ls.scale_src[i]->data, 0, ggml_nbytes(ls.scale_src[i]));
+                }
+            }
+        }
+
+        if (ls.pub.sel_scale) {
+            const std::vector<float> ones(n_expert, 1.0f);
+            ggml_backend_tensor_set(ls.pub.sel_scale, ones.data(), 0, n_expert*sizeof(float));
+        }
+        std::vector<int32_t> dummy(n_expert, n_slots);
+        ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
+        ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
+    }
+}
+
 void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_params & params) {
     std::lock_guard<std::mutex> init_lock(g_init_mtx);
     if (g_init_done) {
@@ -207,6 +252,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
 
     auto * mc = new moe_cache();
     mc->params = params;
+    mc->owner  = &model;
     mc->params.max_inserts = std::max(1, params.max_inserts);
     mc->params.admit       = std::min(255, std::max(1, params.admit));
     mc->params.window      = std::max(1, params.window);
@@ -289,6 +335,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
             return false;
         }
         mc->ctxs.push_back(ctx);
+        mc->ctx_bufts.push_back(buft);
 
         for (size_t idx : idxs) {
             llama_moe_cache_layer & pub = mc->layers[idx].pub;
@@ -349,37 +396,10 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     }
 
     // init bookkeeping + tables (everything uncached -> dummy slot n_slots)
+    reset_slots(mc, /*keep_warm=*/false);
     size_t vram = 0;
     for (size_t idx = 0; idx < mc->layers.size(); ++idx) {
         layer_state & ls = mc->layers[idx];
-        const int64_t n_expert = ls.pub.down_src->ne[2];
-        ls.slot_expert.assign(n_slots, -1);
-        ls.expert_slot.assign(n_expert, -1);
-        ls.slot_last_use.assign(n_slots, 0);
-        ls.slot_in_flight.assign(n_slots, false);
-        ls.n_free = n_slots;
-        ls.expert_in_flight.assign(n_expert, false);
-        ls.miss_ring.assign((size_t) n_expert*mc->params.admit, 0);
-        ls.miss_pos.assign(n_expert, 0);
-        ls.warm_cnt.assign(n_expert, 0);
-
-        {
-            ggml_tensor * const dst[3] = { ls.pub.up_s_c, ls.pub.gate_s_c, ls.pub.down_s_c };
-            for (int i = 0; i < 3; ++i) {
-                if (ls.scale_src[i]) {
-                    ggml_backend_tensor_set(dst[i], ls.scale_src[i]->data, 0, ggml_nbytes(ls.scale_src[i]));
-                }
-            }
-        }
-
-        if (ls.pub.sel_scale) {
-            const std::vector<float> ones(n_expert, 1.0f);
-            ggml_backend_tensor_set(ls.pub.sel_scale, ones.data(), 0, n_expert*sizeof(float));
-        }
-        std::vector<int32_t> dummy(n_expert, n_slots);
-        ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
-        ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
-
         mc->by_key[ls.pub.gate_up_src ? ls.pub.gate_up_src : ls.pub.up_src] = idx;
         for (const ggml_tensor * t : { ls.pub.up_c, ls.pub.gate_c, ls.pub.gate_up_c, ls.pub.down_c }) {
             vram += t ? ggml_nbytes(t) : 0;
@@ -429,12 +449,74 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     }
 }
 
+bool llama_moe_cache_owned_by(const llama_model & model) {
+    return g_cache != nullptr && g_cache->owner == &model;
+}
+
+size_t llama_moe_cache_suspend() {
+    moe_cache * mc = g_cache;
+    if (!mc || mc->suspended) {
+        return 0;
+    }
+    {
+        // queued uploads are dropped; one already being copied must land before its buffer goes away
+        std::unique_lock<std::mutex> wlk(mc->wmtx);
+        mc->todo.clear();
+        mc->dcv.wait(wlk, [mc]() { return mc->n_busy == 0; });
+        mc->done.clear();
+    }
+    size_t freed = 0;
+    for (size_t i = 0; i < mc->ctxs.size(); ++i) {
+        if (mc->ctx_bufts[i] == ggml_backend_cpu_buffer_type() || !mc->bufs[i]) {
+            continue; // the host tables stay
+        }
+        freed += ggml_backend_buffer_get_size(mc->bufs[i]);
+        ggml_backend_buffer_free(mc->bufs[i]);
+        mc->bufs[i] = nullptr;
+    }
+    mc->suspended = true;
+    LLAMA_LOG_INFO("moe-cache: prefill mode: released %.1f MiB of device slots\n", freed/1024.0/1024.0);
+    return freed;
+}
+
+bool llama_moe_cache_resume() {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->suspended) {
+        return true;
+    }
+    size_t got = 0;
+    for (size_t i = 0; i < mc->ctxs.size(); ++i) {
+        if (mc->ctx_bufts[i] == ggml_backend_cpu_buffer_type() || mc->bufs[i]) {
+            continue;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(mc->ctxs[i], mc->ctx_bufts[i]);
+        if (!buf) {
+            LLAMA_LOG_WARN("moe-cache: could not re-allocate the device slots on %s - cache stays off (outputs unchanged, decode slower)\n",
+                    ggml_backend_buft_name(mc->ctx_bufts[i]));
+            for (size_t j = 0; j < i; ++j) { // all-or-nothing: give back what this pass took
+                if (mc->ctx_bufts[j] != ggml_backend_cpu_buffer_type() && mc->bufs[j]) {
+                    ggml_backend_buffer_free(mc->bufs[j]);
+                    mc->bufs[j] = nullptr;
+                }
+            }
+            return false;
+        }
+        ggml_backend_buffer_clear(buf, 0);
+        mc->bufs[i] = buf;
+        got += ggml_backend_buffer_get_size(buf);
+    }
+    reset_slots(mc, /*keep_warm=*/true);
+    mc->suspended = false;
+    LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots (re-ranked by the prompt at the next step)\n", got/1024.0/1024.0);
+    return true;
+}
+
 bool llama_moe_cache_active() {
     return g_cache != nullptr;
 }
 
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * key) {
-    if (!g_cache || !key) {
+    if (!g_cache || !key || g_cache->suspended) {
         return nullptr;
     }
     auto it = g_cache->by_key.find(key);
@@ -460,8 +542,8 @@ ggml_tensor * llama_moe_cache_build_warm_obs(ggml_context * ctx, const ggml_tens
 
 void llama_moe_cache_step() {
     moe_cache * mc = g_cache;
-    if (!mc) {
-        return;
+    if (!mc || mc->suspended) {
+        return; // prefill mode: no slots to fill; the warm-up counts wait for resume()
     }
 
     // 1) publish completed uploads (sync point: no graph is executing)

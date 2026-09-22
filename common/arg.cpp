@@ -2571,6 +2571,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WARM"));
     add_opt(common_arg(
+        {"-ubp", "--ubatch-prefill"}, "N",
+        string_format("MoE prefill mode: a batch larger than --ubatch-size runs at this ubatch in the VRAM the expert cache "
+                      "slots give up for its duration; the slots come back (re-ranked by the prompt) at the next decode step. "
+                      "Raise --batch-size too, or prompts arrive in chunks no larger than it. 0 = off (default: %d)", params.n_ubatch_prefill),
+        [](common_params & params, int value) {
+            params.n_ubatch_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_PREFILL"));
+    add_opt(common_arg(
         {"--moe-expert-cache-bias"}, "F",
         string_format("cache-aware routing: during decode a GPU-cached expert competes for the top-k with its router probability scaled by (1 + F); "
                       "the expert weights still use the true probabilities. 0 = exact routing. Changes model outputs when > 0 (default: %.2f)", (double) params.moe_cache_bias),

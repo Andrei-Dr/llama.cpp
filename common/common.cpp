@@ -1731,6 +1731,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_moe_cache_admit   = params.n_moe_cache_admit;
     cparams.n_moe_cache_warm    = params.n_moe_cache_warm;
     cparams.moe_cache_bias      = params.moe_cache_bias;
+    cparams.n_ubatch_prefill    = params.n_ubatch_prefill;
     cparams.n_threads         = params.cpuparams.n_threads;
     cparams.n_threads_batch   = params.cpuparams_batch.n_threads == -1 ?
                                 params.cpuparams.n_threads : params.cpuparams_batch.n_threads;

@@ -25,6 +25,7 @@
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
+#include <cstddef>
 #include <cstdint>
 
 struct llama_model;
@@ -78,6 +79,18 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
 
 // true once a cache has been built
 bool llama_moe_cache_active();
+
+// true when the cache mirrors this model's experts (a draft / MTP model never owns it)
+bool llama_moe_cache_owned_by(const llama_model & model);
+
+// prefill mode: the cache chain only serves 1-4 token batches, so during a large batch the device slots are dead weight.
+// suspend() drops queued uploads, waits for one in progress, frees the device slot buffers (the host tables stay) and makes
+// lookups return nullptr, so graphs are built without the cache chain; returns the bytes freed. resume() re-allocates the
+// slots empty (all-or-nothing; false = could not, the cache stays off and outputs are unchanged) and keeps the routing counts
+// the prefill collected, so the next step() re-ranks the slots by the prompt. Call both between graph executions only,
+// with the backends synchronized.
+size_t llama_moe_cache_suspend();
+bool   llama_moe_cache_resume();
 
 // key = the layer's gate_up_exps tensor when fused, else its up_exps tensor.
 // nullptr when the cache is disabled or this tensor has no cached layer
