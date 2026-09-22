@@ -473,6 +473,12 @@ size_t llama_moe_cache_suspend() {
         freed += ggml_backend_buffer_get_size(mc->bufs[i]);
         ggml_backend_buffer_free(mc->bufs[i]);
         mc->bufs[i] = nullptr;
+        // detach the tensors from the freed buffer: ggml_backend_alloc_ctx_tensors_from_buft only allocates tensors whose data
+        // is NULL, so a stale pointer would make resume() "allocate" nothing and fail
+        for (ggml_tensor * t = ggml_get_first_tensor(mc->ctxs[i]); t; t = ggml_get_next_tensor(mc->ctxs[i], t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
     }
     mc->suspended = true;
     LLAMA_LOG_INFO("moe-cache: prefill mode: released %.1f MiB of device slots\n", freed/1024.0/1024.0);
