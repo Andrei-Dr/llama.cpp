@@ -1109,6 +1109,9 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // dev_overlap: optional device work that depends only on the layer input (e.g. a shared expert). When the MoE expert
+    // cache is active it is built inside the cache-hit split, which runs concurrently with the host experts; otherwise it is
+    // NOT called and the caller builds it where it always did (so the graph without a cache is unchanged).
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1129,7 +1132,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const std::function<ggml_tensor *()> & dev_overlap = {}) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1155,7 +1159,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             const std::function<ggml_tensor *()> & dev_overlap = {}) const;
 
     //
     // inputs
