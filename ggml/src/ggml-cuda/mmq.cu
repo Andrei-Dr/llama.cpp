@@ -316,7 +316,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         }
     }
 
-    if (turing_mma_available(cc)) {
+    if (mmq_turing_mma_available(cc)) {
         return true;
     }
 

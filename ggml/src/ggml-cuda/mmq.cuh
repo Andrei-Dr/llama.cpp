@@ -2,6 +2,23 @@
 
 #include "common.cuh"
 
+// GGML_CUDA_MMQ_NO_MMA: the quantized matmuls (MMQ, batches > 8: prefill) use the dp4a kernels even where Turing MMA is compiled
+// in. For Turing parts without tensor cores (GTX 16xx: TU116 / TU117), whose MMA path is sized for hardware they lack: the
+// Pascal-path build measured 3x the prefill on a GTX 1650 SUPER (arch1). Decode (MMVQ) and FlashAttention keep their own paths.
+// Host (tile sizes, data layout) and device (kernel bodies) read the same switch, so they cannot disagree.
+#if defined(TURING_MMA_AVAILABLE) && !defined(GGML_CUDA_MMQ_NO_MMA)
+#define MMQ_TURING_MMA_AVAILABLE
+#endif // defined(TURING_MMA_AVAILABLE) && !defined(GGML_CUDA_MMQ_NO_MMA)
+
+static bool mmq_turing_mma_available(const int cc) {
+#ifdef GGML_CUDA_MMQ_NO_MMA
+    GGML_UNUSED(cc);
+    return false;
+#else
+    return turing_mma_available(cc);
+#endif // GGML_CUDA_MMQ_NO_MMA
+}
+
 #include <climits>
 #include <cstdint>
 
@@ -187,18 +204,18 @@ struct ggml_cuda_mmq_config {
 
     // TODO transition all combinations of GPUs and quantizations to the MMA data layout.
     __host__ int use_mma_data_layout(const int cc) const {
-        if (amd_mfma_available(cc) || amd_wmma_available(cc) || turing_mma_available(cc)) {
+        if (amd_mfma_available(cc) || amd_wmma_available(cc) || mmq_turing_mma_available(cc)) {
             return true;
         }
         return false;
     }
 
     constexpr __device__ bool use_mma_data_layout() const {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(MMQ_TURING_MMA_AVAILABLE)
         return true;
 #else
         return false;
-#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(MMQ_TURING_MMA_AVAILABLE)
     }
 
 };
@@ -249,9 +266,11 @@ static __host__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(const ggml_type ty
     if (blackwell_mma_available(cc)) {
         return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
     }
+#ifndef GGML_CUDA_MMQ_NO_MMA // no MMA: the dp4a tile config below, exactly as a Pascal-arch build selects it
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) {
         return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
     }
+#endif // GGML_CUDA_MMQ_NO_MMA
     if (ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_DP4A) {
         return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
     }
@@ -276,7 +295,7 @@ static constexpr __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config(ggml_t
 #else
 #ifdef BLACKWELL_MMA_AVAILABLE
     return ggml_cuda_mmq_get_config_blackwell(type, J, fallback);
-#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && !defined(GGML_CUDA_MMQ_NO_MMA)
     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A
     return ggml_cuda_mmq_get_config_pascal_dp4a(type, J, fallback);
