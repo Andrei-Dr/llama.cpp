@@ -1790,12 +1790,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
-                        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        if (ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async != NULL) {
+                            // host -> device (e.g. the outputs of host-offloaded MoE experts): enqueue the upload on the split
+                            // backend's own stream, ordered after the event wait above and before this split's compute, instead
+                            // of blocking the host for the transfer. The host source cannot be overwritten before the copy runs:
+                            // any later split on the host backend first synchronizes this backend (it either copies inputs from
+                            // it, which synchronizes the input backend, or has no inputs and synchronizes the previous backend).
+                            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                         } else {
-                            ggml_backend_synchronize(split_backend);
+                            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                            } else {
+                                ggml_backend_synchronize(split_backend);
+                            }
+                            ggml_backend_tensor_copy(input, input_cpy);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
                     }
                 }
             }
