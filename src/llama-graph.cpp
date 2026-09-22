@@ -1967,7 +1967,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const std::function<ggml_tensor *()> & dev_overlap) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1988,7 +1989,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        dev_overlap
     );
 }
 
@@ -2016,7 +2018,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const std::function<ggml_tensor *()> & dev_overlap) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2262,6 +2265,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         mc_out = mc_mm(mcache->down_c, mc_act, mcache->down_s_c, "ffn_moe_cache_down");
         ggml_build_forward_expand(gf, mc_out);
+
+        // caller-supplied device work that only needs the layer input (a shared expert): same split as the cache hits,
+        // so it also runs while the host computes the misses instead of after them
+        if (dev_overlap) {
+            ggml_build_forward_expand(gf, dev_overlap());
+        }
     }
 
     // host side: hand the expert table to the CPU mul_mat_id so it skips cached ids, and keep the op on the
