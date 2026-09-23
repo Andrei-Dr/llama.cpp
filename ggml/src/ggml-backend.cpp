@@ -1518,7 +1518,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // The plan only depends on the graph's structure, not on the batch size, so the graph_copy layout is the same for every
     // batch that produces this split structure. Cost: the next expert tensor is resident one split early (VRAM).
     // CUDA only (a second backend instance = a second stream; other backends' cross-instance events are not validated).
-    if (ggml_backend_sched_moe_prefetch_enabled() && sched->n_copies == 1 && !ggml_backend_sched_moe_readback_forced()) {
+    // GGML_SCHED_MOE_PREFETCH_SKIPLOOP=1 (diagnostic): mode on, plan loop skipped entirely (bisects the per-graph cost, ovl17)
+    static const bool diag_skiploop = [] {
+        const char * env = getenv("GGML_SCHED_MOE_PREFETCH_SKIPLOOP");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    if (ggml_backend_sched_moe_prefetch_enabled() && !diag_skiploop && sched->n_copies == 1 && !ggml_backend_sched_moe_readback_forced()) {
         for (int i = 1; i < sched->n_splits; i++) {
             struct ggml_backend_sched_split * split = &sched->splits[i];
             ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
