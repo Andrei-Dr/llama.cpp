@@ -27,9 +27,16 @@ const mtp_subvocab * mtp_subvocab_get(const ggml_tensor * head_w) {
     if (sv.tried) {
         return sv.head == head_w && sv.w_sub ? &sv : nullptr;
     }
-    sv.tried = true;
     const char * path = getenv("LLAMA_MTP_VOCAB_FILE");
-    if (!path || !head_w->buffer || ggml_is_transposed(head_w)) {
+    if (!path) {
+        return nullptr;
+    }
+    // graphs are also built over UNALLOCATED weights (the memory-fit dry run): wait for a head with data before deciding
+    if (!head_w->buffer || head_w->data == nullptr) {
+        return nullptr;
+    }
+    sv.tried = true;
+    if (ggml_is_transposed(head_w)) {
         return nullptr;
     }
     const int64_t n_embd = head_w->ne[0], n_vocab = head_w->ne[1];
