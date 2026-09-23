@@ -377,6 +377,16 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // the MoE expert cache's pre-gated prefetch enqueues its slot uploads on the compute stream of the device that runs the
+        // cached layers (a no-op unless this context's model owns the cache and LLAMA_MOE_PREFETCH is set)
+        for (auto & backend : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                llama_moe_cache_set_backend(model, backend.get());
+                break;
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -500,6 +510,7 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    llama_moe_cache_set_backend(model, nullptr);
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 

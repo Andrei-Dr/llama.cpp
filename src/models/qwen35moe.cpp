@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moecache.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -210,8 +211,24 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
+        // pre-gated prefetch (LLAMA_MOE_PREFETCH, see llama-moecache.h): layer il+1's router on this layer's MoE input predicts
+        // il+1's experts; the prediction is computed here (ahead of this layer's cache-hit barrier) and consumed by a CPU node
+        // at the head of this layer's host-expert split, which uploads the predicted misses into il+1's cache slots
+        ggml_tensor * pf_node = nullptr;
+        if (n_tokens <= 4 && il + 1 < n_layer && llama_moe_cache_prefetch_budget() > 0) {
+            const auto & nl = model.layers[il + 1];
+            ggml_tensor * key_next = nl.ffn_gate_up_exps ? nl.ffn_gate_up_exps : nl.ffn_up_exps;
+            if (nl.ffn_gate_inp && llama_moe_cache_lookup(key_next)) {
+                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0,
+                        ggml_mul_mat(ctx0, nl.ffn_gate_inp, attn_post_norm), llama_moe_cache_prefetch_topk()));
+                cb(pred, "ffn_moe_prefetch_pred", il);
+                ggml_build_forward_expand(gf, pred);
+                pf_node = llama_moe_cache_build_prefetch(ctx0, key_next, pred);
+            }
+        }
+
         // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il);
+        cur = build_layer_ffn(attn_post_norm, il, pf_node);
         cb(cur, "ffn_out", il);
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
@@ -491,7 +508,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * host_first) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
@@ -541,7 +558,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s,
             nullptr,
-            has_shexp ? std::function<ggml_tensor *()>(build_shexp) : std::function<ggml_tensor *()>());
+            has_shexp ? std::function<ggml_tensor *()>(build_shexp) : std::function<ggml_tensor *()>(),
+            host_first);
     cb(moe_out, "ffn_moe_out", il);
 
     if (has_shexp) {

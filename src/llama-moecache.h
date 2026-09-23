@@ -25,6 +25,8 @@
 //
 // Enabled via llama_context_params.n_moe_cache_slots (CLI: --moe-expert-cache).
 
+#include "ggml-backend.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -104,3 +106,17 @@ ggml_tensor * llama_moe_cache_build_warm_obs(ggml_context * ctx, const ggml_tens
 // publish finished uploads and schedule new ones. Call between graph executions only,
 // after the backend has been synchronized.
 void llama_moe_cache_step();
+
+// pre-gated prefetch (LLAMA_MOE_PREFETCH=N, N = max uploads per layer per decode step; 0/unset = off).
+// During layer L of a decode step, layer L+1's router applied to layer L's MoE input predicts L+1's experts (top-k,
+// LLAMA_MOE_PREFETCH_TOPK, default 16). A CPU node at the head of layer L's host-expert split uploads the predicted experts
+// that are not cached into LRU slots of layer L+1 and publishes them IN THE SAME STEP: the slot copies and the device table
+// are enqueued with set_tensor_async on the compute backend's stream (behind layer L's cache-hit kernels, ahead of every
+// kernel of layer L+1), and the host table is written directly (layer L+1's host-expert op reads it later on this thread).
+// Layer L+1 then computes those experts on the device and the host skips them. Same math as any cache hit.
+// set_backend registers the compute backend that runs the cached layers (nullptr = unregister); only the owning model's
+// context may register. build_prefetch returns the CPU node for the layer keyed by key_next, or nullptr.
+void          llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backend);
+int           llama_moe_cache_prefetch_budget(); // 0 = prefetch off (unset, no backend, suspended, or cache-aware routing)
+int           llama_moe_cache_prefetch_topk();
+ggml_tensor * llama_moe_cache_build_prefetch(ggml_context * ctx, const ggml_tensor * key_next, ggml_tensor * pred_ids);
