@@ -3429,6 +3429,24 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// GGML_CUDA_FUSION_LOG=1 (diagnostic): count the memory-range verdicts of the fusions whose eligibility depends on buffer
+// addresses (MoE weighted reduction, top-k MoE); logged every 4096 verdicts. A layout change that flips a verdict changes the
+// kernels that run (fused vs unfused round differently) without changing the math.
+static bool ggml_cuda_fusion_verdict(int kind, bool ok) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_FUSION_LOG"); return e != nullptr && atoi(e) != 0; }();
+    if (on) {
+        static uint64_t n[2][2] = {};
+        static uint64_t total = 0;
+        n[kind][ok ? 1 : 0]++;
+        if (++total % 4096 == 0) {
+            GGML_LOG_INFO("cuda-fusion: verdicts %llu | moe_weighted_reduction ok %llu reject %llu | topk_moe ok %llu reject %llu\n",
+                (unsigned long long) total, (unsigned long long) n[0][1], (unsigned long long) n[0][0],
+                (unsigned long long) n[1][1], (unsigned long long) n[1][0]);
+        }
+    }
+    return ok;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3442,7 +3460,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            if (ggml_cuda_fusion_verdict(0, ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1))) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
@@ -3517,7 +3535,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_fusion_verdict(1, ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true))) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
@@ -3532,7 +3550,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
+                        ggml_cuda_fusion_verdict(1, ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true))) {
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
                     return ops.size() - 1;
                 }
