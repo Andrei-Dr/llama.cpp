@@ -864,13 +864,17 @@ static bool ggml_backend_sched_moe_readback_forced(void) {
     return forced;
 }
 
-// GGML_SCHED_MOE_PREFETCH=1: overlap the whole-tensor upload of host expert weights with the previous split's compute
-static bool ggml_backend_sched_moe_prefetch_enabled(void) {
-    static const bool enabled = [] {
+// GGML_SCHED_MOE_PREFETCH=1: overlap the whole-tensor upload of host expert weights with the previous split's compute.
+// =2 (diagnostic): plan and hoist the input copies, but upload them in stream order like the default path (no second stream).
+static int ggml_backend_sched_moe_prefetch_mode(void) {
+    static const int mode = [] {
         const char * env = getenv("GGML_SCHED_MOE_PREFETCH");
-        return env != nullptr && atoi(env) != 0;
+        return env != nullptr ? atoi(env) : 0;
     }();
-    return enabled;
+    return mode;
+}
+static bool ggml_backend_sched_moe_prefetch_enabled(void) {
+    return ggml_backend_sched_moe_prefetch_mode() != 0;
 }
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
@@ -1955,7 +1959,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int b = splits[i_split].backend_id;
         ggml_backend_t backend = sched->backends[b];
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        if (sched->prefetch_off[b] || dev == NULL) {
+        if (sched->prefetch_off[b] || dev == NULL || ggml_backend_sched_moe_prefetch_mode() == 2) {
             return;
         }
         const struct ggml_backend_sched_split * target = &splits[target_id];
