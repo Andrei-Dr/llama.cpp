@@ -124,4 +124,5 @@ int           llama_moe_cache_prefetch_topk();
 bool          llama_moe_cache_prefetch_ok(const ggml_tensor * key_next); // budget > 0 and the layer keyed by key_next qualifies
 ggml_tensor * llama_moe_cache_build_prefetch(ggml_context * ctx, const ggml_tensor * key_next, ggml_tensor * pred_ids);
 // the matching tail node: expand it as the LAST node of the same host-expert split (after the host down-projection `after`)
-ggml_tensor * llama_moe_cache_build_prefetch_join(ggml_context * ctx, ggml_tensor * after);
+ggml_tensor * llama_moe_cache_build_prefetch_join(ggml_context * ctx, ggml_tensor * after, int il, bool has_head);
+int           llama_moe_cache_prefetch_ahead(); // layers ahead the prediction targets: 2 (window mode) or 1 (step mode)

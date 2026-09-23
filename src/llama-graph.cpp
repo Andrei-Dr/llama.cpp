@@ -2462,8 +2462,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mcache) {
         mc_host(experts);
         // a prefetch posted at the head of this host split must be fully enqueued before the next device split
-        if (host_first_node) {
-            if (ggml_tensor * join = llama_moe_cache_build_prefetch_join(ctx0, experts)) {
+        if (host_first) {
+            if (ggml_tensor * join = llama_moe_cache_build_prefetch_join(ctx0, experts, il, host_first_node != nullptr)) {
                 ggml_build_forward_expand(gf, join);
             }
         }

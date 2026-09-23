@@ -98,6 +98,20 @@ struct moe_cache {
     // thread enqueues them on the compute stream while the host experts run; the tail op (last node of the same split)
     // waits until it is done, so every copy is in the stream before the scheduler enqueues layer L+1's kernels
     struct pf_copy { ggml_tensor * dst; const void * src; size_t offset; size_t size; };
+    // window mode (LLAMA_MOE_PREFETCH_MODE=window, default): layer L's TAIL (the host experts just finished, DDR4 goes idle
+    // while the device runs L's combine and L+1's attention) issues L+2's predicted misses on a SEPARATE copy stream and
+    // records an event; layer L+1's tail makes the compute stream wait on it (ahead of L+1's combine, so ahead of L+2's cache
+    // chain). step mode (=step): the head of layer L's host split uploads L+1's misses on the compute stream (pf1-pf3: the DMA
+    // lands inside the DDR4-bound host window and costs more than it saves).
+    int                     pf_mode         = 1;       // 0 = step, 1 = window
+    ggml_backend_t          pf_copy_backend = nullptr; // window: second instance of the device backend = its own stream
+    ggml_backend_event_t    pf_ev[2]        = { nullptr, nullptr };
+    int                     pf_pending_il   = -1;      // window: target layer of the last issued, not yet waited copy
+    int                     pf_pending_ev   = -1;
+    ggml_tensor *           pf_build_pred   = nullptr; // graph build: prediction the next tail node consumes
+    int                     pf_build_target = -1;
+    ggml_backend_t          pf_job_backend  = nullptr; // helper job: stream to issue on, event to record after it (or null)
+    ggml_backend_event_t    pf_job_event    = nullptr;
     bool                    pf_inline  = false;  // LLAMA_MOE_PREFETCH_INLINE=1: issue on the head op's thread (A/B)
     bool                    pf_touch   = true;   // LLAMA_MOE_PREFETCH_TOUCH=0: do not refresh the LRU clock of predicted cached experts
     std::thread             pf_thread;
@@ -113,6 +127,16 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+
+// wait until the helper thread has enqueued the posted copies (and recorded their event)
+void pf_join_helper(moe_cache * mc) {
+    if (mc->pf_inline) {
+        return;
+    }
+    std::unique_lock<std::mutex> plk(mc->pf_mtx);
+    mc->pf_cv.wait(plk, [mc]() { return !mc->pf_busy || mc->pf_stop; });
+}
+
 
 // which layers the pre-gated prefetch may target: slots in dev_buft (the registered backend's device) and pinned host experts
 int pf_qualify(moe_cache * mc, ggml_backend_buffer_type_t host_buft, ggml_backend_buffer_type_t dev_buft) {
@@ -310,6 +334,8 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
         mc->pf_budget = e ? std::max(0, atoi(e)) : 0;
         const char * tc = getenv("LLAMA_MOE_PREFETCH_TOUCH");
         mc->pf_touch = !(tc && atoi(tc) == 0);
+        const char * md = getenv("LLAMA_MOE_PREFETCH_MODE");
+        mc->pf_mode = (md && strcmp(md, "step") == 0) ? 0 : 1;
         const char * in = getenv("LLAMA_MOE_PREFETCH_INLINE");
         mc->pf_inline = in && atoi(in) != 0;
         const char * k = getenv("LLAMA_MOE_PREFETCH_TOPK");
@@ -514,6 +540,11 @@ size_t llama_moe_cache_suspend() {
     if (!mc || mc->suspended) {
         return 0;
     }
+    if (mc->pf_copy_backend) {
+        pf_join_helper(mc);
+        ggml_backend_synchronize(mc->pf_copy_backend); // no prefetch copy may still write the slots being freed
+        mc->pf_pending_il = -1;
+    }
     {
         // queued uploads are dropped; one already being copied must land before its buffer goes away
         std::unique_lock<std::mutex> wlk(mc->wmtx);
@@ -629,6 +660,20 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
         mc->pf_stop = false;
     }
     std::lock_guard<std::mutex> lock(mc->mtx);
+    if (mc->pf_copy_backend) {
+        ggml_backend_synchronize(mc->pf_copy_backend); // nothing may still read the stage or write the slots
+    }
+    for (auto & ev : mc->pf_ev) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
+    if (mc->pf_copy_backend) {
+        ggml_backend_free(mc->pf_copy_backend);
+        mc->pf_copy_backend = nullptr;
+    }
+    mc->pf_pending_il = -1;
     if (mc->pf_stage) {
         ggml_backend_buffer_free(mc->pf_stage);
         mc->pf_stage = nullptr;
@@ -651,6 +696,22 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
         LLAMA_LOG_WARN("moe-cache: pre-gated prefetch disabled: no layer with device slots on %s and pinned host experts\n",
                 ggml_backend_name(backend));
         return;
+    }
+    if (mc->pf_mode == 1) {
+        mc->pf_copy_backend = ggml_backend_dev_init(dev, nullptr);
+        mc->pf_ev[0] = mc->pf_copy_backend ? ggml_backend_event_new(dev) : nullptr;
+        mc->pf_ev[1] = mc->pf_copy_backend ? ggml_backend_event_new(dev) : nullptr;
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (!mc->pf_copy_backend || !mc->pf_ev[0] || !mc->pf_ev[1] || !props.caps.async || !props.caps.events) {
+            LLAMA_LOG_WARN("moe-cache: pre-gated prefetch disabled: %s has no second stream / events for window mode\n",
+                    ggml_backend_name(backend));
+            for (auto & ev : mc->pf_ev) { if (ev) { ggml_backend_event_free(ev); ev = nullptr; } }
+            if (mc->pf_copy_backend) { ggml_backend_free(mc->pf_copy_backend); mc->pf_copy_backend = nullptr; }
+            ggml_backend_buffer_free(mc->pf_stage);
+            mc->pf_stage = nullptr;
+            return;
+        }
     }
     mc->pf_backend = backend;
     // the issue thread calls the CUDA runtime without selecting a device: only the first GPU device qualifies (else inline)
@@ -675,9 +736,14 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
                 }
                 std::vector<moe_cache::pf_copy> todo;
                 todo.swap(mc->pf_todo);
+                ggml_backend_t       be = mc->pf_job_backend;
+                ggml_backend_event_t ev = mc->pf_job_event;
                 plk.unlock();
                 for (const auto & c : todo) {
-                    ggml_backend_tensor_set_async(mc->pf_backend, c.dst, c.src, c.offset, c.size);
+                    ggml_backend_tensor_set_async(be, c.dst, c.src, c.offset, c.size);
+                }
+                if (ev) {
+                    ggml_backend_event_record(ev, be);
                 }
                 plk.lock();
                 mc->pf_busy = false;
@@ -690,7 +756,8 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
                 n_ok, mc->layers.size());
     }
     if (backend && mc->pf_budget > 0) {
-        LLAMA_LOG_INFO("moe-cache: pre-gated prefetch on: up to %d uploads per layer per step from the top-%d prediction (%s, %s issue)\n",
+        LLAMA_LOG_INFO("moe-cache: pre-gated prefetch on: %s mode, up to %d uploads per layer per step from the top-%d prediction (%s, %s issue)\n",
+                mc->pf_mode == 1 ? "window (L+2, copy stream)" : "step (L+1, compute stream)",
                 mc->pf_budget, mc->pf_topk, ggml_backend_name(backend), mc->pf_inline ? "inline" : "async");
     }
 }
@@ -730,17 +797,10 @@ bool llama_moe_cache_prefetch_ok(const ggml_tensor * key_next) {
     return it != mc->by_key.end() && mc->layers[it->second].pf_ok;
 }
 
-// custom op (CPU, one task): a = predicted expert ids of the target layer [k, n_tokens] (I32, sorted by router score per
-// token, best first); ud = layer index
-static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
-    GGML_UNUSED(dst);
-    GGML_UNUSED(nth);
-    moe_cache * mc = g_cache;
-    const size_t idx = (size_t) (uintptr_t) ud;
-    if (ith != 0 || !mc || mc->suspended || !mc->pf_backend || !mc->pf_stage || idx >= mc->layers.size() || a->type != GGML_TYPE_I32 ||
-            !mc->layers[idx].pf_ok) {
-        return;
-    }
+// plan a prefetch into layer idx from predicted ids a [k, n_tokens] (I32, sorted by router score per token, best first):
+// pick LRU victims, rewrite the bookkeeping and the host table NOW, stage the device table, and return the copies (slot slices
+// then the table) that must land before the layer's next device read. Called with nothing locked; takes mc->mtx.
+static void pf_plan(moe_cache * mc, size_t idx, const ggml_tensor * a, std::vector<moe_cache::pf_copy> & copies) {
     layer_state & ls = mc->layers[idx];
     llama_moe_cache_layer & pub = ls.pub;
     const int32_t n_expert = (int32_t) ls.expert_slot.size();
@@ -760,8 +820,6 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<moe_cache::pf_copy> copies;
     std::unique_lock<std::mutex> lock(mc->mtx);
     int32_t * host_table = (int32_t *) pub.host_table->data;
     int budget = mc->pf_budget;
@@ -835,7 +893,21 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         memcpy(stage, host_table, nb);
         copies.push_back({ pub.dev_table, stage, 0, nb });
     }
-    lock.unlock();
+}
+
+// custom op (CPU, one task), step mode: first node of layer L's host-expert split; a = layer L+1's predicted ids; ud = its index
+static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    moe_cache * mc = g_cache;
+    const size_t idx = (size_t) (uintptr_t) ud;
+    if (ith != 0 || !mc || mc->suspended || !mc->pf_backend || !mc->pf_stage || idx >= mc->layers.size() || a->type != GGML_TYPE_I32 ||
+            !mc->layers[idx].pf_ok) {
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<moe_cache::pf_copy> copies;
+    pf_plan(mc, idx, a, copies);
     if (!copies.empty()) {
         if (mc->pf_inline) {
             for (const auto & c : copies) {
@@ -846,6 +918,8 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 std::lock_guard<std::mutex> plk(mc->pf_mtx);
                 GGML_ASSERT(!mc->pf_busy && "prefetch issue still running: the tail join of the previous layer was skipped");
                 mc->pf_todo = std::move(copies);
+                mc->pf_job_backend = mc->pf_backend;
+                mc->pf_job_event   = nullptr;
                 mc->pf_busy = true;
             }
             mc->pf_cv.notify_all();
@@ -855,24 +929,106 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     mc->pf_calls++;
 }
 
-// custom op (CPU, one task), last node of the host-expert split whose head posted a prefetch: wait until every copy is enqueued
+// custom op (CPU, one task), step mode: last node of the host split whose head posted a prefetch
 static void moe_prefetch_join_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
     GGML_UNUSED(dst); GGML_UNUSED(a); GGML_UNUSED(nth); GGML_UNUSED(ud);
     moe_cache * mc = g_cache;
-    if (ith != 0 || !mc || mc->pf_inline) {
+    if (ith != 0 || !mc) {
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    std::unique_lock<std::mutex> plk(mc->pf_mtx);
-    mc->pf_cv.wait(plk, [mc]() { return !mc->pf_busy || mc->pf_stop; });
+    pf_join_helper(mc);
     mc->pf_tail_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 }
 
-ggml_tensor * llama_moe_cache_build_prefetch_join(ggml_context * ctx, ggml_tensor * after) {
+// window mode, last node of layer L's host split (ud = L's il, and target il + 1 << 16, 0 = none; b = target's predicted ids):
+//  1) the copies issued by the previous tail target L+1: make the compute stream wait for them (ahead of L's combine, i.e.
+//     ahead of L+1's cache chain). A pending target <= L means a tail was skipped: the target's device reads were enqueued
+//     unordered with its slot copies -> abort rather than compute with torn slots.
+//  2) plan L+2's misses and hand them to the helper, which issues them on the copy stream and records the event.
+static void moe_prefetch_tail(const ggml_tensor * b, uintptr_t ud) {
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->pf_copy_backend) {
+        return;
+    }
+    const int il     = (int) (ud & 0xffff);
+    const int target = (int) (ud >> 16) - 1;
+    const auto t0 = std::chrono::steady_clock::now();
+    pf_join_helper(mc);
+    if (mc->pf_pending_il >= 0) {
+        if (mc->pf_pending_il == il + 1) {
+            ggml_backend_event_wait(mc->pf_backend, mc->pf_ev[mc->pf_pending_ev]);
+            mc->pf_pending_il = -1;
+        } else if (mc->pf_pending_il <= il) {
+            GGML_ABORT("moe-cache: prefetch into layer %d was not waited for before its device reads (tail of layer %d missing)",
+                    mc->pf_pending_il, mc->pf_pending_il - 1);
+        }
+    }
+    if (b != nullptr && target >= 0 && !mc->suspended && target < (int32_t) mc->il_to_idx.size() && mc->il_to_idx[target] >= 0 &&
+            mc->layers[mc->il_to_idx[target]].pf_ok && b->type == GGML_TYPE_I32) {
+        GGML_ASSERT(mc->pf_pending_il < 0 && "window prefetch: a previous copy is still unwaited");
+        std::vector<moe_cache::pf_copy> copies;
+        pf_plan(mc, (size_t) mc->il_to_idx[target], b, copies);
+        if (!copies.empty()) {
+            const int e = target & 1;
+            if (mc->pf_inline) {
+                for (const auto & c : copies) {
+                    ggml_backend_tensor_set_async(mc->pf_copy_backend, c.dst, c.src, c.offset, c.size);
+                }
+                ggml_backend_event_record(mc->pf_ev[e], mc->pf_copy_backend);
+            } else {
+                {
+                    std::lock_guard<std::mutex> plk(mc->pf_mtx);
+                    GGML_ASSERT(!mc->pf_busy);
+                    mc->pf_todo        = std::move(copies);
+                    mc->pf_job_backend = mc->pf_copy_backend;
+                    mc->pf_job_event   = mc->pf_ev[e];
+                    mc->pf_busy        = true;
+                }
+                mc->pf_cv.notify_all();
+            }
+            mc->pf_pending_il = target;
+            mc->pf_pending_ev = e;
+        }
+        mc->pf_calls++;
+    }
+    mc->pf_tail_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+
+static void moe_prefetch_tail_op2(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst); GGML_UNUSED(a); GGML_UNUSED(nth);
+    if (ith == 0) {
+        moe_prefetch_tail(b, (uintptr_t) ud);
+    }
+}
+
+static void moe_prefetch_tail_op1(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst); GGML_UNUSED(a); GGML_UNUSED(nth);
+    if (ith == 0) {
+        moe_prefetch_tail(nullptr, (uintptr_t) ud);
+    }
+}
+
+int llama_moe_cache_prefetch_ahead() {
+    return g_cache && g_cache->pf_mode == 1 ? 2 : 1;
+}
+
+ggml_tensor * llama_moe_cache_build_prefetch_join(ggml_context * ctx, ggml_tensor * after, int il, bool has_head) {
+    moe_cache * mc = g_cache;
     if (llama_moe_cache_prefetch_budget() <= 0 || !after) {
         return nullptr;
     }
-    return ggml_map_custom1(ctx, after, moe_prefetch_join_op, 1, nullptr);
+    if (mc->pf_mode == 0) {
+        return has_head ? ggml_map_custom1(ctx, after, moe_prefetch_join_op, 1, nullptr) : nullptr;
+    }
+    // window: a tail node at EVERY cached decode layer (it carries the wait for the copies the previous tail issued)
+    ggml_tensor * pred = mc->pf_build_pred;
+    const int target   = mc->pf_build_target;
+    mc->pf_build_pred   = nullptr;
+    mc->pf_build_target = -1;
+    const uintptr_t ud = (uintptr_t) (il & 0xffff) | ((uintptr_t) (pred ? target + 1 : 0) << 16);
+    return pred ? ggml_map_custom2(ctx, after, pred, moe_prefetch_tail_op2, 1, (void *) ud)
+                : ggml_map_custom1(ctx, after, moe_prefetch_tail_op1, 1, (void *) ud);
 }
 
 ggml_tensor * llama_moe_cache_build_prefetch(ggml_context * ctx, const ggml_tensor * key_next, ggml_tensor * pred_ids) {
@@ -884,6 +1040,12 @@ ggml_tensor * llama_moe_cache_build_prefetch(ggml_context * ctx, const ggml_tens
     if (it == mc->by_key.end() || !mc->layers[it->second].pf_ok) {
         return nullptr;
     }
+    if (mc->pf_mode == 1) {
+        // consumed by this layer's tail node (built by llama_moe_cache_build_prefetch_join in the same build_moe_ffn call)
+        mc->pf_build_pred   = pred_ids;
+        mc->pf_build_target = mc->layers[it->second].pub.il;
+        return nullptr;
+    }
     return ggml_map_custom1(ctx, pred_ids, moe_prefetch_op, 1, (void *) (uintptr_t) it->second);
 }
 
@@ -891,6 +1053,13 @@ void llama_moe_cache_step() {
     moe_cache * mc = g_cache;
     if (!mc || mc->suspended) {
         return; // prefill mode: no slots to fill; the warm-up counts wait for resume()
+    }
+
+    // 0) window prefetch: everything issued this step has been waited for by the last tail; drain the copy stream anyway
+    if (mc->pf_copy_backend) {
+        pf_join_helper(mc);
+        ggml_backend_synchronize(mc->pf_copy_backend);
+        mc->pf_pending_il = -1;
     }
 
     // 1) publish completed uploads (sync point: no graph is executing)

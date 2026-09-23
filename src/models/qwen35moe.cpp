@@ -215,21 +215,36 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // il+1's experts. build_moe_ffn calls the builder only when it builds this layer's cache chain, ahead of the cache-hit
         // barrier; the CPU node it returns heads this layer's host-expert split and uploads the predicted misses into il+1's slots
         std::function<ggml_tensor *()> pf_builder;
-        if (n_tokens <= 4 && il + 1 < n_layer && llama_moe_cache_prefetch_budget() > 0) {
-            const auto & nl = model.layers[il + 1];
-            ggml_tensor * key_next = nl.ffn_gate_up_exps ? nl.ffn_gate_up_exps : nl.ffn_up_exps;
-            // the next layer must qualify (cached, device slots, pinned experts) and its router must be device-resident (a
-            // host router would add a device -> host -> device round trip ahead of the barrier)
-            if (nl.ffn_gate_inp && nl.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(nl.ffn_gate_inp->buffer) &&
-                    llama_moe_cache_prefetch_ok(key_next)) {
-                pf_builder = [&, key_next, il]() -> ggml_tensor * {
-                    const auto & nl2 = model.layers[il + 1];
-                    const int topk = std::min<int>(llama_moe_cache_prefetch_topk(), (int) nl2.ffn_gate_inp->ne[1]);
+        if (n_tokens <= 4 && llama_moe_cache_prefetch_budget() > 0) {
+            // window mode predicts two layers ahead (the copy is issued at this layer's tail and waited for at the next
+            // layer's tail), step mode one layer ahead. In window mode the builder is provided for EVERY layer: build_moe_ffn
+            // then puts a tail node at every cached layer, which carries the wait for the previous layer's copies.
+            const int ahead  = llama_moe_cache_prefetch_ahead();
+            const int target = il + ahead;
+            bool predict = false;
+            ggml_tensor * key_target = nullptr;
+            if (target < n_layer) {
+                const auto & tl = model.layers[target];
+                key_target = tl.ffn_gate_up_exps ? tl.ffn_gate_up_exps : tl.ffn_up_exps;
+                // the target must qualify and its router be device-resident (a host router adds a device -> host -> device
+                // round trip ahead of the barrier); window mode also needs layer il+1 cached, i.e. with a tail node to wait
+                const auto & ml = model.layers[il + 1];
+                ggml_tensor * key_mid = ml.ffn_gate_up_exps ? ml.ffn_gate_up_exps : ml.ffn_up_exps;
+                predict = tl.ffn_gate_inp && tl.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(tl.ffn_gate_inp->buffer) &&
+                          llama_moe_cache_prefetch_ok(key_target) && (ahead == 1 || llama_moe_cache_lookup(key_mid));
+            }
+            if (predict || ahead == 2) {
+                pf_builder = [&, key_target, target, predict]() -> ggml_tensor * {
+                    if (!predict) {
+                        return nullptr; // window mode: tail (wait) only
+                    }
+                    const auto & tl2 = model.layers[target];
+                    const int topk = std::min<int>(llama_moe_cache_prefetch_topk(), (int) tl2.ffn_gate_inp->ne[1]);
                     ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0,
-                            ggml_mul_mat(ctx0, nl2.ffn_gate_inp, attn_post_norm), topk));
+                            ggml_mul_mat(ctx0, tl2.ffn_gate_inp, attn_post_norm), topk));
                     cb(pred, "ffn_moe_prefetch_pred", il);
                     ggml_build_forward_expand(gf, pred);
-                    return llama_moe_cache_build_prefetch(ctx0, key_next, pred);
+                    return llama_moe_cache_build_prefetch(ctx0, key_target, pred);
                 };
             }
         }
