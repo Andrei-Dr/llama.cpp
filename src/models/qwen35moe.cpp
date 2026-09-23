@@ -1,6 +1,81 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdio>
+#include <vector>
+
+// LLAMA_MTP_VOCAB_FILE=<path> (FR-Spec style draft vocabulary): the MTP draft's LM head computes only the rows of the token ids
+// listed in the file (int32 little-endian, e.g. the ~32k most frequent tokens) and scatters them into a persistent [1, n_vocab]
+// logits buffer that holds -inf everywhere else. The head is read at ~VRAM roofline (pf3: 0.81 ms/token on the draft), so the
+// cost scales with the rows read. The TARGET still verifies every draft against its full vocabulary: outputs keep the target's
+// distribution; only the acceptance rate can change (a draft can no longer propose a token outside the list).
+// Built lazily at the first single-output draft graph; nullptr (full head) when unset, unreadable, or the head has a scale.
+namespace {
+struct mtp_subvocab {
+    bool                  tried       = false;
+    ggml_context *        ctx         = nullptr;
+    ggml_backend_buffer_t buf         = nullptr;
+    ggml_tensor *         w_sub       = nullptr; // [n_embd, K], same type as the head
+    ggml_tensor *         ids         = nullptr; // [K] I32
+    ggml_tensor *         logits_full = nullptr; // [1, n_vocab] F32, -inf outside ids (rows ids are rewritten every draft)
+    const ggml_tensor *   head        = nullptr; // the head it was built from
+};
+mtp_subvocab g_mtp_sv;
+
+const mtp_subvocab * mtp_subvocab_get(const ggml_tensor * head_w) {
+    mtp_subvocab & sv = g_mtp_sv;
+    if (sv.tried) {
+        return sv.head == head_w && sv.w_sub ? &sv : nullptr;
+    }
+    sv.tried = true;
+    const char * path = getenv("LLAMA_MTP_VOCAB_FILE");
+    if (!path || !head_w->buffer || ggml_is_transposed(head_w)) {
+        return nullptr;
+    }
+    const int64_t n_embd = head_w->ne[0], n_vocab = head_w->ne[1];
+    std::vector<int32_t> ids;
+    if (FILE * f = fopen(path, "rb")) {
+        int32_t v;
+        std::vector<bool> seen(n_vocab, false);
+        while (fread(&v, sizeof(v), 1, f) == 1) {
+            if (v >= 0 && v < n_vocab && !seen[v]) { seen[v] = true; ids.push_back(v); }
+        }
+        fclose(f);
+    }
+    if (ids.empty()) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_VOCAB_FILE=%s has no usable token ids; full draft head\n", __func__, path);
+        return nullptr;
+    }
+    const int64_t K = (int64_t) ids.size();
+    ggml_init_params ip = { ggml_tensor_overhead()*4, nullptr, true };
+    sv.ctx = ggml_init(ip);
+    sv.w_sub       = ggml_new_tensor_2d(sv.ctx, head_w->type, n_embd, K);
+    sv.ids         = ggml_new_tensor_1d(sv.ctx, GGML_TYPE_I32, K);
+    sv.logits_full = ggml_new_tensor_2d(sv.ctx, GGML_TYPE_F32, 1, n_vocab);
+    sv.buf = ggml_backend_alloc_ctx_tensors_from_buft(sv.ctx, ggml_backend_buffer_get_type(head_w->buffer));
+    if (!sv.buf) {
+        LLAMA_LOG_WARN("%s: could not allocate the draft sub-head; full draft head\n", __func__);
+        sv.w_sub = nullptr;
+        return nullptr;
+    }
+    // gather the listed rows of the (quantized) head: rows are contiguous blocks of nb[1] bytes
+    const size_t row = head_w->nb[1];
+    std::vector<uint8_t> all(ggml_nbytes(head_w)), sub((size_t) K*row);
+    ggml_backend_tensor_get(head_w, all.data(), 0, all.size());
+    for (int64_t k = 0; k < K; ++k) {
+        memcpy(sub.data() + (size_t) k*row, all.data() + (size_t) ids[k]*row, row);
+    }
+    ggml_backend_tensor_set(sv.w_sub, sub.data(), 0, sub.size());
+    ggml_backend_tensor_set(sv.ids, ids.data(), 0, ids.size()*sizeof(int32_t));
+    std::vector<float> minf(n_vocab, -INFINITY);
+    ggml_backend_tensor_set(sv.logits_full, minf.data(), 0, minf.size()*sizeof(float));
+    sv.head = head_w;
+    LLAMA_LOG_INFO("%s: MTP draft head restricted to %lld of %lld tokens (%.1f of %.1f MiB read per draft)\n", __func__,
+            (long long) K, (long long) n_vocab, sub.size()/1048576.0, all.size()/1048576.0);
+    return &sv;
+}
+} // namespace
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -743,7 +818,15 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    const mtp_subvocab * sv = (cur->ne[1] == 1 && head_s == nullptr && loras->empty()) ? mtp_subvocab_get(head_w) : nullptr;
+    if (sv) {
+        // K logits, scattered into the persistent -inf buffer (in place: set_rows returns a view of it)
+        ggml_tensor * sub = ggml_mul_mat(ctx0, sv->w_sub, cur);                                    // [K, 1]
+        ggml_tensor * dst = ggml_set_rows(ctx0, sv->logits_full, ggml_reshape_2d(ctx0, sub, 1, sub->ne[0]), sv->ids);
+        cur = ggml_reshape_2d(ctx0, dst, sv->logits_full->ne[1], 1);                              // [n_vocab, 1]
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
