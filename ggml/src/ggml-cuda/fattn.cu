@@ -524,6 +524,17 @@ static bool ggml_cuda_fattn_mma_disabled() {
     return disabled;
 }
 
+// GGML_CUDA_FA_TILE_MIN_BATCH=N: the MMA kernel is not selected for N or more query tokens. On TU116 the tile kernel wins prefill
+// (+29% at ubatch 4096) while MMA stays faster for the 1-3 token batches of decode / speculative verify (tile: -3.9% decode).
+static int64_t ggml_cuda_fattn_tile_min_batch() {
+    static const int64_t min_batch = [] {
+        const char * env = getenv("GGML_CUDA_FA_TILE_MIN_BATCH");
+        const long long v = env != nullptr ? atoll(env) : 0;
+        return v > 0 ? (int64_t) v : INT64_MAX;
+    }();
+    return min_batch;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -620,7 +631,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    const bool mma_allowed = !ggml_cuda_fattn_mma_disabled();
+    const bool mma_allowed = !ggml_cuda_fattn_mma_disabled() && Q->ne[1] < ggml_cuda_fattn_tile_min_batch();
 
     // If Turing tensor cores are available, use them:
     if (mma_allowed && turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
