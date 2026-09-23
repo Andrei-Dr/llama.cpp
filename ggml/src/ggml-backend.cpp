@@ -1561,7 +1561,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const char * env = getenv("GGML_SCHED_MOE_PREFETCH_LOG");
                 return env != nullptr && atoi(env) != 0;
             }();
+            // GGML_SCHED_MOE_PREFETCH_ONLY=<substring>: plan only targets whose first node's name contains it (e.g. "ffn_moe_up",
+            // "ffn_moe_down-7"); diagnostic bisection
+            static const std::string diag_only = [] {
+                const char * env = getenv("GGML_SCHED_MOE_PREFETCH_ONLY");
+                return std::string(env != nullptr ? env : "");
+            }();
             if (mask != 0 && node->src[2] != NULL && ggml_nelements(node->src[2]) < diag_min_ids) {
+                mask = 0;
+            }
+            if (mask != 0 && !diag_only.empty() && strstr(node->name, diag_only.c_str()) == NULL) {
                 mask = 0;
             }
             if (mask != 0) {
