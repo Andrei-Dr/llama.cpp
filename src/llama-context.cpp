@@ -384,7 +384,7 @@ llama_context::llama_context(
             for (auto & backend : backends) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
                 if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                    llama_moe_cache_set_backend(model, backend.get());
+                    cparams.moe_prefetch_owner = llama_moe_cache_set_backend(model, backend.get());
                     break;
                 }
             }

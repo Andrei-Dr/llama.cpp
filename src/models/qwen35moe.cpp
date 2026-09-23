@@ -290,7 +290,7 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // il+1's experts. build_moe_ffn calls the builder only when it builds this layer's cache chain, ahead of the cache-hit
         // barrier; the CPU node it returns heads this layer's host-expert split and uploads the predicted misses into il+1's slots
         std::function<ggml_tensor *()> pf_builder;
-        if (n_tokens <= 4 && llama_moe_cache_prefetch_budget() > 0) {
+        if (n_tokens <= 4 && cparams.moe_prefetch_owner && llama_moe_cache_prefetch_budget() > 0) {
             // window mode predicts two layers ahead (the copy is issued at this layer's tail and waited for at the next
             // layer's tail), step mode one layer ahead. In window mode the builder is provided for EVERY layer: build_moe_ffn
             // then puts a tail node at every cached layer, which carries the wait for the previous layer's copies.

@@ -112,6 +112,8 @@ struct moe_cache {
     int                     pf_build_target = -1;
     ggml_backend_t          pf_job_backend  = nullptr; // helper job: stream to issue on, event to record after it (or null)
     ggml_backend_event_t    pf_job_event    = nullptr;
+    ggml_backend_event_t    pf_fence        = nullptr; // window: compute-stream position the copy stream waits for before its writes
+    ggml_backend_event_t    pf_job_fence    = nullptr;
     bool                    pf_inline  = false;  // LLAMA_MOE_PREFETCH_INLINE=1: issue on the head op's thread (A/B)
     bool                    pf_touch   = true;   // LLAMA_MOE_PREFETCH_TOUCH=0: do not refresh the LRU clock of predicted cached experts
     std::thread             pf_thread;
@@ -637,17 +639,17 @@ ggml_tensor * llama_moe_cache_build_warm_obs(ggml_context * ctx, const ggml_tens
     return ggml_map_custom1(ctx, ids, moe_warm_obs_op, 1, (void *) (uintptr_t) it->second);
 }
 
-void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backend) {
+bool llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backend) {
     moe_cache * mc = g_cache;
     if (!mc || mc->owner != &model) {
-        return;
+        return false;
     }
     if (backend != nullptr) {
         std::lock_guard<std::mutex> lock(mc->mtx);
         if (mc->pf_backend != nullptr && mc->pf_backend != backend) {
             // one registered backend: a second DEFAULT context of the same model would run its graphs on other streams
             LLAMA_LOG_WARN("moe-cache: pre-gated prefetch already bound to another context; not re-registering\n");
-            return;
+            return false;
         }
     }
     if (mc->pf_thread.joinable()) {
@@ -658,6 +660,13 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
         mc->pf_cv.notify_all();
         mc->pf_thread.join();
         mc->pf_stop = false;
+        // a job posted but never picked up (aborted graph) must not survive into the next registration
+        std::lock_guard<std::mutex> plk(mc->pf_mtx);
+        mc->pf_todo.clear();
+        mc->pf_busy        = false;
+        mc->pf_job_backend = nullptr;
+        mc->pf_job_event   = nullptr;
+        mc->pf_job_fence   = nullptr;
     }
     std::lock_guard<std::mutex> lock(mc->mtx);
     if (mc->pf_copy_backend) {
@@ -668,6 +677,10 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
             ggml_backend_event_free(ev);
             ev = nullptr;
         }
+    }
+    if (mc->pf_fence) {
+        ggml_backend_event_free(mc->pf_fence);
+        mc->pf_fence = nullptr;
     }
     if (mc->pf_copy_backend) {
         ggml_backend_free(mc->pf_copy_backend);
@@ -680,7 +693,7 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
     }
     mc->pf_backend = nullptr;
     if (!backend || mc->pf_budget <= 0 || mc->layers.empty()) {
-        return;
+        return false;
     }
     ggml_backend_dev_t          dev       = ggml_backend_get_device(backend);
     ggml_backend_buffer_type_t  host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
@@ -695,22 +708,24 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
     if (!mc->pf_stage) {
         LLAMA_LOG_WARN("moe-cache: pre-gated prefetch disabled: no layer with device slots on %s and pinned host experts\n",
                 ggml_backend_name(backend));
-        return;
+        return false;
     }
     if (mc->pf_mode == 1) {
         mc->pf_copy_backend = ggml_backend_dev_init(dev, nullptr);
         mc->pf_ev[0] = mc->pf_copy_backend ? ggml_backend_event_new(dev) : nullptr;
         mc->pf_ev[1] = mc->pf_copy_backend ? ggml_backend_event_new(dev) : nullptr;
+        mc->pf_fence = mc->pf_copy_backend ? ggml_backend_event_new(dev) : nullptr;
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev, &props);
-        if (!mc->pf_copy_backend || !mc->pf_ev[0] || !mc->pf_ev[1] || !props.caps.async || !props.caps.events) {
+        if (!mc->pf_copy_backend || !mc->pf_ev[0] || !mc->pf_ev[1] || !mc->pf_fence || !props.caps.async || !props.caps.events) {
             LLAMA_LOG_WARN("moe-cache: pre-gated prefetch disabled: %s has no second stream / events for window mode\n",
                     ggml_backend_name(backend));
             for (auto & ev : mc->pf_ev) { if (ev) { ggml_backend_event_free(ev); ev = nullptr; } }
+            if (mc->pf_fence) { ggml_backend_event_free(mc->pf_fence); mc->pf_fence = nullptr; }
             if (mc->pf_copy_backend) { ggml_backend_free(mc->pf_copy_backend); mc->pf_copy_backend = nullptr; }
             ggml_backend_buffer_free(mc->pf_stage);
             mc->pf_stage = nullptr;
-            return;
+            return false;
         }
     }
     mc->pf_backend = backend;
@@ -738,7 +753,11 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
                 todo.swap(mc->pf_todo);
                 ggml_backend_t       be = mc->pf_job_backend;
                 ggml_backend_event_t ev = mc->pf_job_event;
+                ggml_backend_event_t fe = mc->pf_job_fence;
                 plk.unlock();
+                if (fe) {
+                    ggml_backend_event_wait(be, fe); // behind every compute-stream reader enqueued before the tail
+                }
                 for (const auto & c : todo) {
                     ggml_backend_tensor_set_async(be, c.dst, c.src, c.offset, c.size);
                 }
@@ -760,6 +779,7 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
                 mc->pf_mode == 1 ? "window (L+2, copy stream)" : "step (L+1, compute stream)",
                 mc->pf_budget, mc->pf_topk, ggml_backend_name(backend), mc->pf_inline ? "inline" : "async");
     }
+    return true;
 }
 
 void llama_moe_cache_release_backend(const llama_model & model, ggml_backend_t backend) {
@@ -884,9 +904,9 @@ static void pf_plan(moe_cache * mc, size_t idx, const ggml_tensor * a, std::vect
     }
     if (changed) {
         // the device table mirrors the host table: stage it in pinned memory and copy it once, ordered after the slot copies
-        // above. This layer's region is rewritten only by its next prefetch, a whole step later; the previous copy has
-        // landed by then because the step ends with a backend synchronize (and this CPU split's device->host input copy
-        // synchronizes the device before this op runs). If either sync ever goes away, double-buffer the stage.
+        // above. This layer's region is rewritten only by the layer's next prefetch; the previous table copy has been consumed
+        // by then: step mode issues on the compute stream (stream order), window mode waits for the previous copy at the next
+        // layer's tail and fences its copy stream behind the compute stream, and step()/suspend() drain the copy stream.
         const size_t nb = ggml_nbytes(pub.dev_table);
         void * stage = (char *) ggml_backend_buffer_get_base(mc->pf_stage) + idx*n_expert*sizeof(int32_t);
         GGML_ASSERT(nb == (size_t) n_expert*sizeof(int32_t));
@@ -920,6 +940,7 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 mc->pf_todo = std::move(copies);
                 mc->pf_job_backend = mc->pf_backend;
                 mc->pf_job_event   = nullptr;
+                mc->pf_job_fence   = nullptr;
                 mc->pf_busy = true;
             }
             mc->pf_cv.notify_all();
@@ -956,7 +977,8 @@ static void moe_prefetch_tail(const ggml_tensor * b, uintptr_t ud) {
     const auto t0 = std::chrono::steady_clock::now();
     pf_join_helper(mc);
     if (mc->pf_pending_il >= 0) {
-        if (mc->pf_pending_il == il + 1) {
+        if (mc->pf_pending_il == il + 1 || mc->pf_pending_il > il + 1) {
+            // > il + 1: left behind by a graph that stopped early (abort / failure before step()); order it and drop it
             ggml_backend_event_wait(mc->pf_backend, mc->pf_ev[mc->pf_pending_ev]);
             mc->pf_pending_il = -1;
         } else if (mc->pf_pending_il <= il) {
@@ -971,7 +993,11 @@ static void moe_prefetch_tail(const ggml_tensor * b, uintptr_t ud) {
         pf_plan(mc, (size_t) mc->il_to_idx[target], b, copies);
         if (!copies.empty()) {
             const int e = target & 1;
+            // fence: the copy stream starts only behind everything enqueued on the compute stream so far (earlier graphs of
+            // this decode may still have to read the target's slots, e.g. several ubatches between two step() calls)
+            ggml_backend_event_record(mc->pf_fence, mc->pf_backend);
             if (mc->pf_inline) {
+                ggml_backend_event_wait(mc->pf_copy_backend, mc->pf_fence);
                 for (const auto & c : copies) {
                     ggml_backend_tensor_set_async(mc->pf_copy_backend, c.dst, c.src, c.offset, c.size);
                 }
@@ -983,6 +1009,7 @@ static void moe_prefetch_tail(const ggml_tensor * b, uintptr_t ud) {
                     mc->pf_todo        = std::move(copies);
                     mc->pf_job_backend = mc->pf_copy_backend;
                     mc->pf_job_event   = mc->pf_ev[e];
+                    mc->pf_job_fence   = mc->pf_fence;
                     mc->pf_busy        = true;
                 }
                 mc->pf_cv.notify_all();
