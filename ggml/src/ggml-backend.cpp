@@ -843,6 +843,7 @@ struct ggml_backend_sched {
     ggml_backend_t         copy_backends[GGML_SCHED_MAX_BACKENDS];  // a second instance of the backend = a second stream
     ggml_backend_event_t   prefetch_front[GGML_SCHED_MAX_BACKENDS]; // compute-stream position a prefetch upload waits for
     bool                   prefetch_off[GGML_SCHED_MAX_BACKENDS];   // the backend cannot prefetch (no second instance / events)
+    int8_t                 prefetch_backend_ok[GGML_SCHED_MAX_BACKENDS]; // 0 = not evaluated yet, 1 = CUDA device, -1 = no
     ggml_backend_event_t * prefetch_done;                           // [prefetch_done_capacity] per split: its upload landed
     int                    prefetch_done_capacity;
 
@@ -1524,18 +1525,25 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         return env != nullptr && atoi(env) != 0;
     }();
     if (ggml_backend_sched_moe_prefetch_enabled() && !diag_skiploop && sched->n_copies == 1 && !ggml_backend_sched_moe_readback_forced()) {
+        // per backend, once: may it prefetch (a CUDA device)? ovl17/ovl19: evaluating the device / registry queries for every
+        // split of every graph cost ~7% of decode (~20 us per split) even when nothing was planned; the op test comes first now
+        // and the backend verdict is cached, so a decode graph (no MUL_MAT_ID-first device split) does almost no work here
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->prefetch_backend_ok[b] == 0) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+                const bool ok = dev != NULL && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && reg != NULL &&
+                                strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+                sched->prefetch_backend_ok[b] = ok ? 1 : -1;
+            }
+        }
         for (int i = 1; i < sched->n_splits; i++) {
             struct ggml_backend_sched_split * split = &sched->splits[i];
-            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
-            if (dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU || split->graph.n_nodes == 0 ||
-                    sched->prefetch_off[split->backend_id] || ggml_backend_dev_backend_reg(dev) == NULL ||
-                    strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
+            if (split->graph.n_nodes == 0 || split->graph.nodes[0]->op != GGML_OP_MUL_MAT_ID ||
+                    sched->prefetch_backend_ok[split->backend_id] != 1 || sched->prefetch_off[split->backend_id]) {
                 continue;
             }
             const struct ggml_tensor * node = split->graph.nodes[0];
-            if (node->op != GGML_OP_MUL_MAT_ID) {
-                continue;
-            }
             int p = i - 1;
             while (p >= 0 && sched->splits[p].backend_id != split->backend_id) {
                 p--;
