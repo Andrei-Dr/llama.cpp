@@ -2172,6 +2172,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prefetch_end(split_id);
 
+        // GGML_SCHED_DIAG_SYNC=1 (diagnostic): drain every backend after each split, removing all cross-split asynchrony
+        static const bool diag_sync = [] {
+            const char * env = getenv("GGML_SCHED_DIAG_SYNC");
+            return env != nullptr && atoi(env) != 0;
+        }();
+        if (diag_sync) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
