@@ -1580,7 +1580,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 const char * env = getenv("GGML_SCHED_MOE_PREFETCH_ONLY");
                 return std::string(env != nullptr ? env : "");
             }();
-            if (mask != 0 && node->src[2] != NULL && ggml_nelements(node->src[2]) < diag_min_ids) {
+            // plan only graphs whose router output reaches the whole-tensor upload threshold (>= 8 routed tokens per expert on
+            // average): below it prefetch_begin never engages, so hoisting would only reserve VRAM — for the ubatch-sized reserve
+            // graph that is +161 MiB kept for the whole decode (promo5: the expert cache could not re-allocate its slots after a
+            // prefill). GGML_SCHED_MOE_PREFETCH_MIN_IDS overrides the threshold (diagnostic).
+            const int64_t min_ids = diag_min_ids > 0 ? diag_min_ids : 8*node->src[0]->ne[2];
+            if (mask != 0 && node->src[2] != NULL && ggml_nelements(node->src[2]) < min_ids) {
                 mask = 0;
             }
             if (mask != 0 && !diag_only.empty() && strstr(node->name, diag_only.c_str()) == NULL) {
