@@ -1728,6 +1728,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     }
 
+                    // When the batch routes enough tokens that every expert is expected to be used (>= 8 routed tokens per
+                    // expert on average), the host readback of the router output is pure latency: it blocks the host until
+                    // the device has drained everything up to the router, and the answer is "all of them" anyway. Upload the
+                    // whole tensor instead. The result is identical (unused experts are never read); only the byte count can
+                    // grow by the few experts a skewed router leaves idle. GGML_SCHED_MOE_READBACK=1 restores the readback.
+                    static const bool always_readback = [] {
+                        const char * env = getenv("GGML_SCHED_MOE_READBACK");
+                        return env != nullptr && atoi(env) != 0;
+                    }();
+                    if (!always_readback && ggml_nelements(ids_tensor) >= 8*n_expert) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        continue;
+                    }
+
                     if (ids_tensor != prev_ids_tensor) {
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
