@@ -2507,7 +2507,7 @@ struct llama_model_qwen35moe : public llama_model_base {
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il,
-                    ggml_tensor * host_first = nullptr);
+                    const std::function<ggml_tensor *()> & host_first = {});
 
         ggml_tensor * build_norm_gated(
                     ggml_tensor * input,

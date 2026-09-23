@@ -212,29 +212,29 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cb(attn_post_norm, "attn_post_norm", il);
 
         // pre-gated prefetch (LLAMA_MOE_PREFETCH, see llama-moecache.h): layer il+1's router on this layer's MoE input predicts
-        // il+1's experts; the prediction is computed here (ahead of this layer's cache-hit barrier) and consumed by a CPU node
-        // at the head of this layer's host-expert split, which uploads the predicted misses into il+1's cache slots
-        ggml_tensor * pf_node = nullptr;
+        // il+1's experts. build_moe_ffn calls the builder only when it builds this layer's cache chain, ahead of the cache-hit
+        // barrier; the CPU node it returns heads this layer's host-expert split and uploads the predicted misses into il+1's slots
+        std::function<ggml_tensor *()> pf_builder;
         if (n_tokens <= 4 && il + 1 < n_layer && llama_moe_cache_prefetch_budget() > 0) {
-            const auto & cl = model.layers[il];
             const auto & nl = model.layers[il + 1];
-            ggml_tensor * key_cur  = cl.ffn_gate_up_exps ? cl.ffn_gate_up_exps : cl.ffn_up_exps;
             ggml_tensor * key_next = nl.ffn_gate_up_exps ? nl.ffn_gate_up_exps : nl.ffn_up_exps;
-            // only when this layer runs the cache chain (the node hangs off its host split) and the next router is on the
-            // device (a host-resident router would add a device -> host -> device round trip ahead of the barrier)
+            // the next layer must qualify (cached, device slots, pinned experts) and its router must be device-resident (a
+            // host router would add a device -> host -> device round trip ahead of the barrier)
             if (nl.ffn_gate_inp && nl.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(nl.ffn_gate_inp->buffer) &&
-                    llama_moe_cache_lookup(key_cur) && llama_moe_cache_lookup(key_next)) {
-                const int topk = std::min<int>(llama_moe_cache_prefetch_topk(), (int) nl.ffn_gate_inp->ne[1]);
-                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0,
-                        ggml_mul_mat(ctx0, nl.ffn_gate_inp, attn_post_norm), topk));
-                cb(pred, "ffn_moe_prefetch_pred", il);
-                ggml_build_forward_expand(gf, pred);
-                pf_node = llama_moe_cache_build_prefetch(ctx0, key_next, pred);
+                    llama_moe_cache_prefetch_ok(key_next)) {
+                pf_builder = [&, key_next, il]() -> ggml_tensor * {
+                    const auto & nl2 = model.layers[il + 1];
+                    const int topk = std::min<int>(llama_moe_cache_prefetch_topk(), (int) nl2.ffn_gate_inp->ne[1]);
+                    ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0,
+                            ggml_mul_mat(ctx0, nl2.ffn_gate_inp, attn_post_norm), topk));
+                    cb(pred, "ffn_moe_prefetch_pred", il);
+                    ggml_build_forward_expand(gf, pred);
+                    return llama_moe_cache_build_prefetch(ctx0, key_next, pred);
+                };
             }
         }
 
-        // MOE FFN layer
-        cur = build_layer_ffn(attn_post_norm, il, pf_node);
+        cur = build_layer_ffn(attn_post_norm, il, pf_builder);
         cb(cur, "ffn_out", il);
 
         // Residual connection for FFN - add to the tensor from before post_attention_layernorm
@@ -514,7 +514,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * host_first) {
+ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, const int il, const std::function<ggml_tensor *()> & host_first) {
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 

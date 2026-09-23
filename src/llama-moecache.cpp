@@ -84,6 +84,7 @@ struct moe_cache {
     int                     n_busy = 0;     // jobs popped by the worker and not yet in `done` (under wmtx)
     bool                    sync_publish = false; // LLAMA_MOE_CACHE_SYNC=1: step() waits for every scheduled upload
     std::vector<ggml_backend_buffer_type_t> ctx_bufts; // buffer type of each context in `ctxs` (host tables: CPU)
+    std::vector<ggml_backend_buffer_type_t> layer_buft; // buffer type of each layer's device slots (valid while suspended too)
     bool                    suspended = false;    // device slots released (prefill mode); lookups return nullptr
     const llama_model *     owner     = nullptr;  // the model whose host-resident experts this cache mirrors
     // pre-gated prefetch (see llama_moe_cache_build_prefetch)
@@ -98,6 +99,7 @@ struct moe_cache {
     // waits until it is done, so every copy is in the stream before the scheduler enqueues layer L+1's kernels
     struct pf_copy { ggml_tensor * dst; const void * src; size_t offset; size_t size; };
     bool                    pf_inline  = false;  // LLAMA_MOE_PREFETCH_INLINE=1: issue on the head op's thread (A/B)
+    bool                    pf_touch   = true;   // LLAMA_MOE_PREFETCH_TOUCH=0: do not refresh the LRU clock of predicted cached experts
     std::thread             pf_thread;
     std::mutex              pf_mtx;
     std::condition_variable pf_cv;
@@ -111,6 +113,24 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+
+// which layers the pre-gated prefetch may target: slots in dev_buft (the registered backend's device) and pinned host experts
+int pf_qualify(moe_cache * mc, ggml_backend_buffer_type_t host_buft, ggml_backend_buffer_type_t dev_buft) {
+    const size_t n_expert = mc->layers.empty() ? 0 : mc->layers[0].expert_slot.size();
+    auto pinned = [&](const ggml_tensor * t) { return t == nullptr || (t->buffer && ggml_backend_buffer_get_type(t->buffer) == host_buft); };
+    int n_ok = 0;
+    for (size_t li = 0; li < mc->layers.size(); ++li) {
+        layer_state & ls = mc->layers[li];
+        const llama_moe_cache_layer & pub = ls.pub;
+        const bool slots_ok = mc->suspended ? (li < mc->layer_buft.size() && mc->layer_buft[li] == dev_buft)
+                                            : (pub.down_c && pub.down_c->buffer && ggml_backend_buffer_get_type(pub.down_c->buffer) == dev_buft);
+        ls.pf_ok = slots_ok && ls.expert_slot.size() == n_expert &&
+                   pinned(pub.down_src) && pinned(pub.gate_up_src) && pinned(pub.up_src) && pinned(pub.gate_src);
+        n_ok += ls.pf_ok;
+    }
+    return n_ok;
+}
+
 float       g_cache_bias = 0.0f; // set once in init, before any table entry is written
 std::mutex  g_init_mtx;
 bool        g_init_done = false;
@@ -288,6 +308,8 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     {
         const char * e = getenv("LLAMA_MOE_PREFETCH");
         mc->pf_budget = e ? std::max(0, atoi(e)) : 0;
+        const char * tc = getenv("LLAMA_MOE_PREFETCH_TOUCH");
+        mc->pf_touch = !(tc && atoi(tc) == 0);
         const char * in = getenv("LLAMA_MOE_PREFETCH_INLINE");
         mc->pf_inline = in && atoi(in) != 0;
         const char * k = getenv("LLAMA_MOE_PREFETCH_TOPK");
@@ -375,6 +397,10 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
                 ggml_format_name(pub.host_table, "moe_cache_htbl.%d", pub.il);
                 continue;
             }
+            if (mc->layer_buft.size() < mc->layers.size()) {
+                mc->layer_buft.resize(mc->layers.size(), nullptr);
+            }
+            mc->layer_buft[idx] = buft;
             if (pub.gate_up_src) {
                 pub.gate_up_c = new_cache_tensor(ctx, pub.gate_up_src, "gate_up", pub.il);
             } else {
@@ -543,6 +569,10 @@ bool llama_moe_cache_resume() {
     }
     reset_slots(mc, /*keep_warm=*/true);
     mc->suspended = false;
+    if (mc->pf_backend) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(mc->pf_backend);
+        pf_qualify(mc, dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr, ggml_backend_get_default_buffer_type(mc->pf_backend));
+    }
     LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots (re-ranked by the prompt at the next step)\n", got/1024.0/1024.0);
     return true;
 }
@@ -581,6 +611,14 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
     if (!mc || mc->owner != &model) {
         return;
     }
+    if (backend != nullptr) {
+        std::lock_guard<std::mutex> lock(mc->mtx);
+        if (mc->pf_backend != nullptr && mc->pf_backend != backend) {
+            // one registered backend: a second DEFAULT context of the same model would run its graphs on other streams
+            LLAMA_LOG_WARN("moe-cache: pre-gated prefetch already bound to another context; not re-registering\n");
+            return;
+        }
+    }
     if (mc->pf_thread.joinable()) {
         {
             std::lock_guard<std::mutex> plk(mc->pf_mtx);
@@ -606,16 +644,8 @@ void llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backe
     // a layer qualifies when its slots live on this backend's device (the copies are ordered on its stream) and its host
     // experts are pinned host memory of that device (true async DMA; a pageable source makes cudaMemcpyAsync sync the stream
     // first, which would serialize the host experts behind the cache hits)
-    auto pinned = [&](const ggml_tensor * t) { return t == nullptr || (t->buffer && ggml_backend_buffer_get_type(t->buffer) == host_buft); };
-    int n_ok = 0;
-    for (auto & ls : mc->layers) {
-        const llama_moe_cache_layer & pub = ls.pub;
-        const ggml_tensor * slot_t = pub.down_c;
-        ls.pf_ok = host_buft && slot_t && slot_t->buffer && ggml_backend_buffer_get_type(slot_t->buffer) == dev_buft &&
-                   ls.expert_slot.size() == n_expert &&
-                   pinned(pub.down_src) && pinned(pub.gate_up_src) && pinned(pub.up_src) && pinned(pub.gate_src);
-        n_ok += ls.pf_ok;
-    }
+    // (while suspended the slots are unallocated: judged by the buffer type the slots are created in, re-checked by resume())
+    const int n_ok = host_buft ? pf_qualify(mc, host_buft, dev_buft) : 0;
     mc->pf_stage = n_ok > 0 ? ggml_backend_buft_alloc_buffer(host_buft, mc->layers.size()*n_expert*sizeof(int32_t)) : nullptr;
     if (!mc->pf_stage) {
         LLAMA_LOG_WARN("moe-cache: pre-gated prefetch disabled: no layer with device slots on %s and pinned host experts\n",
@@ -691,6 +721,15 @@ int llama_moe_cache_prefetch_topk() {
     return g_cache ? g_cache->pf_topk : 16;
 }
 
+bool llama_moe_cache_prefetch_ok(const ggml_tensor * key_next) {
+    moe_cache * mc = g_cache;
+    if (llama_moe_cache_prefetch_budget() <= 0 || !key_next) {
+        return false;
+    }
+    auto it = mc->by_key.find(key_next);
+    return it != mc->by_key.end() && mc->layers[it->second].pf_ok;
+}
+
 // custom op (CPU, one task): a = predicted expert ids of the target layer [k, n_tokens] (I32, sorted by router score per
 // token, best first); ud = layer index
 static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
@@ -729,7 +768,9 @@ static void moe_prefetch_op(ggml_tensor * dst, const ggml_tensor * a, int ith, i
     bool changed = false;
     for (const int32_t id : want) {
         if (ls.expert_slot[id] >= 0) {
-            ls.slot_last_use[ls.expert_slot[id]] = ++mc->clock; // predicted again: keep it warm
+            if (mc->pf_touch) {
+                ls.slot_last_use[ls.expert_slot[id]] = ++mc->clock; // predicted again: keep it warm
+            }
             continue;
         }
         if (ls.expert_in_flight[id] || budget <= 0) {

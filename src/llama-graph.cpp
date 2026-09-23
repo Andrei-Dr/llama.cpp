@@ -1969,7 +1969,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          const std::function<ggml_tensor *()> & dev_overlap,
-         ggml_tensor * host_first) const {
+         const std::function<ggml_tensor *()> & host_first) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2022,7 +2022,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          const std::function<ggml_tensor *()> & dev_overlap,
-         ggml_tensor * host_first) const {
+         const std::function<ggml_tensor *()> & host_first) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2209,7 +2209,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // expanded BEFORE the host chain and starts with a scheduler barrier: ggml-backend then copies the
     // host split's inputs first and the host experts (misses) run concurrently with this chain (hits).
     ggml_tensor * mc_out = nullptr; // [n_embd, n_expert_used, n_tokens], zero rows for uncached ids
+    ggml_tensor * host_first_node = nullptr;
     if (mcache) {
+        // pre-barrier work of the caller (e.g. the next layer's expert prediction) and its host node
+        if (host_first) {
+            host_first_node = host_first();
+        }
         // the top-k ids are a strided view of the argsort once there is more than one token
         ggml_tensor * mc_ids   = n_tokens > 1 ? ggml_cont(ctx0, selected_experts) : selected_experts;
         ggml_tensor * mc_first = n_tokens > 1 ? mc_ids : nullptr;
@@ -2277,8 +2282,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // first node of the host-expert split (e.g. the next layer's expert prefetch: it then runs while the device computes
         // the cache hits, and its uploads are enqueued behind them on the device stream)
-        if (host_first) {
-            ggml_build_forward_expand(gf, host_first);
+        if (host_first_node) {
+            ggml_build_forward_expand(gf, host_first_node);
         }
     }
 
@@ -2457,7 +2462,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (mcache) {
         mc_host(experts);
         // a prefetch posted at the head of this host split must be fully enqueued before the next device split
-        if (host_first) {
+        if (host_first_node) {
             if (ggml_tensor * join = llama_moe_cache_build_prefetch_join(ctx0, experts)) {
                 ggml_build_forward_expand(gf, join);
             }

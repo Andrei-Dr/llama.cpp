@@ -1112,8 +1112,10 @@ struct llm_graph_context {
     // dev_overlap: optional device work that depends only on the layer input (e.g. a shared expert). When the MoE expert
     // cache is active it is built inside the cache-hit split, which runs concurrently with the host experts; otherwise it is
     // NOT called and the caller builds it where it always did (so the graph without a cache is unchanged).
-    // host_first: optional CPU node expanded at the head of the host-expert split (after the cache-hit chain), only when the
-    // MoE expert cache is active; its inputs must already be in the graph (e.g. the pre-gated expert prefetch of the next layer)
+    // host_first: optional builder, called only when the MoE expert cache chain is built for this layer, BEFORE the cache-hit
+    // barrier (so whatever it expands lands ahead of the barrier); the CPU node it returns (or nullptr) is expanded at the head
+    // of the host-expert split, and a matching join (llama_moe_cache_build_prefetch_join) at its tail. Used by the pre-gated
+    // expert prefetch of the next layer.
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1136,7 +1138,7 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              const std::function<ggml_tensor *()> & dev_overlap = {},
-             ggml_tensor * host_first = nullptr) const;
+             const std::function<ggml_tensor *()> & host_first = {}) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1164,7 +1166,7 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr,
              const std::function<ggml_tensor *()> & dev_overlap = {},
-             ggml_tensor * host_first = nullptr) const;
+             const std::function<ggml_tensor *()> & host_first = {}) const;
 
     //
     // inputs
