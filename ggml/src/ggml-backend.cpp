@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <set>
+#include <string>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1548,9 +1550,36 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 }
                 mask |= 1ull << j;
             }
+            // diagnostics: GGML_SCHED_MOE_PREFETCH_MIN_IDS=n plans only splits whose router output has >= n ids (restricts the
+            // plan to batch sizes; makes the layout shape-dependent, diagnostic use only); GGML_SCHED_MOE_PREFETCH_LOG=1 logs
+            // every planned pair once per distinct (n_splits, split, ids) combination
+            static const int64_t diag_min_ids = [] {
+                const char * env = getenv("GGML_SCHED_MOE_PREFETCH_MIN_IDS");
+                return env != nullptr ? (int64_t) atoll(env) : (int64_t) 0;
+            }();
+            static const bool diag_log = [] {
+                const char * env = getenv("GGML_SCHED_MOE_PREFETCH_LOG");
+                return env != nullptr && atoi(env) != 0;
+            }();
+            if (mask != 0 && node->src[2] != NULL && ggml_nelements(node->src[2]) < diag_min_ids) {
+                mask = 0;
+            }
             if (mask != 0) {
                 split->prefetch_mask = mask;
                 sched->splits[p].prefetch_split = i;
+                if (diag_log) {
+                    static std::set<std::string> seen;
+                    char key[256];
+                    snprintf(key, sizeof(key), "%d/%d/%s/%lld", sched->n_splits, i, node->name,
+                            (long long) (node->src[2] ? ggml_nelements(node->src[2]) : -1));
+                    if (seen.insert(key).second) {
+                        GGML_LOG_INFO("%s: prefetch plan: graph %d nodes %d splits | split %d (%s, ids %lld, backend %s) <- split %d (first node %s)\n",
+                                __func__, graph->n_nodes, sched->n_splits, i, node->name,
+                                (long long) (node->src[2] ? ggml_nelements(node->src[2]) : -1),
+                                ggml_backend_name(sched->backends[split->backend_id]), p,
+                                sched->splits[p].graph.n_nodes > 0 ? sched->splits[p].graph.nodes[0]->name : "?");
+                    }
+                }
             }
         }
     }
