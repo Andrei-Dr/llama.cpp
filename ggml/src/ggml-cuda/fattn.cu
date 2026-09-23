@@ -535,6 +535,17 @@ static int64_t ggml_cuda_fattn_tile_min_batch() {
     return min_batch;
 }
 
+// GGML_CUDA_FA_MMA_MAX_KV=N: the MMA kernel only while the KV length (K->ne[1]) is below N; at or above it the tile/vec kernels
+// (as with GGML_CUDA_FA_NO_MMA). Unset = no limit. For GPUs whose MMA path scans a long KV cache slower than the tile kernel.
+static int64_t ggml_cuda_fattn_mma_max_kv() {
+    static const int64_t max_kv = [] {
+        const char * env = getenv("GGML_CUDA_FA_MMA_MAX_KV");
+        const long long v = env != nullptr ? atoll(env) : 0;
+        return v > 0 ? (int64_t) v : INT64_MAX;
+    }();
+    return max_kv;
+}
+
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
@@ -631,7 +642,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    const bool mma_allowed = !ggml_cuda_fattn_mma_disabled() && Q->ne[1] < ggml_cuda_fattn_tile_min_batch();
+    const bool mma_allowed = !ggml_cuda_fattn_mma_disabled() && Q->ne[1] < ggml_cuda_fattn_tile_min_batch() &&
+        K->ne[1] < ggml_cuda_fattn_mma_max_kv();
 
     // If Turing tensor cores are available, use them:
     if (mma_allowed && turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
