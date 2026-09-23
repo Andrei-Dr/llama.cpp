@@ -1692,11 +1692,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // A copy from a host buffer that is enqueued on the split backend's own stream (set_tensor_async) is ordered
                 // after every earlier use of input_cpy by that stream, so it needs no host-side wait. Without events (a single
                 // copy, i.e. no pipeline parallelism) the wait below is a full ggml_backend_synchronize: the host blocks until the
-                // device drains, then enqueues the copy and the split while the device idles. Opt-in with
-                // GGML_SCHED_NO_COPY_SYNC=1: exact, but on a GTX 1650 SUPER decode it measured -2.0% +- noise with wider spread.
+                // device drains, then enqueues the copy and the split while the device idles. Exact; on a GTX 1650 SUPER
+                // decode it removes ~18 us of host overhead per MoE layer (prof18). GGML_SCHED_COPY_SYNC=1 restores the wait.
                 static const bool skip_copy_sync = [] {
-                    const char * env = getenv("GGML_SCHED_NO_COPY_SYNC");
-                    return env != nullptr && atoi(env) != 0;
+                    const char * env = getenv("GGML_SCHED_COPY_SYNC");
+                    return !(env != nullptr && atoi(env) != 0);
                 }();
                 const bool stream_ordered = skip_copy_sync && ggml_backend_buffer_is_host(input->buffer) &&
                     split_backend->iface.set_tensor_async != NULL;
