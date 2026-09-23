@@ -1876,6 +1876,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // GGML_SCHED_MOE_DIAG_FILL=<byte> (diagnostic): fill the whole device copy with <byte> before the used experts
+                    // are uploaded, so the bytes of the experts NOT uploaded are known instead of whatever the region held before.
+                    // Two fills giving different outputs = a kernel reads experts the router did not select.
+                    static const int diag_fill = [] {
+                        const char * env = getenv("GGML_SCHED_MOE_DIAG_FILL");
+                        return env != nullptr ? atoi(env) & 0xff : -1;
+                    }();
+                    if (diag_fill >= 0) {
+                        ggml_backend_synchronize(split_backend);
+                        ggml_backend_tensor_memset(input_cpy, (uint8_t) diag_fill, 0, ggml_nbytes(input_cpy));
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
