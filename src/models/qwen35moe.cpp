@@ -1,10 +1,13 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 #include "llama-impl.h"
+#include "llama-moecache.h"
 
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
+#include <vector>
+#include <algorithm>
 
 // LLAMA_MOE_PREGATE_DIAG=1 (diagnostic, decode batches of <= 4 tokens): how well does layer L's MoE input predict the routing
 // of layer L+1 (and L+2) through THEIR routers ("pre-gating")? For every layer: recall of the actual top-8 by the predicted
@@ -15,6 +18,11 @@ struct pregate_stats {
     double  hit[3][64] = {};   // [0] +1 @8, [1] +1 @16, [2] +2 @16 ; per layer
     int64_t n[3][64]   = {};   // actual ids compared
     int64_t steps      = 0;
+    // miss view (per pass, union over its tokens), [0] = top-8, [1] = top-16 predictions from one layer back:
+    // actual misses, misses the prediction covers, predicted experts not cached (= uploads a prefetch would issue)
+    int64_t miss[2] = {}, miss_cov[2] = {}, pred_unc[2] = {}, passes[2] = {};
+    const int32_t * tab[64] = {};  // host expert table of layer il (expert -> slot, n_slots = uncached), nullptr = no cache
+    int32_t n_slots[64]    = {};
 };
 pregate_stats g_pregate;
 
@@ -44,6 +52,23 @@ void pregate_cmp_op(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor 
     std::lock_guard<std::mutex> lock(g_pregate.mtx);
     g_pregate.hit[kind][il] += (double) hits;
     g_pregate.n[kind][il]   += A*T;
+    const int32_t * tab = g_pregate.tab[il];
+    if (kind <= 1 && tab != nullptr) {
+        const int32_t ns = g_pregate.n_slots[il];
+        std::vector<char> in_pred(512, 0), in_miss(512, 0);
+        for (int64_t t = 0; t < T; ++t) {
+            const int32_t * pa = (const int32_t *) ((const char *) a->data + t*a->nb[1]);
+            const int32_t * pb = (const int32_t *) ((const char *) b->data + t*b->nb[1]);
+            for (int64_t k = 0; k < K; ++k) { if (pa[k] >= 0 && pa[k] < 512) in_pred[pa[k]] = 1; }
+            for (int64_t j = 0; j < A; ++j) { if (pb[j] >= 0 && pb[j] < 512 && tab[pb[j]] == ns) in_miss[pb[j]] = 1; }
+        }
+        for (int e = 0; e < 512; ++e) {
+            g_pregate.miss[kind]     += in_miss[e];
+            g_pregate.miss_cov[kind] += in_miss[e] && in_pred[e];
+            g_pregate.pred_unc[kind] += in_pred[e] && tab[e] == ns;
+        }
+        g_pregate.passes[kind]++;
+    }
     if (kind == 0 && il == 39 && ++g_pregate.steps % 256 == 0) {
         auto band = [&](int k, int lo, int hi) {
             double h = 0; int64_t n = 0;
@@ -53,6 +78,12 @@ void pregate_cmp_op(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor 
         LLAMA_LOG_INFO("pregate: steps %lld | +1@8 %.1f%% (L1-9 %.1f, 10-19 %.1f, 20-29 %.1f, 30-39 %.1f) | +1@16 %.1f%% | +2@16 %.1f%%\n",
             (long long) g_pregate.steps, band(0, 1, 39), band(0, 1, 9), band(0, 10, 19), band(0, 20, 29), band(0, 30, 39),
             band(1, 1, 39), band(2, 2, 39));
+        for (int k = 0; k < 2; ++k) {
+            const double p = (double) std::max<int64_t>(1, g_pregate.passes[k]);
+            LLAMA_LOG_INFO("pregate-miss: top-%d | misses/layer-pass %.2f | covered %.1f%% | uploads/layer-pass %.2f (useful %.1f%%)\n",
+                k == 0 ? 8 : 16, g_pregate.miss[k]/p, 100.0*g_pregate.miss_cov[k]/std::max<int64_t>(1, g_pregate.miss[k]),
+                g_pregate.pred_unc[k]/p, 100.0*g_pregate.miss_cov[k]/std::max<int64_t>(1, g_pregate.pred_unc[k]));
+        }
     }
 }
 } // namespace
@@ -275,6 +306,13 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
                 return ggml_cont(ctx0, ggml_top_k(ctx0, ggml_mul_mat(ctx0, gate, attn_post_norm), k));
             };
             ggml_tensor * actual = topk(model.layers[il].ffn_gate_inp, (int) n_expert_used);
+            {
+                const llama_moe_cache_layer * mcl = llama_moe_cache_lookup(
+                    model.layers[il].ffn_gate_up_exps ? model.layers[il].ffn_gate_up_exps : model.layers[il].ffn_up_exps);
+                std::lock_guard<std::mutex> lock(g_pregate.mtx);
+                g_pregate.tab[il]     = mcl && mcl->host_table ? (const int32_t *) mcl->host_table->data : nullptr;
+                g_pregate.n_slots[il] = mcl ? mcl->n_slots : 0;
+            }
             if (pg_prev8)  { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev8,  actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((0 << 8) | il))); }
             if (pg_prev16) { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev16, actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((1 << 8) | il))); }
             if (pg_prev2)  { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev2,  actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((2 << 8) | il))); }
