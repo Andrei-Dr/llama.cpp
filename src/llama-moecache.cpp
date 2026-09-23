@@ -166,10 +166,23 @@ void moe_warm_obs_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth,
     const int64_t   n   = ggml_nelements(a);
 
     std::lock_guard<std::mutex> lock(mc->mtx);
+    // LLAMA_MOE_WARM_TRACE=1 (diagnostic): one line per call = layer, id count, checksum, out-of-range ids
+    static const bool trace = [] {
+        const char * env = getenv("LLAMA_MOE_WARM_TRACE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    uint64_t sum = 0;
+    int64_t  bad = 0;
     for (int64_t i = 0; i < n; ++i) {
+        sum = sum * 1000003u + (uint32_t) ids[i];
         if (ids[i] >= 0 && ids[i] < (int32_t) ls.warm_cnt.size()) {
             ls.warm_cnt[ids[i]]++;
+        } else {
+            bad++;
         }
+    }
+    if (trace) {
+        LLAMA_LOG_INFO("moe-warm-trace: layer %zu n %lld sum %016llx bad %lld\n", idx, (long long) n, (unsigned long long) sum, (long long) bad);
     }
     ls.warm_seen = true;
 }
