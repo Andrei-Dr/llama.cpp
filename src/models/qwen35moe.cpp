@@ -1,5 +1,61 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-impl.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+
+// LLAMA_MOE_PREGATE_DIAG=1 (diagnostic, decode batches of <= 4 tokens): how well does layer L's MoE input predict the routing
+// of layer L+1 (and L+2) through THEIR routers ("pre-gating")? For every layer: recall of the actual top-8 by the predicted
+// top-8 and top-16 from one layer back, and top-16 from two layers back. Cumulative summary logged every 256 decode steps.
+namespace {
+struct pregate_stats {
+    std::mutex mtx;
+    double  hit[3][64] = {};   // [0] +1 @8, [1] +1 @16, [2] +2 @16 ; per layer
+    int64_t n[3][64]   = {};   // actual ids compared
+    int64_t steps      = 0;
+};
+pregate_stats g_pregate;
+
+bool pregate_enabled() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_PREGATE_DIAG"); return e != nullptr && atoi(e) != 0; }();
+    return on;
+}
+
+// a = predicted ids [K, T] (i32, contiguous), b = actual top-8 ids [8, T]; userdata = (kind << 8) | layer
+void pregate_cmp_op(ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b, int ith, int nth, void * ud) {
+    GGML_UNUSED(dst); GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    const int kind = (int) (((uintptr_t) ud) >> 8), il = (int) (((uintptr_t) ud) & 0xff);
+    const int64_t K = a->ne[0], T = a->ne[1], A = b->ne[0];
+    int64_t hits = 0;
+    for (int64_t t = 0; t < T; ++t) {
+        const int32_t * pa = (const int32_t *) ((const char *) a->data + t*a->nb[1]);
+        const int32_t * pb = (const int32_t *) ((const char *) b->data + t*b->nb[1]);
+        for (int64_t j = 0; j < A; ++j) {
+            for (int64_t k = 0; k < K; ++k) {
+                if (pa[k] == pb[j]) { hits++; break; }
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lock(g_pregate.mtx);
+    g_pregate.hit[kind][il] += (double) hits;
+    g_pregate.n[kind][il]   += A*T;
+    if (kind == 0 && il == 39 && ++g_pregate.steps % 256 == 0) {
+        auto band = [&](int k, int lo, int hi) {
+            double h = 0; int64_t n = 0;
+            for (int l = lo; l <= hi; ++l) { h += g_pregate.hit[k][l]; n += g_pregate.n[k][l]; }
+            return n ? 100.0*h/n : -1.0;
+        };
+        LLAMA_LOG_INFO("pregate: steps %lld | +1@8 %.1f%% (L1-9 %.1f, 10-19 %.1f, 20-29 %.1f, 30-39 %.1f) | +1@16 %.1f%% | +2@16 %.1f%%\n",
+            (long long) g_pregate.steps, band(0, 1, 39), band(0, 1, 9), band(0, 10, 19), band(0, 20, 29), band(0, 30, 39),
+            band(1, 1, 39), band(2, 2, 39));
+    }
+}
+} // namespace
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -174,6 +230,9 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // pre-gating diagnostic state (LLAMA_MOE_PREGATE_DIAG): predicted ids for the next layer(s)
+    ggml_tensor * pg_prev8 = nullptr, * pg_prev16 = nullptr, * pg_prev2 = nullptr, * pg_next2 = nullptr;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = inpL;
@@ -209,6 +268,21 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // Post-attention norm
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
+
+        // pre-gating diagnostic (see pregate_cmp_op): predictions made from this layer's MoE input, compared at later layers
+        if (pregate_enabled() && n_tokens <= 4 && il < 64) {
+            auto topk = [&](ggml_tensor * gate, int k) {
+                return ggml_cont(ctx0, ggml_top_k(ctx0, ggml_mul_mat(ctx0, gate, attn_post_norm), k));
+            };
+            ggml_tensor * actual = topk(model.layers[il].ffn_gate_inp, (int) n_expert_used);
+            if (pg_prev8)  { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev8,  actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((0 << 8) | il))); }
+            if (pg_prev16) { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev16, actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((1 << 8) | il))); }
+            if (pg_prev2)  { ggml_build_forward_expand(gf, ggml_map_custom2(ctx0, pg_prev2,  actual, pregate_cmp_op, 1, (void *) (uintptr_t) ((2 << 8) | il))); }
+            pg_prev2  = pg_next2;
+            pg_prev8  = il + 1 < n_layer ? topk(model.layers[il + 1].ffn_gate_inp, (int) n_expert_used) : nullptr;
+            pg_prev16 = il + 1 < n_layer ? topk(model.layers[il + 1].ffn_gate_inp, 16) : nullptr;
+            pg_next2  = il + 2 < n_layer ? topk(model.layers[il + 2].ffn_gate_inp, 16) : nullptr;
+        }
 
         // MOE FFN layer
         cur = build_layer_ffn(attn_post_norm, il);
