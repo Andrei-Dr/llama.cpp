@@ -216,11 +216,17 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         // at the head of this layer's host-expert split, which uploads the predicted misses into il+1's cache slots
         ggml_tensor * pf_node = nullptr;
         if (n_tokens <= 4 && il + 1 < n_layer && llama_moe_cache_prefetch_budget() > 0) {
+            const auto & cl = model.layers[il];
             const auto & nl = model.layers[il + 1];
+            ggml_tensor * key_cur  = cl.ffn_gate_up_exps ? cl.ffn_gate_up_exps : cl.ffn_up_exps;
             ggml_tensor * key_next = nl.ffn_gate_up_exps ? nl.ffn_gate_up_exps : nl.ffn_up_exps;
-            if (nl.ffn_gate_inp && llama_moe_cache_lookup(key_next)) {
+            // only when this layer runs the cache chain (the node hangs off its host split) and the next router is on the
+            // device (a host-resident router would add a device -> host -> device round trip ahead of the barrier)
+            if (nl.ffn_gate_inp && nl.ffn_gate_inp->buffer && !ggml_backend_buffer_is_host(nl.ffn_gate_inp->buffer) &&
+                    llama_moe_cache_lookup(key_cur) && llama_moe_cache_lookup(key_next)) {
+                const int topk = std::min<int>(llama_moe_cache_prefetch_topk(), (int) nl.ffn_gate_inp->ne[1]);
                 ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0,
-                        ggml_mul_mat(ctx0, nl.ffn_gate_inp, attn_post_norm), llama_moe_cache_prefetch_topk()));
+                        ggml_mul_mat(ctx0, nl.ffn_gate_inp, attn_post_norm), topk));
                 cb(pred, "ffn_moe_prefetch_pred", il);
                 ggml_build_forward_expand(gf, pred);
                 pf_node = llama_moe_cache_build_prefetch(ctx0, key_next, pred);

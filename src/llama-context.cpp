@@ -379,11 +379,14 @@ llama_context::llama_context(
 
         // the MoE expert cache's pre-gated prefetch enqueues its slot uploads on the compute stream of the device that runs the
         // cached layers (a no-op unless this context's model owns the cache and LLAMA_MOE_PREFETCH is set)
-        for (auto & backend : backends) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
-                llama_moe_cache_set_backend(model, backend.get());
-                break;
+        // only the main (DEFAULT) context: an in-model MTP draft context shares the model but runs on its own streams
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    llama_moe_cache_set_backend(model, backend.get());
+                    break;
+                }
             }
         }
 
@@ -510,9 +513,13 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
-    llama_moe_cache_set_backend(model, nullptr);
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // then stop prefetching through this context's backend (no-op unless it is the registered one)
+    for (auto & backend : backends) {
+        llama_moe_cache_release_backend(model, backend.get());
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {

@@ -117,6 +117,8 @@ void llama_moe_cache_step();
 // set_backend registers the compute backend that runs the cached layers (nullptr = unregister); only the owning model's
 // context may register. build_prefetch returns the CPU node for the layer keyed by key_next, or nullptr.
 void          llama_moe_cache_set_backend(const llama_model & model, ggml_backend_t backend);
+// unregister `backend` if (and only if) it is the one registered (a context tearing down must not switch off another's)
+void          llama_moe_cache_release_backend(const llama_model & model, ggml_backend_t backend);
 int           llama_moe_cache_prefetch_budget(); // 0 = prefetch off (unset, no backend, suspended, or cache-aware routing)
 int           llama_moe_cache_prefetch_topk();
 ggml_tensor * llama_moe_cache_build_prefetch(ggml_context * ctx, const ggml_tensor * key_next, ggml_tensor * pred_ids);
