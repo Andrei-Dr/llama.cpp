@@ -361,6 +361,20 @@ static bool volta_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA;
 }
 
+// cc 7.5 devices WITHOUT tensor cores (GTX 16xx, MX450, MX550) are flagged at init (ggml-cuda.cu).
+// GGML_CUDA_NO_TENSOR_CORES=1 makes a flagged device stop taking the RUNTIME DISPATCH paths that assume
+// tensor cores. It must NOT be used where the host picks a kernel VARIANT whose device code is selected by
+// __CUDA_ARCH__ (MMQ tile configs, mmq.cuh line ~190): changing the host answer there while the compiled
+// device code stays MMA-sized desynchronizes the scratch-buffer sizing from the kernel => out-of-bounds.
+// Hence turing_mma_available() itself is left untouched; call this only from dispatch sites.
+bool ggml_cuda_no_tensor_cores_mode();
+
+// Tensor cores usable for RUNTIME DISPATCH decisions (attention kernel choice etc.).
+static bool turing_mma_dispatch_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING &&
+        !ggml_cuda_no_tensor_cores_mode();
+}
+
 static bool turing_mma_available(const int cc) {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING;
 }

@@ -217,6 +217,14 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// Devices flagged at init as cc 7.5 without tensor cores, see ggml_cuda_no_tensor_cores_mode() in common.cuh.
+static bool g_ggml_cuda_no_tensor_cores[GGML_CUDA_MAX_DEVICES] = {};
+
+bool ggml_cuda_no_tensor_cores_mode() {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_NO_TENSOR_CORES"); return e != nullptr && atoi(e) != 0; }();
+    return enabled && g_ggml_cuda_no_tensor_cores[ggml_cuda_get_device()];
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -351,12 +359,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       device_vram_mib);
         std::string device_name(prop.name);
-        if (device_name == "NVIDIA GeForce MX450") {
+        if (device_name == "NVIDIA GeForce MX450" || device_name == "NVIDIA GeForce MX550" ||
+                device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
             turing_devices_without_mma.push_back({ id, device_name });
-        } else if (device_name == "NVIDIA GeForce MX550") {
-            turing_devices_without_mma.push_back({ id, device_name });
-        } else if (device_name.substr(0, 21) == "NVIDIA GeForce GTX 16") {
-            turing_devices_without_mma.push_back({ id, device_name });
+            g_ggml_cuda_no_tensor_cores[id] = true;
         }
 
         // Temporary performance fix:
