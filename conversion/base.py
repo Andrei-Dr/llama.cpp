@@ -172,6 +172,10 @@ class ModelBase:
         self._is_mxfp4 = False
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
+        # FP8 tensors of a multi-group compressed-tensors checkpoint, written as F16
+        self._fp8_as_f16: set[str] = set()
+        # tensors that already hold ggml block_mxfp4 bytes (uint8), written as they are
+        self._mxfp4_prepacked: set[str] = set()
 
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
@@ -215,6 +219,8 @@ class ModelBase:
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         tensors: dict[str, Callable[[], Tensor]] = {}
+        # filtered name -> checkpoint name; quantization configs target the checkpoint names
+        self._tensor_source_names: dict[str, str] = {}
 
         if remote_hf_model_id is not None:
             is_safetensors = True
@@ -226,6 +232,7 @@ class ModelBase:
                 if titem := self.filter_tensors((name, data_gen)):
                     tname, tgen = titem
                     tensors[tname] = tgen
+                    self._tensor_source_names[tname] = name
 
             return tensors
 
@@ -287,6 +294,7 @@ class ModelBase:
                     if titem := self.filter_tensors((name, data_gen)):
                         tname, tgen = titem
                         tensors[tname] = tgen
+                        self._tensor_source_names[tname] = name
 
         # verify tensor name presence and identify potentially missing files
         if len(tensor_names_from_index) > 0:
@@ -502,11 +510,12 @@ class ModelBase:
                     and all(g.get("format") == "nvfp4-pack-quantized" for g in groups.values() if isinstance(g, dict))
                 )
 
-                if len(groups) > 1 and not nvfp4_compressed_tensors:
-                    raise NotImplementedError("Can't handle multiple config groups for compressed-tensors yet")
+                multi_group = len(groups) > 1 and not nvfp4_compressed_tensors
                 weight_config = tuple(groups.values())[0]["weights"]
 
-                if quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
+                if multi_group:
+                    tensors_to_remove += self._dequant_compressed_tensors_groups(quant_config, dequant_simple)
+                elif quant_format == "float-quantized" or quant_format == "int-quantized" or quant_format == "naive-quantized":
                     block_size = weight_config.get("block_structure", None)
                     strategy = weight_config.get("strategy")
                     assert strategy == "channel" or strategy == "block"
@@ -582,6 +591,107 @@ class ModelBase:
 
         for name, value in new_tensors.items():
             self.model_tensors[name] = value
+
+    def _dequant_compressed_tensors_groups(self, quant_config: dict[str, Any], dequant_simple: Callable[..., Tensor]) -> list[str]:
+        """
+        compressed-tensors with several config groups: each quantized module takes the scheme
+        of the group whose targets match it.
+
+        As in compressed-tensors, a "re:" target is matched with re.match against the module's
+        checkpoint name, and name matches win over class matches. The checkpoint does not record
+        layer classes, so the only class target understood is "Linear": the group of every
+        quantized module no name matched. Any other plain target is an exact module name.
+        Modules in `ignore` are left alone, their tensors go through unchanged.
+
+        Supported schemes:
+          4-bit float, group 32, mxfp4-pack-quantized -> repacked losslessly to ggml MXFP4
+          8-bit float (FP8), block / channel / tensor -> dequantized, written as F16
+                                                         (Q8_0 with --fp8-as-q8)
+        Returns the tensors to remove.
+        """
+        groups: dict[str, dict[str, Any]] = quant_config["config_groups"]
+        top_format = quant_config.get("format")
+        source_names = getattr(self, "_tensor_source_names", {})
+
+        def split_targets(targets: Iterable[str]) -> tuple[list[re.Pattern[str]], list[str]]:
+            regexes = [re.compile(t[3:]) for t in targets if t.startswith("re:")]
+            plain = [t for t in targets if not t.startswith("re:")]
+            return regexes, plain
+
+        ignore_re, ignore_plain = split_targets(quant_config.get("ignore") or [])
+        group_targets = {gname: split_targets(g.get("targets") or []) for gname, g in groups.items()}
+
+        # "Linear" is the only class target understood, any other plain target is a module name
+        class_groups = [gname for gname, (_, plain) in group_targets.items() if "Linear" in plain]
+        if len(class_groups) > 1:
+            raise NotImplementedError(f"compressed-tensors groups {class_groups!r} all target Linear")
+
+        def module_group(module: str) -> str | None:
+            if module in ignore_plain or any(r.match(module) for r in ignore_re):
+                return None
+            by_name = [gname for gname, (regexes, plain) in group_targets.items()
+                       if module in plain or any(r.match(module) for r in regexes)]
+            if len(by_name) > 1:
+                raise ValueError(f"compressed-tensors module {module!r} matches groups {by_name!r}")
+            if by_name:
+                return by_name[0]
+            if class_groups:
+                return class_groups[0]
+            raise ValueError(f"compressed-tensors module {module!r} is quantized but matches no group")
+
+        suffixes = (".weight_packed", ".weight_scale", ".weight_scale_inv")
+        modules: dict[str, str] = {}  # module -> checkpoint module name
+        for name in self.model_tensors:
+            for suffix in suffixes:
+                if name.endswith(suffix):
+                    module = name.removesuffix(suffix)
+                    modules[module] = source_names.get(name, name).removesuffix(suffix)
+                    break
+
+        tensors_to_remove: list[str] = []
+        n_mxfp4 = n_fp8 = 0
+        for module, source_module in modules.items():
+            gname = module_group(source_module)
+            if gname is None:
+                continue
+            group = groups[gname]
+            wcfg = group["weights"]
+            fmt = group.get("format") or top_format
+            weight_name = module + ".weight"
+
+            if (wcfg.get("type") == "float" and wcfg.get("num_bits") == 4 and wcfg.get("strategy") == "group"
+                    and wcfg.get("group_size") == 32 and fmt == "mxfp4-pack-quantized"):
+                packed_name, scale_name = module + ".weight_packed", module + ".weight_scale"
+                if packed_name not in self.model_tensors or scale_name not in self.model_tensors:
+                    raise ValueError(f"{module}: group {gname!r} is MXFP4 but {packed_name} / {scale_name} are missing")
+                packed = self.model_tensors[packed_name]
+                scale = self.model_tensors[scale_name]
+                if packed().dtype != torch.uint8:
+                    raise ValueError(f"{packed_name}: expected uint8 MXFP4 codes, got {packed().dtype}")
+                self.model_tensors[weight_name] = lambda p=packed, s=scale: self._mxfp4_blocks_torch(p(), s())
+                self._mxfp4_prepacked.add(weight_name)
+                tensors_to_remove += [packed_name, scale_name]
+                n_mxfp4 += 1
+            elif wcfg.get("type") == "float" and wcfg.get("num_bits") == 8 and wcfg.get("strategy") in ("block", "channel", "tensor"):
+                scale_name = next((module + s for s in (".weight_scale", ".weight_scale_inv") if module + s in self.model_tensors), None)
+                if weight_name not in self.model_tensors or scale_name is None:
+                    raise ValueError(f"{module}: group {gname!r} is FP8 but its weight or scale is missing")
+                weight = self.model_tensors[weight_name]
+                scale = self.model_tensors[scale_name]
+                if weight().dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    raise ValueError(f"{weight_name}: expected FP8, got {weight().dtype}")
+                block_size = wcfg.get("block_structure") if wcfg.get("strategy") == "block" else None
+                self.model_tensors[weight_name] = lambda w=weight, s=scale, bs=block_size: dequant_simple(w(), s(), bs)
+                (self._fp8_dequantized if self._fp8_as_q8 else self._fp8_as_f16).add(weight_name)
+                tensors_to_remove.append(scale_name)
+                n_fp8 += 1
+            else:
+                raise NotImplementedError(f"compressed-tensors group {gname!r} ({fmt!r}, {wcfg!r}) is not supported")
+
+        if n_mxfp4:
+            self._is_mxfp4 = True
+        logger.info(f"compressed-tensors: {n_mxfp4} MXFP4 tensors kept as MXFP4, {n_fp8} FP8 tensors dequantized")
+        return tensors_to_remove
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -733,6 +843,8 @@ class ModelBase:
         # Force FP8-original tensors to Q8_0 when requested; Q8_0 is faster than F16/BF16.
         if self._fp8_as_q8 and name in self._fp8_dequantized and n_dims >= 2:
             return gguf.GGMLQuantizationType.Q8_0
+        if name in self._fp8_as_f16 and n_dims >= 2:
+            return gguf.GGMLQuantizationType.F16
         return False
 
     # some models need extra generated tensors (like rope_freqs)
@@ -1000,8 +1112,13 @@ class ModelBase:
 
             old_dtype = data_torch.dtype
 
+            # a prepacked tensor renamed on the way here would otherwise be cast to float silently
+            if self._mxfp4_prepacked and data_torch.dtype == torch.uint8 and name not in self._mxfp4_prepacked:
+                raise ValueError(f"{name}: uint8 tensor that is not a known MXFP4 tensor")
+
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            # (not MXFP4 bytes: after this, uint8 means a tensor that is already block_mxfp4)
+            if data_torch.dtype not in (torch.float16, torch.float32) and name not in self._mxfp4_prepacked:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -1015,6 +1132,14 @@ class ModelBase:
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
                 data = data_torch.numpy()
+
+                if data.dtype == np.uint8:
+                    if name not in self._mxfp4_prepacked or data.shape[-1] % 17 != 0:
+                        raise ValueError(f"{new_name}: unexpected uint8 tensor of shape {tuple(data.shape)} from {name}")
+                    shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+                    logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+                    continue
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
