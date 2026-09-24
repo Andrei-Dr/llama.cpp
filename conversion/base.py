@@ -754,6 +754,11 @@ class ModelBase:
         The 4-bit codes need no remapping: both sides index into ggml's kvalues_mxfp4
         order. ggml doubles the kvalues and halves the scale, so the value is the same.
         """
+        return ModelBase._mxfp4_blocks_torch(packed, scale).cpu().numpy()
+
+    @staticmethod
+    def _mxfp4_blocks_torch(packed: Tensor, scale: Tensor) -> Tensor:
+        """repack_mxfp4_blocks as a uint8 tensor [rows, cols/32 * 17], so it can stay lazy"""
         p = packed.contiguous().view(torch.uint8)
         s = scale.contiguous().view(torch.uint8)
 
@@ -774,7 +779,7 @@ class ModelBase:
         qs = vals[:, :, :16] | (vals[:, :, 16:] << 4)
 
         raw = torch.cat((s.unsqueeze(-1), qs.to(torch.uint8)), dim=-1)
-        return raw.reshape(rows, n_blocks * 17).cpu().numpy()
+        return raw.reshape(rows, n_blocks * 17)
 
     @staticmethod
     def _nvfp4_pack(weight: Tensor, scale: Tensor) -> tuple[np.ndarray, list[int]]:
