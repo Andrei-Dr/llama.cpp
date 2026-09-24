@@ -1,3 +1,4 @@
+#define GGML_CUDA_MMQ_NO_MMA // EXPERIMENT (mmqdp1): local define instead of the CMake option, rebuilds only the MMQ objects
 #pragma once
 
 #include "common.cuh"

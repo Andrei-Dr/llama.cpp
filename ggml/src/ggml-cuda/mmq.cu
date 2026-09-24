@@ -246,8 +246,14 @@ void ggml_cuda_mul_mat_q(
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
     // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // GGML_CUDA_MMQ_MOE_EXPERT_COLS=1 does the same on any GPU: at ubatch 128 with 256 experts and 8 used, an expert sees
+    // ~4 tokens, and a tile sized against ne12 (J = 128) multiplies ~97% padding.
+    static const bool expert_cols_env = [] {
+        const char * env = getenv("GGML_CUDA_MMQ_MOE_EXPERT_COLS");
+        return env != nullptr && atoi(env) != 0;
+    }();
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (expert_cols_env || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 
