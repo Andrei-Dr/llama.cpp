@@ -8,7 +8,7 @@ from torch import Tensor
 import gguf
 import numpy as np
 
-from .base import ModelBase
+from .base import LazyTorchTensor, ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
 
@@ -34,6 +34,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         # only the shard names, so the table itself is never held
         self._ple_shards: dict[int, str] = {}
         self._ple_row_dim: int | None = None
+        # key/value projections that absorbed the n-gram table's FP8 scale
+        self._ple_scaled: set[str] = set()
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -120,6 +122,17 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if ".ngram_embedding.shard_" in name:
             return self._place_ple_shard(data_torch, name)
 
+        # FP8 checkpoints store the n-gram table as FP8 codes times one per-tensor scale.
+        # The table only feeds the key and value projections, so the scale folds into
+        # those: the table stays exact (FP8 codes fit BF16 / F16) and the projections are
+        # written as F32, where a BF16 weight times a BF16 scale is exact too.
+        if name.endswith(".ngram_embedding.weight_scale"):
+            return []
+        if name.endswith((".ple.key_proj.weight", ".ple.value_proj.weight")):
+            if (scale := self._ple_table_scale()) is not None:
+                self._ple_scaled.add(name)
+                data_torch = data_torch.to(torch.float32) * scale
+
         # one projection feeds indexer q and k; split it, as minimax-m3 does
         if ".indexer.index_qk_proj.weight" in name:
             n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
@@ -139,6 +152,20 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return [(self.map_tensor_name(name), data_torch.squeeze())]
 
         return super().modify_tensors(data_torch, name, bid)
+
+    def _ple_table_scale(self) -> float | None:
+        for name, gen in self.model_tensors.items():
+            if name.endswith(".ngram_embedding.weight_scale"):
+                t = LazyTorchTensor.to_eager(gen())
+                if t.numel() != 1:
+                    raise ValueError(f"{name}: expected a per-tensor scale, got shape {tuple(t.shape)}")
+                return float(t.to(torch.float32).item())
+        return None
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if name in self._ple_scaled:
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     # the shards concatenate into a tensor of well over 100 GB
     # use LazyChunkedTensor here, a single shard resident at a time
@@ -173,8 +200,6 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
     def _load_ple_shard(self, name: str):
         def load() -> np.ndarray:
-            from .base import LazyTorchTensor
-
             # a fresh lazy tensor every call, or to_eager() memoizes every shard
             eager = LazyTorchTensor.to_eager(self.model_tensors[name]())
             return eager.to(torch.float32).contiguous().numpy()
