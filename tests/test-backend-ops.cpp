@@ -10712,6 +10712,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // FA-GQA: grouped-query attention (ratio 8 and 16) on a quantized KV cache with 1-5 query tokens, head size 256:
+    // the vec kernel's head-group columns (upstream covers quantized KV only for head sizes 64/72 and ratio 8 only for 192).
+    for (int kv : { 512, 2048 }) {
+        for (int nb : { 1, 2, 3, 4, 5 }) {
+            for (bool sinks : { false, true }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1));
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, nb, true, sinks, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
+            }
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {16, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 3, {8, 2}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
             if (hsk != 96 && hsk != 192 && hsk != 320 && hsk != 576 && hsk != hsv) continue;

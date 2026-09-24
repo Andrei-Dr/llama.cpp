@@ -642,6 +642,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // Grouped-query attention on a quantized KV cache with few query tokens: the vec kernel walks each K/V head once for all of
+    // its query heads, instead of per-head walks (1 token) or dequantizing the used KV cache to F16 every step (MMA, 2+ tokens).
+    if (can_use_vector_kernel && ggml_cuda_fattn_vec_gqa_applies(dst)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     const bool mma_allowed = !ggml_cuda_fattn_mma_disabled() && Q->ne[1] < ggml_cuda_fattn_tile_min_batch() &&
         K->ne[1] < ggml_cuda_fattn_mma_max_kv();
 
