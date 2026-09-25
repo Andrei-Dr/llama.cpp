@@ -35,6 +35,11 @@
 #include <thread>
 #include <vector>
 
+#if defined(__AVX2__) && defined(__FMA__)
+#include <immintrin.h>
+#define SCORE_TOPK_AVX2 1
+#endif
+
 namespace fs = std::filesystem;
 
 struct topk_args {
@@ -68,57 +73,120 @@ static inline float exp_nonpos(float x) {
     return e;
 }
 
+#ifdef SCORE_TOPK_AVX2
+// exp_nonpos on 8 lanes, the same scheme and constants
+static inline __m256 exp_nonpos8(__m256 x) {
+    x = _mm256_max_ps(x, _mm256_set1_ps(-87.0f));
+    const __m256 n = _mm256_floor_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f), _mm256_set1_ps(0.5f)));
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693359375f), x);
+    r = _mm256_fmadd_ps(n, _mm256_set1_ps(2.12194440e-4f), r);
+    __m256 p = _mm256_set1_ps(1.9875691500e-4f);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073e-3f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894e-2f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459e-1f));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201e-1f));
+    p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), _mm256_add_ps(r, _mm256_set1_ps(1.0f)));
+    const __m256i bits = _mm256_add_epi32(_mm256_castps_si256(p), _mm256_slli_epi32(_mm256_cvttps_epi32(n), 23));
+    return _mm256_castsi256_ps(bits);
+}
+#endif
+
 // top-K of one logits row; writes ids / lp (descending) and the leftover log-mass
 static void topk_row(const float * x, int n_vocab, int K, int32_t * ids, float * lp, float * left) {
-    // pass 1: max and the K largest (sorted descending, insertion when a value beats the smallest kept one)
+    constexpr int B = 64;
+
+    // pass 1: max and the K largest (sorted descending); a block whose max cannot enter the top-K is skipped
     std::vector<float>   tv(K, -INFINITY);
     std::vector<int32_t> ti(K, -1);
     float mx = -INFINITY;
-    for (int i = 0; i < n_vocab; ++i) {
-        const float v = x[i];
-        mx = std::max(mx, v);
-        if (v > tv[K - 1]) {
-            int j = K - 1;
-            while (j > 0 && tv[j - 1] < v) {
-                tv[j] = tv[j - 1];
-                ti[j] = ti[j - 1];
-                --j;
+    for (int i0 = 0; i0 < n_vocab; i0 += B) {
+        const int n = std::min(B, n_vocab - i0);
+        float bm = -INFINITY;
+        int   l0 = 0;
+#ifdef SCORE_TOPK_AVX2
+        if (n == B) {
+            __m256 m8 = _mm256_loadu_ps(x + i0);
+            for (int l = 8; l < B; l += 8) {
+                m8 = _mm256_max_ps(m8, _mm256_loadu_ps(x + i0 + l));
             }
-            tv[j] = v;
-            ti[j] = i;
+            __m128 m4 = _mm_max_ps(_mm256_castps256_ps128(m8), _mm256_extractf128_ps(m8, 1));
+            m4 = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));
+            m4 = _mm_max_ss(m4, _mm_movehdup_ps(m4));
+            bm = _mm_cvtss_f32(m4);
+            l0 = B;
+        }
+#endif
+        for (int l = l0; l < n; ++l) {
+            bm = std::max(bm, x[i0 + l]);
+        }
+        mx = std::max(mx, bm);
+        if (!(bm > tv[K - 1])) {
+            continue;
+        }
+        for (int l = 0; l < n; ++l) {
+            const float v = x[i0 + l];
+            if (v > tv[K - 1]) {
+                int j = K - 1;
+                while (j > 0 && tv[j - 1] < v) {
+                    tv[j] = tv[j - 1];
+                    ti[j] = ti[j - 1];
+                    --j;
+                }
+                tv[j] = v;
+                ti[j] = i0 + l;
+            }
         }
     }
     const float thr = tv[K - 1];
 
-    // pass 2: sum of exp(x - max) below the threshold and at / above it, in independent lanes
-    constexpr int L = 16;
+    // pass 2: sums of exp(x - max) below the threshold and at / above it, per block in independent lanes
     double lo = 0.0, hi = 0.0;
     int    n_ge = 0;
-    int    i = 0;
-    constexpr int BLOCK = 4096;
-    while (i < n_vocab) {
-        const int end = std::min(n_vocab, i + BLOCK);
-        float alo[L] = {}, ahi[L] = {};
-        int   cge[L] = {};
-        for (; i + L <= end; i += L) {
-            for (int l = 0; l < L; ++l) {
-                const float v = x[i + l];
-                const float e = exp_nonpos(v - mx);
-                const bool  ge = v >= thr;
-                alo[l] += ge ? 0.0f : e;
-                ahi[l] += ge ? e : 0.0f;
-                cge[l] += ge ? 1 : 0;
+    float  e[B];
+    for (int i0 = 0; i0 < n_vocab; i0 += B) {
+        const int n = std::min(B, n_vocab - i0);
+        float slo = 0.0f, shi = 0.0f;
+        int   cge = 0;
+        int   l0 = 0;
+#ifdef SCORE_TOPK_AVX2
+        if (n == B) {
+            const __m256 vmx = _mm256_set1_ps(mx), vthr = _mm256_set1_ps(thr);
+            __m256  alo = _mm256_setzero_ps(), ahi = _mm256_setzero_ps();
+            __m256i acnt = _mm256_setzero_si256();
+            for (int l = 0; l < B; l += 8) {
+                const __m256 v  = _mm256_loadu_ps(x + i0 + l);
+                const __m256 ev = exp_nonpos8(_mm256_sub_ps(v, vmx));
+                const __m256 ge = _mm256_cmp_ps(v, vthr, _CMP_GE_OQ);
+                ahi  = _mm256_add_ps(ahi, _mm256_and_ps(ge, ev));
+                alo  = _mm256_add_ps(alo, _mm256_andnot_ps(ge, ev));
+                acnt = _mm256_sub_epi32(acnt, _mm256_castps_si256(ge));  // ge lanes are all ones = -1
             }
+            float fl[8], fh[8];
+            int32_t ic[8];
+            _mm256_storeu_ps(fl, alo);
+            _mm256_storeu_ps(fh, ahi);
+            _mm256_storeu_si256((__m256i *) ic, acnt);
+            for (int j = 0; j < 8; ++j) {
+                slo += fl[j];
+                shi += fh[j];
+                cge += ic[j];
+            }
+            l0 = B;
         }
-        for (; i < end; ++i) {
-            const float e = exp_nonpos(x[i] - mx);
-            if (x[i] >= thr) { ahi[0] += e; cge[0]++; } else { alo[0] += e; }
+#endif
+        for (int l = l0; l < n; ++l) {
+            e[l] = exp_nonpos(x[i0 + l] - mx);
         }
-        for (int l = 0; l < L; ++l) {
-            lo += alo[l];
-            hi += ahi[l];
-            n_ge += cge[l];
+        for (int l = l0; l < n; ++l) {
+            const bool ge = x[i0 + l] >= thr;
+            slo += ge ? 0.0f : e[l];
+            shi += ge ? e[l] : 0.0f;
+            cge += ge;
         }
+        lo += slo;
+        hi += shi;
+        n_ge += cge;
     }
 
     const double sum = lo + hi;
