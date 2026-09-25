@@ -36,6 +36,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         self._ple_row_dim: int | None = None
         # key/value projections that absorbed the n-gram table's FP8 scale
         self._ple_scaled: set[str] = set()
+        # the n-gram table is stored as FP8 codes
+        self._ple_fp8 = False
 
     def _read_hash_constants(self, suffix: str) -> list[int]:
         """Read an int64 PLE constant straight from the checkpoint.
@@ -165,6 +167,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
         if name in self._ple_scaled:
             return gguf.GGMLQuantizationType.F32
+        # an FP8 table follows --fp8-as-q8 like the other FP8 tensors; the chunks are
+        # quantized from the exact FP8 codes in F32, with no intermediate rounding
+        if self._fp8_as_q8 and self._ple_fp8 and new_name == gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD] + ".weight":
+            return gguf.GGMLQuantizationType.Q8_0
         return super().tensor_force_quant(name, new_name, bid, n_dims)
 
     # the shards concatenate into a tensor of well over 100 GB
@@ -176,6 +182,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 
         self._ple_shards[idx] = name
         self._ple_row_dim = int(data_torch.shape[-1])
+        if self.model_tensors[name]().dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            self._ple_fp8 = True
 
         if len(self._ple_shards) < n_parts:
             return []
