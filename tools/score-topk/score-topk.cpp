@@ -16,6 +16,7 @@
 //
 // The rows of one decode are --batch-size / --ctx-size sequences, each in its own sequence id.
 // --dump-logits FILE writes the raw f32 logits of the first row [S][n_vocab] (for testing).
+// --no-write computes every shard and writes none (speed runs); the last line reports tok/s without the first decode.
 
 #include "arg.h"
 #include "common.h"
@@ -50,6 +51,7 @@ struct topk_args {
     int32_t     shard_rows = 32;
     int32_t     n_threads  = 0;   // top-K threads, 0 = hardware concurrency
     int64_t     row_limit  = -1;
+    bool        no_write   = false; // speed runs: compute everything, write nothing
 };
 
 // exp for x <= 0 (the argument is always logit - max), the Cephes expf scheme: n = round(x / ln 2),
@@ -219,6 +221,7 @@ static bool parse_own_args(int & argc, char ** argv, topk_args & a) {
         else if (arg == "--shard-rows")  { if (!(v = next())) return false; a.shard_rows = std::stoi(v); }
         else if (arg == "--topk-threads"){ if (!(v = next())) return false; a.n_threads  = std::stoi(v); }
         else if (arg == "--row-limit")   { if (!(v = next())) return false; a.row_limit  = std::stoll(v); }
+        else if (arg == "--no-write")    { a.no_write = true; }
         else { keep.push_back(argv[i]); }
     }
     for (size_t i = 0; i < keep.size(); ++i) {
@@ -292,7 +295,7 @@ int main(int argc, char ** argv) {
     };
     std::vector<int64_t> todo;
     for (int64_t sh = 0; sh < n_shards; ++sh) {
-        if (!fs::exists(shard_path(sh, ".topk")) && !fs::exists(shard_path(sh, ".npz"))) {
+        if (ta.no_write || (!fs::exists(shard_path(sh, ".topk")) && !fs::exists(shard_path(sh, ".npz")))) {
             todo.push_back(sh);
         }
     }
@@ -334,6 +337,9 @@ int main(int argc, char ** argv) {
     int64_t n_tok_done = 0;
     bool dumped = ta.dump_logits.empty();
     const auto t0 = std::chrono::steady_clock::now();
+    // throughput without the first decode (warm-up), from the end of that decode's top-K to the last result
+    std::chrono::steady_clock::time_point t_warm;
+    int64_t n_tok_warm = -1;
 
     for (int64_t sh : todo) {
         const int64_t r0 = sh * ta.shard_rows;
@@ -390,6 +396,17 @@ int main(int argc, char ** argv) {
             t_decode += std::chrono::duration<double>(ta1 - ta0).count();
             t_topk   += std::chrono::duration<double>(ta2 - ta1).count();
             n_tok_done += n_tok;
+            if (n_tok_warm < 0) {
+                n_tok_warm = n_tok_done;
+                t_warm = ta2;
+            }
+        }
+
+        if (ta.no_write) {
+            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            LOG_INF("shard %lld done (not written): %lld tok, %.1f tok/s (decode %.1f s, top-K %.1f s)\n",
+                    (long long) sh, (long long) n_tok_done, n_tok_done / el, t_decode, t_topk);
+            continue;
         }
 
         const std::string tmp = shard_path(sh, ".topk.tmp");
@@ -413,6 +430,13 @@ int main(int argc, char ** argv) {
         const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         LOG_INF("shard %lld done: %lld tok, %.1f tok/s (decode %.1f s, top-K %.1f s)\n",
                 (long long) sh, (long long) n_tok_done, n_tok_done / el, t_decode, t_topk);
+    }
+
+    {
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count();
+        const int64_t n = n_tok_done - n_tok_warm;
+        LOG_INF("SUMMARY tokens %lld, after warm-up %lld in %.2f s = %.1f tok/s; decode %.1f s, top-K %.1f s (all batches)\n",
+                (long long) n_tok_done, (long long) n, el, n > 0 && el > 0 ? n / el : 0.0, t_decode, t_topk);
     }
 
     llama_batch_free(batch);
