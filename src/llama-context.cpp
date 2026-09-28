@@ -3372,6 +3372,85 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+class llama_io_write_cb : public llama_io_write_i {
+public:
+    llama_io_write_cb(llama_state_write_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
+
+    void write(const void * src, size_t size) override {
+        if (size > 0 && !cb(src, size, user_data)) {
+            throw std::runtime_error("state write callback failed");
+        }
+        size_written += size;
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        temp_buffer.resize(size);
+        ggml_backend_tensor_get(tensor, temp_buffer.data(), offset, size);
+        write(temp_buffer.data(), temp_buffer.size());
+    }
+
+    size_t n_bytes() override {
+        return size_written;
+    }
+
+private:
+    llama_state_write_cb cb;
+    void * user_data;
+    size_t size_written = 0;
+    std::vector<uint8_t> temp_buffer;
+};
+
+class llama_io_read_cb : public llama_io_read_i {
+public:
+    llama_io_read_cb(llama_state_read_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
+
+    void read(void * dst, size_t size) override {
+        if (size > 0 && !cb(dst, size, user_data)) {
+            throw std::runtime_error("state read callback failed");
+        }
+        size_read += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        temp_buffer.resize(size);
+        read(temp_buffer.data(), size);
+        ggml_backend_tensor_set(tensor, temp_buffer.data(), offset, size);
+    }
+
+    size_t n_bytes() override {
+        return size_read;
+    }
+
+private:
+    llama_state_read_cb cb;
+    void * user_data;
+    size_t size_read = 0;
+    std::vector<uint8_t> temp_buffer;
+};
+
+size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, llama_state_write_cb write_cb, void * user_data) {
+    llama_io_write_cb io(write_cb, user_data);
+    io.write(&io_magic, sizeof(io_magic));
+    io.write(&seq_id, sizeof(seq_id));
+    state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    return io.n_bytes();
+}
+
+size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_state_read_cb read_cb, void * user_data) {
+    llama_io_read_cb io(read_cb, user_data);
+    uint32_t magic_read = 0;
+    io.read(&magic_read, sizeof(magic_read));
+    if (magic_read != io_magic) {
+        throw std::runtime_error("wrong sequence state magic");
+    }
+    llama_seq_id seq_id_read;
+    io.read(&seq_id_read, sizeof(seq_id_read));
+    if (state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+        throw std::runtime_error("failed to restore sequence state");
+    }
+    return io.n_bytes();
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
@@ -4328,6 +4407,28 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_save_stream(llama_context * ctx, llama_seq_id seq_id, llama_state_write_cb write_cb, void * user_data) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_save_stream(seq_id, write_cb, user_data);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error streaming sequence state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_state_seq_load_stream(llama_context * ctx, llama_seq_id dest_seq_id, llama_state_read_cb read_cb, void * user_data) {
+    ctx->synchronize();
+
+    try {
+        return ctx->state_seq_load_stream(dest_seq_id, read_cb, user_data);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error restoring streamed sequence state: %s\n", __func__, err.what());
         return 0;
     }
 }

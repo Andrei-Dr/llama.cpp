@@ -181,6 +181,9 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
+    size_t state_seq_save_stream(llama_seq_id seq_id, llama_state_write_cb write_cb, void * user_data);
+    size_t state_seq_load_stream(llama_seq_id seq_id, llama_state_read_cb  read_cb,  void * user_data);
+
     //
     // perf
     //

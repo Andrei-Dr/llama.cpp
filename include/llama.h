@@ -921,6 +921,25 @@ extern "C" {
                           size_t   n_token_capacity,
                           size_t * n_token_count_out);
 
+    // Stream a sequence's state through callbacks instead of one host buffer or a plain file, so the caller can
+    // encrypt, compress or store it elsewhere with bounded memory (one tensor chunk at a time). A callback returns
+    // false to abort. Returns the number of bytes streamed, 0 on failure. The stream is only valid for a context with
+    // the same model and memory layout.
+    typedef bool (*llama_state_write_cb)(const void * data, size_t size, void * user_data);
+    typedef bool (*llama_state_read_cb)(void * data, size_t size, void * user_data);
+
+    LLAMA_API size_t llama_state_seq_save_stream(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+            llama_state_write_cb   write_cb,
+                            void * user_data);
+
+    LLAMA_API size_t llama_state_seq_load_stream(
+            struct llama_context * ctx,
+                    llama_seq_id   dest_seq_id,
+             llama_state_read_cb   read_cb,
+                            void * user_data);
+
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
 // for backwards-compat
