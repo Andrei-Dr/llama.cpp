@@ -9,6 +9,7 @@
 #include "../../ggml-cpu-impl.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h> // for qsort
@@ -1571,6 +1572,30 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 #endif
 }
 
+// Software prefetch for the K-quant dot products that stream MoE expert weights on the CPU (decode misses). At 6 threads that
+// phase is DRAM bound, and the hardware L2 streamer stops at every 4 KiB boundary, so each thread's ~1 MB expert stream stalls
+// ~250 times. GGML_CPU_KQ_PREFETCH = distance in bytes ahead of the block being read (0 = off, the default). Weights only:
+// the q8_K activations are small and stay in L1. Prefetches never fault, so running past the tensor's end is harmless.
+#if defined(__AVX2__)
+static int ggml_kq_prefetch_dist(void) {
+    static int dist = -1;
+    if (dist < 0) {
+        const char * env = getenv("GGML_CPU_KQ_PREFETCH");
+        dist = env ? atoi(env) : 0;
+        if (dist < 0) {
+            dist = 0;
+        }
+    }
+    return dist;
+}
+
+static inline void ggml_kq_prefetch(const void * block, int dist) {
+    const char * p = (const char *) block + dist;
+    _mm_prefetch(p,      _MM_HINT_T0);
+    _mm_prefetch(p + 64, _MM_HINT_T0);
+}
+#endif // defined(__AVX2__)
+
 void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     assert(nrc == 1);
     UNUSED(nrc);
@@ -1590,7 +1615,13 @@ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     __m256 acc = _mm256_setzero_ps();
 
+    const int pf = ggml_kq_prefetch_dist();
+
     for (int i = 0; i < nb; ++i) {
+
+        if (pf) {
+            ggml_kq_prefetch(&x[i], pf);
+        }
 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
         const float dmin = -y[i].d * GGML_CPU_FP16_TO_FP32(x[i].dmin);
@@ -1789,7 +1820,13 @@ void ggml_vec_dot_q3_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     uint32_t aux[3];
 
+    const int pf = ggml_kq_prefetch_dist();
+
     for (int i = 0; i < nb; ++i) {
+
+        if (pf) {
+            ggml_kq_prefetch(&x[i], pf);
+        }
 
         const float d = y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d);
 
