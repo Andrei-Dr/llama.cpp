@@ -1044,13 +1044,13 @@ static __global__ void flash_attn_tile(
     // KQ == SRAM buffer to hold KQ fragments between KQ and VKQ matrix multiplications.
     // VKQ == Accumulators in registers for the final VKQ result.
 #ifdef FAST_FP16_AVAILABLE
-    __shared__ half2 Q_tmp[ncols * DKQ/2];
-    __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
+    __shared__ __align__(16) half2 Q_tmp[ncols * DKQ/2];
+    __shared__ __align__(16) half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
     __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #else
-    __shared__ float Q_tmp[ncols * DKQ];
-    __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
+    __shared__ __align__(16) float Q_tmp[ncols * DKQ];
+    __shared__ __align__(16) float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
     __shared__ float KQ[ncols * nbatch_fa];
     __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
 #endif // FAST_FP16_AVAILABLE
@@ -1065,25 +1065,50 @@ static __global__ void flash_attn_tile(
     ggml_cuda_pdl_sync();
 
     if constexpr (kv_mode == 2) {
-        // Q -> q8_1 per 32-value block (after the softmax scale), one warp per (column, block): int8 values in Q_tmp,
-        // then (d, d*sum) per block. Replaces the half2 Q load below.
+        // Q -> q8_1 per 32-value block (after the softmax scale), with exactly the arithmetic of quantize_q8_1_to_shared (the
+        // decode vec kernel): 8 lanes per block, 4 values per lane summed in order, xor-shuffle reduction 4 / 2 / 1, d = amax/127,
+        // q = roundf(x/d), ds = (d, sum of the scaled x). So a verify batch through this kernel and a 1-token decode through the
+        // vec kernel see the same Q bytes and scales. One warp handles 4 blocks per step.
         static_assert(ncols*DKQ + ncols*(DKQ/QK4_0)*sizeof(float2) <= sizeof(Q_tmp), "Q_tmp too small for q8_1 Q");
-        int8_t * Q_i8 = (int8_t *) Q_tmp;
-        float2 * Q_ds = (float2 *) (Q_i8 + ncols*DKQ);
-        constexpr int nblk = ncols*(DKQ/QK4_0);
-        for (int w = threadIdx.y; w < nblk; w += nwarps) {
-            const int jc = w / (DKQ/QK4_0);
-            const int bq = w % (DKQ/QK4_0);
+        static_assert(warp_size == 32 && DKQ % 128 == 0, "bad warp_size / DKQ");
+        int    * Q_i32 = (int    *) Q_tmp;
+        float2 * Q_ds  = (float2 *) (Q_i32 + ncols*(DKQ/4));
+        constexpr int nunit = ncols*(DKQ/128);
+        for (int u = threadIdx.y; u < nunit; u += nwarps) {
+            const int jc = u / (DKQ/128);
+            const int bq = (u % (DKQ/128))*4 + threadIdx.x/8; // block of this lane
             const int j  = jc / ncols2;
             const int c  = jc % ncols2;
-            const float x = Q_f[c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float)) + bq*QK4_0 + threadIdx.x] * scale;
-            const float amax = warp_reduce_max<warp_size>(fabsf(x));
-            const float d = amax / 127.0f;
-            const int   q = amax == 0.0f ? 0 : __float2int_rn(x / d);
-            const int sum = warp_reduce_sum<warp_size>(q);
-            Q_i8[jc*DKQ + bq*QK4_0 + threadIdx.x] = (int8_t) q;
-            if (threadIdx.x == 0) {
-                Q_ds[jc*(DKQ/QK4_0) + bq] = make_float2(d, d*sum);
+            const float * xq = Q_f + c*(nb02/sizeof(float)) + fastmodulo(col_Q_0 + j, ne01)*(nb01/sizeof(float)) + bq*QK4_0 + 4*(threadIdx.x % 8);
+            float vals[4];
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                vals[l] = scale * xq[l];
+            }
+            float amax = fabsf(vals[0]);
+            float sum  = vals[0];
+#pragma unroll
+            for (int l = 1; l < 4; ++l) {
+                amax = fmaxf(amax, fabsf(vals[l]));
+                sum += vals[l];
+            }
+#pragma unroll
+            for (int mask = 4; mask > 0; mask >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, mask, 32));
+                sum +=             __shfl_xor_sync(0xFFFFFFFF, sum,  mask, 32);
+            }
+            const float d = amax / 127;
+            int q32 = 0;
+            int8_t * q8 = (int8_t *) &q32;
+            if (d != 0.0f) {
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    q8[l] = roundf(vals[l] / d);
+                }
+            }
+            Q_i32[jc*(DKQ/4) + bq*(QK4_0/4) + threadIdx.x % 8] = q32;
+            if (threadIdx.x % 8 == 0) {
+                Q_ds[jc*(DKQ/QK4_0) + bq] = make_float2(d, sum);
             }
         }
     } else {

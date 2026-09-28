@@ -70,15 +70,19 @@ static inline bool ggml_cuda_fattn_tile_kv_q4_native(const ggml_tensor * dst) {
         K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0 && K->nb[1] < INT32_MAX && V->nb[1] < INT32_MAX;
 }
 
-// With the q4_0-native tile path, K.Q runs in int8: Q quantized to q8_1 per 32 values, 8 dp4a per q4_0 block, the decode vec
-// kernel's arithmetic. On by default (tnext1: KLD at 32k 0.99x the exact half2 path, prefill +18% at 68k on TU116);
-// GGML_CUDA_FA_TILE_DP4A=0 = the exact half2 K.Q.
+// With the q4_0-native tile path, K.Q can run in int8: Q quantized to q8_1 exactly like the decode vec kernel
+// (quantize_q8_1_to_shared), 8 dp4a per q4_0 block. Default on only where it was measured (NVIDIA Turing, sm_75: tnext1 KLD at
+// 32k 0.99x the exact half2 path, prefill +18% at 68k); GGML_CUDA_FA_TILE_DP4A=1 / 0 forces it on / off everywhere.
 static inline bool ggml_cuda_fattn_tile_kq_dp4a() {
-    static const bool on = [] {
-        const char * env = getenv("GGML_CUDA_FA_TILE_DP4A");
-        return env == nullptr || atoi(env) != 0;
+    static const int env = [] {
+        const char * e = getenv("GGML_CUDA_FA_TILE_DP4A");
+        return e == nullptr ? -1 : (atoi(e) != 0 ? 1 : 0);
     }();
-    return on;
+    if (env >= 0) {
+        return env == 1;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING;
 }
 
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(

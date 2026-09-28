@@ -739,7 +739,10 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            need_f16_K = !ggml_cuda_fattn_tile_kv_q4_native(dst);
+            // q4_0-native tile: no f16 copy - unless a 2-31 token batch (MTP verify) can still pick the MMA kernel at this KV
+            // length, which needs the whole-KV f16 copy and is never a reserved graph: keep the scratch in the worst case then
+            need_f16_K = !ggml_cuda_fattn_tile_kv_q4_native(dst) ||
+                (!ggml_cuda_fattn_mma_disabled() && K->ne[1] < ggml_cuda_fattn_mma_max_kv());
             need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_MMA_F16:

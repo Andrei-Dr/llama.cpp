@@ -5689,6 +5689,11 @@ static void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
             ctx->pools[d][s].reset();
         }
     }
+#ifdef USE_CUDA_GRAPH
+    // captured graphs hold pool addresses in their kernel arguments (q8_1 activations, FA KV_max / dst_tmp, ...); a replay
+    // after the pools are gone would read or write freed memory, so every graph is captured again on its next use
+    ctx->cuda_graphs.clear();
+#endif // USE_CUDA_GRAPH
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
