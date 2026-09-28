@@ -1,12 +1,18 @@
 #pragma once
 
 // Disk tier of the server prompt cache: slot states that leave the slot are written to a directory and restored on a
-// later request that shares their prefix, so a long prompt is read from disk instead of being prefilled again.
-// Entries are bound to a fingerprint of the model and context setup (one subdirectory per fingerprint), expire after a
-// TTL and are evicted oldest first to stay under a byte cap and above a free-space reserve.
+// later request that shares their prefix, so a long prompt is read back instead of being prefilled again.
+//
+// By default everything on disk is encrypted with AES-256-GCM under a key drawn from the OS CSPRNG when the server starts and
+// kept only in its memory: the files are unreadable to anyone else and become garbage when the process exits
+// (crypto-shredding). --no-cache-disk-encrypt stores plaintext for fully trusted disks. Each run uses its own directory `<root>/run-<pid>`, removed on exit; directories of runs whose
+// process is gone are removed at startup. The index (tokens, sizes, last use) lives in memory only.
+//
+// Entries expire after a TTL and are evicted oldest first to stay under a byte cap and above a free-space reserve.
 
 #include "server-common.h"
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <list>
@@ -15,15 +21,18 @@
 struct server_prompt;
 
 struct server_prompt_disk_entry {
-    std::string  id;     // hex FNV-1a of the tokens: identical prompts share one entry
+    std::string  id;       // hex FNV-1a of the tokens: identical prompts share one entry
     llama_tokens tokens;
-    size_t       bytes = 0;  // all files of the entry
-    std::filesystem::file_time_type t_used;  // last save or restore (mtime of the .meta file)
+    size_t       bytes = 0;
+    std::chrono::steady_clock::time_point t_used;  // last save or restore
 };
 
 struct server_prompt_disk {
-    server_prompt_disk(const std::string & root, const std::string & fingerprint,
-                       size_t limit_bytes, int64_t ttl_s, size_t reserve_bytes);
+    server_prompt_disk(const std::string & root, size_t limit_bytes, int64_t ttl_s, size_t reserve_bytes, bool encrypt);
+    ~server_prompt_disk();
+
+    server_prompt_disk(const server_prompt_disk &) = delete;
+    server_prompt_disk & operator=(const server_prompt_disk &) = delete;
 
     bool ok() const { return ready; }
 
@@ -51,15 +60,19 @@ private:
     int64_t ttl_s;
     size_t  reserve_bytes;
     bool    ready = false;
+    bool    encrypt;
+    uint8_t key[32] = {};
+
+    const uint8_t * key_ptr() const { return encrypt ? key : nullptr; }
 
     std::list<server_prompt_disk_entry> entries;  // least recently used first
 
     std::filesystem::path path(const std::string & id, const char * ext) const;
-    void scan();
+    void remove_stale_runs(const std::filesystem::path & root) const;
     void remove(std::list<server_prompt_disk_entry>::iterator it);
     void touch(std::list<server_prompt_disk_entry>::iterator it);
     bool expired(const server_prompt_disk_entry & e) const;
 };
 
-// Hex FNV-1a of a byte string; used for entry ids and the fingerprint directory name.
+// Hex FNV-1a of a byte string; used for entry ids.
 std::string server_prompt_disk_hash(const void * data, size_t n);

@@ -661,6 +661,7 @@ struct common_params {
     int32_t cache_disk_mib         = 32768;     // disk tier size cap in MiB (0 = no cap)
     int32_t cache_disk_ttl         = 3600;      // seconds an unused entry is kept (0 = no expiry)
     int32_t cache_disk_reserve_mib = 8192;      // free space the disk tier always leaves on its filesystem
+    bool    cache_disk_encrypt     = true;      // AES-256-GCM with a per-run key
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

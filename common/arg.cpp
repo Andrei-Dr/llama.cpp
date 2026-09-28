@@ -1758,6 +1758,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-encrypt"},
+        {"--no-cache-disk-encrypt"},
+        "encrypt the prompt cache disk tier with AES-256-GCM under a key that lives only in this process, so entries "
+        "die with it (default: enabled)",
+        [](common_params & params, bool value) {
+            params.cache_disk_encrypt = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_ENCRYPT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

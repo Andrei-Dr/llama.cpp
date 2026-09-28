@@ -35,6 +35,10 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# the prompt cache disk tier encrypts with AES-256-GCM (OpenSSL libcrypto)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
