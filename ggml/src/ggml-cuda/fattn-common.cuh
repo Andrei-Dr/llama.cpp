@@ -50,6 +50,26 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// q4_0-native tile kernel (fattn-tile.cuh): with K and V both q4_0 the tile kernel dequantizes each tile as it loads it instead
+// of reading a whole-KV f16 copy (identical values: same float arithmetic, same rounding to half). Head sizes with a q4_0
+// instance: 256/256. GGML_CUDA_FA_TILE_Q4=0 turns it off (the f16 copy, as upstream).
+static constexpr bool ggml_cuda_fattn_tile_q4_head(const int DKQ, const int DV) {
+    return DKQ == 256 && DV == 256;
+}
+
+static inline bool ggml_cuda_fattn_tile_kv_q4_native(const ggml_tensor * dst) {
+    static const bool disabled = [] {
+        const char * env = getenv("GGML_CUDA_FA_TILE_Q4");
+        return env != nullptr && atoi(env) == 0;
+    }();
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    return !disabled && K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        ggml_cuda_fattn_tile_q4_head(K->ne[0], V->ne[0]) &&
+        K->nb[0] == ggml_type_size(GGML_TYPE_Q4_0) && V->nb[0] == ggml_type_size(GGML_TYPE_Q4_0) &&
+        K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0 && K->nb[1] < INT32_MAX && V->nb[1] < INT32_MAX;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
