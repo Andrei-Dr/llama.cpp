@@ -102,6 +102,16 @@ llama_context::llama_context(
         mc_params.warm        = params.n_moe_cache_warm;
         mc_params.bias        = params.moe_cache_bias;
         llama_moe_cache_init(model, mc_params);
+
+        // prefill mode without a cache is for models whose experts stream from host memory (a separate draft model with
+        // device-resident weights must not grow its own prefill buffers beside the target's)
+        for (const auto & l : model.layers) {
+            const ggml_tensor * t = l.ffn_down_exps;
+            if (t && t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
+                model_host_experts = true;
+                break;
+            }
+        }
     }
 
     t_start_us = model.t_start_us;
@@ -1801,8 +1811,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // Lazy in both directions: a prompt fed in several chunks switches once. Only the context that owns the cache toggles it;
     // with no cache at all (--moe-expert-cache 0) the target context still toggles: decode keeps the small compute buffer and
     // the pools the prefill grew (the FA K/V conversion scratch grows with the context) are trimmed before decode needs them.
-    if (cparams.n_ubatch_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
-            (llama_moe_cache_owned_by(model) || !llama_moe_cache_active())) {
+    if (cparams.n_ubatch_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && !prefill_unfit &&
+            (llama_moe_cache_owned_by(model) || (!llama_moe_cache_active() && model_host_experts))) {
         const bool big = n_tokens_all > cparams.n_ubatch;
         if (big != moe_prefill_mode) {
             synchronize(); // nothing submitted earlier may still read the slots or the compute buffer
@@ -1821,12 +1831,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     if (moe_prefill_mode && sched_need_reserve) {
-        // the prefill buffer is sized by the VRAM left after the context: when it does not fit, this prompt runs at n_ubatch
+        // the prefill buffer is sized by the VRAM left after the context: when it does not fit, prompts run at n_ubatch for the
+        // rest of this context's life (latched: retrying every chunk would re-reserve twice and wipe the cache slots each time)
         try {
             sched_reserve();
-        } catch (const std::exception & e) {
-            LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): this batch runs at ubatch %u\n",
+        } catch (const std::runtime_error & e) {
+            if (std::string(e.what()).find("failed to allocate") == std::string::npos) {
+                throw; // not an allocation failure
+            }
+            LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): prompts run at ubatch %u from now on\n",
                     __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
+            prefill_unfit      = true;
             moe_prefill_mode   = false;
             sched_need_reserve = true;
             sched_reserve();

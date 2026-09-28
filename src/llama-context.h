@@ -357,6 +357,8 @@ private:
 
     bool sched_need_reserve = true;
     bool moe_prefill_mode   = false; // MoE prefill mode active (see decode)
+    bool prefill_unfit      = false; // the prefill ubatch did not fit once: prefill mode stays off for this context
+    bool model_host_experts = false; // the model keeps MoE experts in host memory (prefill mode without a cache applies)
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
