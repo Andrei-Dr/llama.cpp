@@ -3376,7 +3376,10 @@ class llama_io_write_cb : public llama_io_write_i {
 public:
     llama_io_write_cb(llama_state_write_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
     ~llama_io_write_cb() override {
-        std::fill(temp_buffer.begin(), temp_buffer.end(), 0);  // plaintext state
+        volatile uint8_t * p = temp_buffer.data();  // plaintext state; volatile so the wipe is not elided
+        for (size_t i = 0; i < temp_buffer.size(); ++i) {
+            p[i] = 0;
+        }
     }
 
     void write(const void * src, size_t size) override {
@@ -3407,7 +3410,10 @@ class llama_io_read_cb : public llama_io_read_i {
 public:
     llama_io_read_cb(llama_state_read_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
     ~llama_io_read_cb() override {
-        std::fill(temp_buffer.begin(), temp_buffer.end(), 0);  // plaintext state
+        volatile uint8_t * p = temp_buffer.data();  // plaintext state; volatile so the wipe is not elided
+        for (size_t i = 0; i < temp_buffer.size(); ++i) {
+            p[i] = 0;
+        }
     }
 
     void read(void * dst, size_t size) override {
@@ -3435,7 +3441,9 @@ private:
 };
 
 size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_write_cb write_cb, void * user_data) {
-    GGML_ASSERT(!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && "a streamed state lives on the host");
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        throw std::invalid_argument("a streamed state lives on the host: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported");
+    }
     llama_io_write_cb io(write_cb, user_data);
     io.write(&io_magic, sizeof(io_magic));
     io.write(&seq_id, sizeof(seq_id));
@@ -3444,7 +3452,9 @@ size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, llama_state_seq
 }
 
 size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_read_cb read_cb, void * user_data) {
-    GGML_ASSERT(!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && "a streamed state lives on the host");
+    if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
+        throw std::invalid_argument("a streamed state lives on the host: LLAMA_STATE_SEQ_FLAGS_ON_DEVICE is not supported");
+    }
     llama_io_read_cb io(read_cb, user_data);
     uint32_t magic_read = 0;
     io.read(&magic_read, sizeof(magic_read));

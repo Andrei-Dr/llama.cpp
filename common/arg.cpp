@@ -1758,6 +1758,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-disk-idle"}, "MS",
+        string_format("write an idle slot to the prompt cache disk tier after this many ms without requests; a new "
+            "request cancels a write in progress (default: %d)", params.cache_disk_idle_ms),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-idle must be non-negative");
+            }
+            params.cache_disk_idle_ms = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-disk-encrypt"},
         {"--no-cache-disk-encrypt"},
         "encrypt the prompt cache disk tier with AES-256-GCM under a key that lives only in this process, so entries "

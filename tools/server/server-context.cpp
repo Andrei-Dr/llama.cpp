@@ -925,6 +925,10 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // the prompt cache disk tier outlives model reloads (sleep/wake): its entries stay valid for the same model
+    std::unique_ptr<server_prompt_disk> prompt_disk;
+    bool prompt_disk_tried = false;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1377,15 +1381,21 @@ private:
                 // recurrent/hybrid/SWA memory only its end or its checkpoints
                 const bool can_truncate = !llama_model_is_recurrent(model_tgt) && !llama_model_is_hybrid(model_tgt)
                                        && llama_model_n_swa(model_tgt) == 0;
-                prompt_cache->disk = std::make_unique<server_prompt_disk>(
-                        params_base.cache_disk_path,
-                        (size_t) params_base.cache_disk_mib * 1024 * 1024, params_base.cache_disk_ttl,
-                        (size_t) params_base.cache_disk_reserve_mib * 1024 * 1024, params_base.cache_disk_encrypt,
-                        can_truncate);
-                if (!prompt_cache->disk->ok()) {
-                    SRV_ERR("%s", "--cache-disk was given but the disk tier could not start, refusing to run without it\n");
-                    return false;
+                if (!prompt_disk_tried) {
+                    prompt_disk_tried = true;
+                    prompt_disk = std::make_unique<server_prompt_disk>(
+                            params_base.cache_disk_path,
+                            (size_t) params_base.cache_disk_mib * 1024 * 1024, params_base.cache_disk_ttl,
+                            (size_t) params_base.cache_disk_reserve_mib * 1024 * 1024, params_base.cache_disk_encrypt,
+                            can_truncate);
+                    if (!prompt_disk->ok()) {
+                        // explicit configuration: fail the first startup rather than silently serve without it
+                        SRV_ERR("%s", "--cache-disk was given but the disk tier could not start, refusing to run\n");
+                        prompt_disk.reset();
+                        return false;
+                    }
                 }
+                prompt_cache->disk = prompt_disk.get();
             }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
@@ -1443,6 +1453,9 @@ private:
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
+        });
+        queue_tasks.on_idle([this]() {
+            save_idle_slots_to_disk();
         });
 
         metrics.init();
@@ -1589,7 +1602,8 @@ private:
 
         // find the slot that has at least n% prompt similarity
         if (slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
+            float  f_sim_best = 0;
+            size_t lcp_best   = 0;
 
             for (server_slot & slot : slots) {
                 if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -1619,6 +1633,7 @@ private:
                 // select the current slot if the criteria match
                 if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                     f_sim_best = f_sim_cur;
+                    lcp_best   = lcp_len;
 
                     ret = &slot;
                 }
@@ -1639,7 +1654,11 @@ private:
                     // the slot shares a prefix with the request, but a stored prompt may share much more
                     float f_keep_disk = 0.0f;
                     float f_sim_disk  = 0.0f;
-                    if (prompt_cache->disk->find(task.tokens, f_keep, f_sim_best, f_keep_disk, f_sim_disk)) {
+                    // score the slot like stored entries: for recurrent/hybrid memory only its checkpoints count
+                    const size_t slot_reuse = prompt_cache->disk->reusable_prompt(ret->prompt, lcp_best);
+                    const float  f_keep_slot = float(slot_reuse) / ret->prompt.tokens.size();
+                    const float  f_sim_slot  = float(slot_reuse) / task.tokens.size();
+                    if (prompt_cache->disk->find(task.tokens, f_keep_slot, f_sim_slot, f_keep_disk, f_sim_disk)) {
                         update_cache = true;
                     }
                 }
@@ -2366,13 +2385,19 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed. Keep the first one (at the first user message: the end of
+            // the system prompt + tools) while any other can go: it is the one a new or compacted conversation with
+            // the same system prompt restores
+            auto it = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() > 1) {
+                ++it;
+            }
+            const auto & cur = *it;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2856,8 +2881,6 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
-
-                save_idle_slots_to_disk();
 
                 return; // skip further processing
 
@@ -4069,15 +4092,23 @@ private:
         if (!prompt_cache || !prompt_cache->disk) {
             return;
         }
+        const int64_t now      = ggml_time_us();
+        const int64_t debounce = (int64_t) params_base.cache_disk_idle_ms * 1000;
+        const auto    abort    = [this]() { return queue_tasks.has_pending(); };
         for (auto & slot : slots) {
-            if (queue_tasks.has_pending()) {
+            if (abort()) {
                 return;
             }
-            if (slot.is_processing() || slot.prompt.tokens.size() == 0 || slot.t_disk_offered == slot.t_last_used) {
+            // wait for real idleness: a client that sends its next request right away (a tool loop) keeps its
+            // state in the slot and never pays for a write
+            if (slot.is_processing() || slot.prompt.tokens.size() == 0 || slot.t_disk_offered == slot.t_last_used
+                    || now - slot.t_last_used < debounce) {
                 continue;
             }
-            slot.t_disk_offered = slot.t_last_used;
-            prompt_cache->disk->save(slot.prompt, slot.ctx_tgt, slot.ctx_dft, slot.id);
+            // a cancelled save is retried at the next idle period
+            if (prompt_cache->disk->save(slot.prompt, slot.ctx_tgt, slot.ctx_dft, slot.id, abort) || !abort()) {
+                slot.t_disk_offered = slot.t_last_used;
+            }
         }
         prompt_cache->disk->evict();  // TTL
     }

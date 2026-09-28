@@ -1,8 +1,9 @@
 #pragma once
 
 // Disk tier of the server prompt cache: slot states are written to a directory and restored on a later request that
-// shares their prefix, so a long prompt is read back instead of being prefilled again. States are written when the
-// server goes idle (off the critical path of the next request) and, if still unsaved, when a request evicts them.
+// shares their prefix, so a long prompt is read back instead of being prefilled again. States are written after the
+// server has been idle for --cache-disk-idle ms (a new request cancels the write) and, if still unsaved, when a request
+// evicts them.
 //
 // By default every file is encrypted with AES-256-GCM under a key drawn from the OS CSPRNG at startup and kept only in
 // locked, non-dumpable memory: the files are unreadable to anyone else and become garbage when the process exits
@@ -11,13 +12,16 @@
 // Layout: <root>/llama-pdc/run-XXXXXX (mkdtemp, 0700) per server run, holding a marker file and a lock file that the
 // run keeps flock()ed. At startup, run directories that carry the marker and whose lock can be taken are removed;
 // nothing without the marker is ever touched. The index (tokens, checkpoint positions, sizes, last use) lives in
-// memory only. Entries expire after a TTL and are evicted oldest first under a byte cap and a free-space reserve.
+// memory only. A new entry replaces older ones it reproduces >= 90% of (the same conversation, one turn later).
+// Entries expire after a TTL; under the byte cap or the free-space reserve, old entries largely reproduced by newer
+// ones go first, then the least recently used.
 
 #include "server-common.h"
 
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <list>
 #include <string>
 #include <vector>
@@ -44,14 +48,20 @@ struct server_prompt_disk {
 
     bool ok() const { return ready; }
 
+    // Reuse the slot itself offers for tokens_new under the same accounting as stored entries.
+    size_t reusable_prompt(const server_prompt & prompt, size_t lcp) const;
+
     // Whether the prompt is already on disk in a form that restores it exactly.
     bool stored(const server_prompt & prompt);
 
     // Write the state of `seq` (target and draft contexts) and the prompt's checkpoints, unless already stored.
     // Removes entries the new one supersedes. Prompts containing media are not stored.
-    bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
+    // `abort` is polled between 4 MiB records; when it returns true the save stops and leaves nothing behind.
+    bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq,
+              const std::function<bool()> & abort = {});
 
-    // The entry whose reusable prefix beats both f_keep_base and f_sim_base for tokens_new, or nullptr.
+    // The entry that reuses the most of tokens_new, more than f_sim_base (what the slot or RAM offers), or nullptr.
+    // f_keep_base is accepted for symmetry with the RAM tier and not used.
     const server_prompt_disk_entry * find(const server_tokens & tokens_new, float f_keep_base, float f_sim_base,
                                           float & f_keep_out, float & f_sim_out) const;
 
@@ -60,7 +70,7 @@ struct server_prompt_disk {
     bool load(const server_prompt_disk_entry & entry, server_prompt & prompt,
               llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 
-    // Drop expired entries, then the oldest ones until the byte cap and the free-space reserve hold.
+    // Drop expired entries, then (near-duplicates first, else least recently used) until the cap and reserve hold.
     void evict();
 
     size_t size() const;
@@ -89,7 +99,10 @@ private:
     void   touch(std::list<server_prompt_disk_entry>::iterator it);
     bool   expired(const server_prompt_disk_entry & e) const;
     uintmax_t available() const;
-    bool   save_impl(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
+    bool   save_impl(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq,
+                     const std::function<bool()> & abort);
+    float  redundancy(const server_prompt_disk_entry & o, const server_prompt_disk_entry & n) const;
+    std::list<server_prompt_disk_entry>::iterator victim();
     bool   load_impl(std::list<server_prompt_disk_entry>::iterator it, server_prompt & prompt,
                      llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 };

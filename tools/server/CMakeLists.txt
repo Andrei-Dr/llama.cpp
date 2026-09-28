@@ -42,6 +42,8 @@ if (NOT LLAMA_BUILD_BORINGSSL AND NOT LLAMA_BUILD_LIBRESSL)
     if (OpenSSL_FOUND)
         target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
         target_compile_definitions(${TARGET} PRIVATE LLAMA_PDC_OPENSSL)
+    else()
+        message(WARNING "OpenSSL libcrypto not found: the prompt cache disk tier will need --no-cache-disk-encrypt")
     endif()
 endif()
 

@@ -629,8 +629,8 @@ struct server_prompt_cache {
     // false when only the disk tier is on (--cache-ram 0 --cache-disk PATH): states go straight to disk
     bool ram = true;
 
-    // optional disk tier, consulted after the RAM states
-    std::unique_ptr<server_prompt_disk> disk;
+    // optional disk tier, consulted after the RAM states (owned by the server context: it outlives model reloads)
+    server_prompt_disk * disk = nullptr;
 
     size_t size() const;
 

@@ -9,6 +9,7 @@
 #endif
 
 #include <algorithm>
+#include <functional>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +46,8 @@ static constexpr size_t   PDC_AAD       = 6 + PDC_ID;
 static const char *       PDC_BASE      = "llama-pdc";
 static const char *       PDC_MARKER    = "llama-pdc.run";
 static const char *       PDC_LOCK      = "lock";
+static constexpr size_t   PDC_MIN_REUSE = 256;   // tokens a stored entry must save to be worth reading back
+static constexpr float    PDC_SUPERSEDE = 0.9f;  // share of an old entry a newer one must reproduce to replace it
 
 static uint64_t pdc_mix(uint64_t h, uint64_t w) {
     h ^= w;
@@ -164,23 +167,24 @@ file_ptr open_file(const fs::path & p) {
 #endif
 }
 
-// Written data goes to disk and leaves the page cache (the box has no RAM to spare for it).
-bool sync_and_drop(FILE * f) {
-    if (fflush(f) != 0) {
-        return false;
-    }
+// Streaming writeback: each record's pages are handed to the disk right away (no wait), and the pages two records
+// back are waited for and dropped, so at most ~3 records (12 MiB) of this file are ever dirty in the page cache and
+// nothing waits for the whole file (no fdatasync). The box has no RAM to spare for a GB of dirty pages.
+void writeback(FILE * f, off_t from, off_t to, bool wait) {
 #if defined(__linux__)
+    if (to <= from) {
+        return;
+    }
     const int fd = fileno(f);
-    if (fdatasync(fd) != 0) {
-        return false;
+    sync_file_range(fd, from, to - from,
+                    wait ? SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER
+                         : SYNC_FILE_RANGE_WRITE);
+    if (wait) {
+        posix_fadvise(fd, from, to - from, POSIX_FADV_DONTNEED);
     }
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-#elif !defined(_WIN32)
-    if (fsync(fileno(f)) != 0) {
-        return false;
-    }
+#else
+    (void) f; (void) from; (void) to; (void) wait;
 #endif
-    return true;
 }
 
 void drop_cache(FILE * f) {
@@ -201,8 +205,9 @@ using cipher_ptr = std::unique_ptr<EVP_CIPHER_CTX, cipher_free>;
 // Buffers plaintext and writes it as records (encrypted when key != nullptr).
 class rec_writer {
 public:
-    rec_writer(const fs::path & p, const uint8_t * key, char kind, const std::string & id)
-        : key(key), kind(kind), id(id), f(create_file(p)) {
+    rec_writer(const fs::path & p, const uint8_t * key, char kind, const std::string & id,
+               const std::function<bool()> & abort)
+        : key(key), kind(kind), id(id), abort(abort), f(create_file(p)) {
         const uint8_t enc = key != nullptr;
         ok = f && (!enc || random_bytes(prefix, sizeof(prefix)));
         ok = ok && fwrite(&PDC_MAGIC, 4, 1, f.get()) == 1 && fwrite(&PDC_VERSION, 4, 1, f.get()) == 1
@@ -229,7 +234,10 @@ public:
     }
 
     bool finish() {
-        ok = ok && flush(1) && sync_and_drop(f.get());
+        ok = ok && flush(1) && fflush(f.get()) == 0;
+        if (ok) {
+            writeback(f.get(), 0, (off_t) ftello(f.get()), true);  // the last few records only; earlier ones are done
+        }
         return ok;
     }
 
@@ -241,10 +249,12 @@ private:
     const uint8_t * key;
     char            kind;
     std::string     id;
+    std::function<bool()> abort;
     file_ptr        f;
     bool            ok = false;
     uint8_t         prefix[8] = {};
     uint32_t        index = 0;
+    off_t           marks[3] = {0, 0, 0};  // file offsets after the last three records
     std::vector<uint8_t> buf;
     std::vector<uint8_t> out;
 
@@ -285,7 +295,16 @@ private:
         cleanse(buf.data(), buf.size());
         buf.clear();
         ++index;
-        return w;
+        if (!w || fflush(f.get()) != 0) {
+            return false;
+        }
+        const off_t end = (off_t) ftello(f.get());
+        writeback(f.get(), marks[2], end, false);      // start this record's writeback
+        writeback(f.get(), marks[0], marks[1], true);  // wait for and drop the one two records back
+        marks[0] = marks[1];
+        marks[1] = marks[2];
+        marks[2] = end;
+        return !(abort && abort());  // a waiting request cancels an idle save between records
     }
 };
 
@@ -417,8 +436,8 @@ bool get_blob(rec_reader & r, std::vector<uint8_t> & b) {
 }
 
 bool write_ckpts(const fs::path & p, const uint8_t * key, const std::string & id,
-                 const std::list<common_prompt_checkpoint> & ckpts) {
-    rec_writer w(p, key, 'c', id);
+                 const std::list<common_prompt_checkpoint> & ckpts, const std::function<bool()> & abort) {
+    rec_writer w(p, key, 'c', id, abort);
     if (!put_v<uint32_t>(w, ckpts.size())) {
         return false;
     }
@@ -455,8 +474,8 @@ bool read_ckpts(const fs::path & p, const uint8_t * key, const std::string & id,
 }
 
 bool write_state(const fs::path & p, const uint8_t * key, char kind, const std::string & id, llama_context * ctx,
-                 llama_seq_id seq) {
-    rec_writer w(p, key, kind, id);
+                 llama_seq_id seq, const std::function<bool()> & abort) {
+    rec_writer w(p, key, kind, id, abort);
     return llama_state_seq_save_stream(ctx, seq, LLAMA_STATE_SEQ_FLAGS_NONE, rec_writer::cb, &w) > 0 && w.finish();
 }
 
@@ -656,6 +675,19 @@ size_t server_prompt_disk::reusable(const server_prompt_disk_entry & e, size_t l
     return best;
 }
 
+size_t server_prompt_disk::reusable_prompt(const server_prompt & prompt, size_t lcp) const {
+    if (lcp == prompt.tokens.size() || can_truncate) {
+        return lcp;
+    }
+    size_t best = 0;
+    for (const auto & c : prompt.checkpoints) {
+        if (c.n_tokens > 0 && (size_t) c.n_tokens <= lcp) {
+            best = std::max(best, (size_t) c.n_tokens);
+        }
+    }
+    return best;
+}
+
 // entry e restores `tokens` exactly: tokens is e's prompt, or a prefix e can be rolled back to
 bool server_prompt_disk::covers(const server_prompt_disk_entry & e, const server_tokens & tokens) const {
     const size_t n = tokens.size();
@@ -666,6 +698,33 @@ bool server_prompt_disk::covers(const server_prompt_disk_entry & e, const server
         return true;
     }
     return std::find(e.ckpt_tokens.begin(), e.ckpt_tokens.end(), (int64_t) n) != e.ckpt_tokens.end();
+}
+
+// share of old entry o that newer entry n reproduces: n's reusable prefix within their common prefix, over |o|
+float server_prompt_disk::redundancy(const server_prompt_disk_entry & o, const server_prompt_disk_entry & n) const {
+    if (o.tokens.empty()) {
+        return 0.0f;
+    }
+    const size_t lcp = server_tokens(n.tokens, false).get_common_prefix(server_tokens(o.tokens, false));
+    const size_t kept_by_n = reusable(n, lcp);
+    return kept_by_n >= reusable(o, lcp) ? float(kept_by_n) / o.tokens.size() : 0.0f;
+}
+
+// eviction victim: an old entry largely reproduced by a newer one goes first (it costs little to lose), else the
+// least recently used
+std::list<server_prompt_disk_entry>::iterator server_prompt_disk::victim() {
+    auto best = entries.begin();
+    float best_r = 0.5f;  // below this, redundancy does not beat recency
+    for (auto o = entries.begin(); o != entries.end(); ++o) {
+        for (auto n = std::next(o); n != entries.end(); ++n) {  // newer entries only
+            const float r = redundancy(*o, *n);
+            if (r > best_r) {
+                best_r = r;
+                best = o;
+            }
+        }
+    }
+    return best;
 }
 
 bool server_prompt_disk::stored(const server_prompt & prompt) {
@@ -691,16 +750,16 @@ void server_prompt_disk::evict() {
     // btrfs and others report freed space only after their next commit: count what was freed ourselves
     const uintmax_t avail = available();
     while (!entries.empty() && ((limit_bytes > 0 && size() > limit_bytes) || avail + freed < reserve_bytes)) {
-        SRV_TRC("prompt disk cache: evicting oldest entry %s (%.1f MiB)\n", entries.front().id.c_str(),
-                entries.front().bytes / 1048576.0);
-        freed += remove(entries.begin());
+        auto it = victim();
+        SRV_TRC("prompt disk cache: evicting entry %s (%.1f MiB)\n", it->id.c_str(), it->bytes / 1048576.0);
+        freed += remove(it);
     }
 }
 
 bool server_prompt_disk::save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
-                              llama_seq_id seq) {
+                              llama_seq_id seq, const std::function<bool()> & abort) {
     try {
-        return save_impl(prompt, ctx_tgt, ctx_dft, seq);
+        return save_impl(prompt, ctx_tgt, ctx_dft, seq, abort);
     } catch (const std::exception & e) {
         SRV_ERR("prompt disk cache: save failed: %s\n", e.what());
         return false;
@@ -708,7 +767,7 @@ bool server_prompt_disk::save(const server_prompt & prompt, llama_context * ctx_
 }
 
 bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
-                                   llama_seq_id seq) {
+                                   llama_seq_id seq, const std::function<bool()> & abort) {
     if (!ready || prompt.tokens.size() == 0) {
         return false;
     }
@@ -743,7 +802,7 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     size_t freed = 0;
     while (!entries.empty() && ((limit_bytes > 0 && size() + need > limit_bytes)
                                 || (avail != UINTMAX_MAX && avail + freed < need + reserve_bytes))) {
-        freed += remove(entries.begin());
+        freed += remove(victim());
     }
 
     const int64_t t0 = ggml_time_us();
@@ -751,16 +810,21 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     e.id = server_prompt_disk_hash(tokens.data(), tokens.size() * sizeof(llama_token));
     for (auto it = entries.begin(); it != entries.end(); ++it) {
         if (it->id == e.id) {  // same hash, different prompt (a collision): replace it
-            remove(it);
+            freed += remove(it);
             break;
         }
     }
 
-    const bool ok = write_state(path(e.id, ".tgt"), key_ptr(), 't', e.id, ctx_tgt, seq)
-        && (!ctx_dft || write_state(path(e.id, ".dft"), key_ptr(), 'd', e.id, ctx_dft, seq))
-        && (prompt.checkpoints.empty() || write_ckpts(path(e.id, ".ckpt"), key_ptr(), e.id, prompt.checkpoints));
+    const bool ok = write_state(path(e.id, ".tgt"), key_ptr(), 't', e.id, ctx_tgt, seq, abort)
+        && (!ctx_dft || write_state(path(e.id, ".dft"), key_ptr(), 'd', e.id, ctx_dft, seq, abort))
+        && (prompt.checkpoints.empty()
+            || write_ckpts(path(e.id, ".ckpt"), key_ptr(), e.id, prompt.checkpoints, abort));
     if (!ok) {
-        SRV_ERR("prompt disk cache: failed to write entry %s\n", e.id.c_str());
+        if (abort && abort()) {
+            SRV_INF("prompt disk cache: idle save of %d tokens cancelled by a new request\n", (int) tokens.size());
+        } else {
+            SRV_ERR("prompt disk cache: failed to write entry %s\n", e.id.c_str());
+        }
         std::error_code ec;
         for (const char * ext : { ".tgt", ".dft", ".ckpt" }) {
             fs::remove(path(e.id, ext), ec);
@@ -777,10 +841,13 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     }
     e.t_used = std::chrono::steady_clock::now();
 
-    // entries the new one restores exactly are superseded
+    // superseded: entries the new one restores exactly, and near-duplicates it reproduces >= 90% of (a chat client
+    // that rewrites earlier turns, e.g. dropping old reasoning, never extends the old entry's own tail, so without
+    // this every turn would leave a ~full-size copy behind)
     for (auto it = entries.begin(); it != entries.end();) {
         auto next = std::next(it);
-        if (covers(e, server_tokens(it->tokens, false))) {
+        if (covers(e, server_tokens(it->tokens, false)) || redundancy(*it, e) >= PDC_SUPERSEDE) {
+            SRV_TRC("prompt disk cache: entry %s superseded\n", it->id.c_str());
             remove(it);
         }
         it = next;
@@ -795,6 +862,7 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
 
 const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & tokens_new, float f_keep_base,
                                                           float f_sim_base, float & f_keep_out, float & f_sim_out) const {
+    (void) f_keep_base;
     const server_prompt_disk_entry * best = nullptr;
     f_keep_out = f_keep_base;
     f_sim_out  = f_sim_base;
@@ -809,14 +877,17 @@ const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & 
         const size_t reuse = reusable(e, lcp);
         const float f_keep = float(reuse) / e.tokens.size();
         const float f_sim  = float(reuse) / tokens_new.size();
-        if (reuse == 0 || f_keep < 0.25f) {
-            continue;  // the RAM tier's "don't trash large prompts" rule, on the part that is actually reusable
+        // Unlike the RAM tier, no "keep most of the entry" rule (f_keep): reading a stored state back costs well under
+        // a second even at 1 GB, while every reused token saves a prefill step. After a client compacts a long
+        // conversation only the system prompt + tools is shared (f_keep ~0.1) and that is still minutes of prefill.
+        // So: the most tokens reused wins, it must beat what the slot (or a RAM state) already offers, and it must be
+        // worth a read (PDC_MIN_REUSE tokens).
+        if (reuse < PDC_MIN_REUSE || f_sim <= f_sim_out) {
+            continue;
         }
-        if (f_keep_out < f_keep && f_sim_out < f_sim) {
-            f_keep_out = f_keep;
-            f_sim_out  = f_sim;
-            best = &e;
-        }
+        f_keep_out = f_keep;
+        f_sim_out  = f_sim;
+        best = &e;
     }
     return best;
 }

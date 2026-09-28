@@ -662,6 +662,7 @@ struct common_params {
     int32_t cache_disk_ttl         = 3600;      // seconds an unused entry is kept (0 = no expiry)
     int32_t cache_disk_reserve_mib = 8192;      // free space the disk tier always leaves on its filesystem
     bool    cache_disk_encrypt     = true;      // AES-256-GCM with a per-run key
+    int32_t cache_disk_idle_ms     = 2000;      // idle time before an idle slot is written to the disk tier
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
