@@ -2865,6 +2865,11 @@ public:
     llama_io_read_file(llama_file * f) : file(f) {}
 
     void read(void * dst, size_t size) override {
+        // llama_file::read_raw reads short without an error at the end of a file (POSIX stdio path), so a truncated state
+        // file would be consumed past its end and restored from garbage: refuse it here
+        if (size > file->size() - file->tell()) {
+            throw std::runtime_error("sequence state file is truncated");
+        }
         file->read_raw(dst, size);
         size_read += size;
     }
@@ -3584,7 +3589,13 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     if (memory) {
-        memory->state_read(io, seq_id, flags);
+        try {
+            memory->state_read(io, seq_id, flags);
+        } catch (...) {
+            // a restore that failed part way must not leave cells that a later prefix match would reuse
+            memory->seq_rm(seq_id, -1, -1);
+            throw;
+        }
     }
 
     return io.n_bytes();
