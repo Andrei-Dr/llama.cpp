@@ -1798,8 +1798,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // A batch larger than n_ubatch releases the slots and re-reserves the scheduler for n_ubatch_prefill (the compute buffer
     // grows into the freed VRAM; the node budget grows with the ubatch too); the first small batch after it re-reserves for
     // n_ubatch (freeing the prefill buffer) and restores the slots, which the prompt's routing then re-ranks (warm-up).
-    // Lazy in both directions: a prompt fed in several chunks switches once. Only the context that owns the cache toggles it.
-    if (cparams.n_ubatch_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && llama_moe_cache_owned_by(model)) {
+    // Lazy in both directions: a prompt fed in several chunks switches once. Only the context that owns the cache toggles it;
+    // with no cache at all (--moe-expert-cache 0) the target context still toggles: decode keeps the small compute buffer and
+    // the pools the prefill grew (the FA K/V conversion scratch grows with the context) are trimmed before decode needs them.
+    if (cparams.n_ubatch_prefill && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            (llama_moe_cache_owned_by(model) || !llama_moe_cache_active())) {
         const bool big = n_tokens_all > cparams.n_ubatch;
         if (big != moe_prefill_mode) {
             synchronize(); // nothing submitted earlier may still read the slots or the compute buffer
@@ -1814,6 +1817,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 trim_device_pools();       // and the prefill's temporaries (backend pools never shrink by themselves)
                 llama_moe_cache_resume();
             }
+        }
+    }
+
+    if (moe_prefill_mode && sched_need_reserve) {
+        // the prefill buffer is sized by the VRAM left after the context: when it does not fit, this prompt runs at n_ubatch
+        try {
+            sched_reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): this batch runs at ubatch %u\n",
+                    __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
+            moe_prefill_mode   = false;
+            sched_need_reserve = true;
+            sched_reserve();
+            trim_device_pools();
+            llama_moe_cache_resume();
         }
     }
 
