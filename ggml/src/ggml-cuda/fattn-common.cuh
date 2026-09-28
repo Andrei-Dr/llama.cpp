@@ -70,12 +70,13 @@ static inline bool ggml_cuda_fattn_tile_kv_q4_native(const ggml_tensor * dst) {
         K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0 && K->nb[1] < INT32_MAX && V->nb[1] < INT32_MAX;
 }
 
-// GGML_CUDA_FA_TILE_DP4A=1 (with the q4_0-native tile path): K.Q in int8 - Q quantized to q8_1 per 32 values, 8 dp4a per q4_0
-// block, the decode vec kernel's arithmetic. Changes prefill numerics (KLD-gated); off by default.
+// With the q4_0-native tile path, K.Q runs in int8: Q quantized to q8_1 per 32 values, 8 dp4a per q4_0 block, the decode vec
+// kernel's arithmetic. On by default (tnext1: KLD at 32k 0.99x the exact half2 path, prefill +18% at 68k on TU116);
+// GGML_CUDA_FA_TILE_DP4A=0 = the exact half2 K.Q.
 static inline bool ggml_cuda_fattn_tile_kq_dp4a() {
     static const bool on = [] {
         const char * env = getenv("GGML_CUDA_FA_TILE_DP4A");
-        return env != nullptr && atoi(env) != 0;
+        return env == nullptr || atoi(env) != 0;
     }();
     return on;
 }
