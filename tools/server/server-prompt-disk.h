@@ -1,14 +1,17 @@
 #pragma once
 
-// Disk tier of the server prompt cache: slot states that leave the slot are written to a directory and restored on a
-// later request that shares their prefix, so a long prompt is read back instead of being prefilled again.
+// Disk tier of the server prompt cache: slot states are written to a directory and restored on a later request that
+// shares their prefix, so a long prompt is read back instead of being prefilled again. States are written when the
+// server goes idle (off the critical path of the next request) and, if still unsaved, when a request evicts them.
 //
-// By default everything on disk is encrypted with AES-256-GCM under a key drawn from the OS CSPRNG when the server starts and
-// kept only in its memory: the files are unreadable to anyone else and become garbage when the process exits
-// (crypto-shredding). --no-cache-disk-encrypt stores plaintext for fully trusted disks. Each run uses its own directory `<root>/run-<pid>`, removed on exit; directories of runs whose
-// process is gone are removed at startup. The index (tokens, sizes, last use) lives in memory only.
+// By default every file is encrypted with AES-256-GCM under a key drawn from the OS CSPRNG at startup and kept only in
+// locked, non-dumpable memory: the files are unreadable to anyone else and become garbage when the process exits
+// (crypto-shredding). --no-cache-disk-encrypt stores plaintext with a per-record checksum, for fully trusted disks.
 //
-// Entries expire after a TTL and are evicted oldest first to stay under a byte cap and above a free-space reserve.
+// Layout: <root>/llama-pdc/run-XXXXXX (mkdtemp, 0700) per server run, holding a marker file and a lock file that the
+// run keeps flock()ed. At startup, run directories that carry the marker and whose lock can be taken are removed;
+// nothing without the marker is ever touched. The index (tokens, checkpoint positions, sizes, last use) lives in
+// memory only. Entries expire after a TTL and are evicted oldest first under a byte cap and a free-space reserve.
 
 #include "server-common.h"
 
@@ -17,18 +20,23 @@
 #include <filesystem>
 #include <list>
 #include <string>
+#include <vector>
 
 struct server_prompt;
 
 struct server_prompt_disk_entry {
-    std::string  id;       // hex FNV-1a of the tokens: identical prompts share one entry
-    llama_tokens tokens;
-    size_t       bytes = 0;
+    std::string          id;           // hex hash of the tokens: identical prompts share one entry
+    llama_tokens         tokens;
+    std::vector<int64_t> ckpt_tokens;  // n_tokens of each stored context checkpoint
+    size_t               bytes = 0;
     std::chrono::steady_clock::time_point t_used;  // last save or restore
 };
 
 struct server_prompt_disk {
-    server_prompt_disk(const std::string & root, size_t limit_bytes, int64_t ttl_s, size_t reserve_bytes, bool encrypt);
+    // can_truncate: the model's memory can be rolled back to any position (no recurrent/SWA state), so a stored
+    // prompt is reusable up to the common prefix; otherwise only up to the prompt's end or one of its checkpoints.
+    server_prompt_disk(const std::string & root, size_t limit_bytes, int64_t ttl_s, size_t reserve_bytes, bool encrypt,
+                       bool can_truncate);
     ~server_prompt_disk();
 
     server_prompt_disk(const server_prompt_disk &) = delete;
@@ -36,15 +44,19 @@ struct server_prompt_disk {
 
     bool ok() const { return ready; }
 
-    // Write the state of `seq` (target and draft contexts) and the prompt's checkpoints. Skips a prompt that an entry
-    // already contains and removes entries the new prompt contains. Multimodal prompts are not stored.
+    // Whether the prompt is already on disk in a form that restores it exactly.
+    bool stored(const server_prompt & prompt);
+
+    // Write the state of `seq` (target and draft contexts) and the prompt's checkpoints, unless already stored.
+    // Removes entries the new one supersedes. Prompts containing media are not stored.
     bool save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 
-    // The entry that beats both f_keep_base and f_sim_base for tokens_new under the RAM tier's rule, or nullptr.
+    // The entry whose reusable prefix beats both f_keep_base and f_sim_base for tokens_new, or nullptr.
     const server_prompt_disk_entry * find(const server_tokens & tokens_new, float f_keep_base, float f_sim_base,
                                           float & f_keep_out, float & f_sim_out) const;
 
-    // Restore an entry into `seq` and replace `prompt` (tokens and checkpoints). On failure the entry is deleted.
+    // Restore an entry into `seq` and replace `prompt` (tokens and checkpoints). On failure the entry is deleted and
+    // `seq` is cleared; the caller must clear the slot.
     bool load(const server_prompt_disk_entry & entry, server_prompt & prompt,
               llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 
@@ -56,23 +68,31 @@ struct server_prompt_disk {
 
 private:
     std::filesystem::path dir;
-    size_t  limit_bytes;
-    int64_t ttl_s;
-    size_t  reserve_bytes;
-    bool    ready = false;
-    bool    encrypt;
-    uint8_t key[32] = {};
-
-    const uint8_t * key_ptr() const { return encrypt ? key : nullptr; }
+    size_t    limit_bytes;
+    int64_t   ttl_s;
+    size_t    reserve_bytes;
+    bool      encrypt;
+    bool      can_truncate;
+    bool      ready   = false;
+    int       lock_fd = -1;
+    uint8_t * key     = nullptr;  // 32 bytes in a locked, non-dumpable page (encrypt only)
+    size_t    key_page = 0;
 
     std::list<server_prompt_disk_entry> entries;  // least recently used first
 
+    const uint8_t * key_ptr() const { return encrypt ? key : nullptr; }
     std::filesystem::path path(const std::string & id, const char * ext) const;
-    void remove_stale_runs(const std::filesystem::path & root) const;
-    void remove(std::list<server_prompt_disk_entry>::iterator it);
-    void touch(std::list<server_prompt_disk_entry>::iterator it);
-    bool expired(const server_prompt_disk_entry & e) const;
+    bool   covers(const server_prompt_disk_entry & e, const server_tokens & tokens) const;
+    size_t reusable(const server_prompt_disk_entry & e, size_t lcp) const;
+    void   remove_stale_runs(const std::filesystem::path & base) const;
+    size_t remove(std::list<server_prompt_disk_entry>::iterator it);
+    void   touch(std::list<server_prompt_disk_entry>::iterator it);
+    bool   expired(const server_prompt_disk_entry & e) const;
+    uintmax_t available() const;
+    bool   save_impl(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
+    bool   load_impl(std::list<server_prompt_disk_entry>::iterator it, server_prompt & prompt,
+                     llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 };
 
-// Hex FNV-1a of a byte string; used for entry ids.
+// Hex hash of a byte string; used for entry ids.
 std::string server_prompt_disk_hash(const void * data, size_t n);

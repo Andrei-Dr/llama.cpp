@@ -1828,7 +1828,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const auto * e = disk->find(tokens_new, f_keep_best, f_sim_best, f_keep_disk, f_sim_disk);
         if (e != nullptr) {
             SRV_TRC(" - found better prompt on disk with f_keep = %.3f, f_sim = %.3f\n", f_keep_disk, f_sim_disk);
-            return disk->load(*e, prompt, ctx_tgt, ctx_dft, id_slot);
+            if (disk->load(*e, prompt, ctx_tgt, ctx_dft, id_slot)) {
+                return true;
+            }
+            if (it_best == states.end()) {
+                return false;  // the sequence was cleared: the caller clears the slot
+            }
+            // fall back to the best RAM state (it overwrites the cleared sequence)
         }
     }
 

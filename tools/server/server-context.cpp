@@ -266,6 +266,9 @@ struct server_slot {
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
 
+    // t_last_used when the slot's state was last offered to the prompt cache disk tier (idle save)
+    int64_t t_disk_offered = -1;
+
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
     int32_t n_keep  = 0;
@@ -1370,15 +1373,18 @@ private:
             prompt_cache->ram = params_base.cache_ram_mib != 0;
 
             if (!params_base.cache_disk_path.empty()) {
+                // memory that can be rolled back to any position reuses any common prefix of a stored prompt;
+                // recurrent/hybrid/SWA memory only its end or its checkpoints
+                const bool can_truncate = !llama_model_is_recurrent(model_tgt) && !llama_model_is_hybrid(model_tgt)
+                                       && llama_model_n_swa(model_tgt) == 0;
                 prompt_cache->disk = std::make_unique<server_prompt_disk>(
                         params_base.cache_disk_path,
                         (size_t) params_base.cache_disk_mib * 1024 * 1024, params_base.cache_disk_ttl,
-                        (size_t) params_base.cache_disk_reserve_mib * 1024 * 1024, params_base.cache_disk_encrypt);
+                        (size_t) params_base.cache_disk_reserve_mib * 1024 * 1024, params_base.cache_disk_encrypt,
+                        can_truncate);
                 if (!prompt_cache->disk->ok()) {
-                    prompt_cache->disk.reset();
-                    if (!prompt_cache->ram) {
-                        prompt_cache.reset();
-                    }
+                    SRV_ERR("%s", "--cache-disk was given but the disk tier could not start, refusing to run without it\n");
+                    return false;
                 }
             }
         } else {
@@ -1629,6 +1635,13 @@ private:
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
                 if (f_keep < 0.5f) {
                     update_cache = true;
+                } else if (prompt_cache && prompt_cache->disk) {
+                    // the slot shares a prefix with the request, but a stored prompt may share much more
+                    float f_keep_disk = 0.0f;
+                    float f_sim_disk  = 0.0f;
+                    if (prompt_cache->disk->find(task.tokens, f_keep, f_sim_best, f_keep_disk, f_sim_disk)) {
+                        update_cache = true;
+                    }
                 }
             }
         }
@@ -2844,6 +2857,8 @@ private:
 
                 metrics_flush_idle();
 
+                save_idle_slots_to_disk();
+
                 return; // skip further processing
 
             } else {
@@ -4048,6 +4063,25 @@ private:
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // Write idle slots to the prompt cache disk tier while nothing is waiting, so a later request that evicts them
+    // finds them already stored instead of paying for the write. Skipped when a task is queued.
+    void save_idle_slots_to_disk() {
+        if (!prompt_cache || !prompt_cache->disk) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (queue_tasks.has_pending()) {
+                return;
+            }
+            if (slot.is_processing() || slot.prompt.tokens.size() == 0 || slot.t_disk_offered == slot.t_last_used) {
+                continue;
+            }
+            slot.t_disk_offered = slot.t_last_used;
+            prompt_cache->disk->save(slot.prompt, slot.ctx_tgt, slot.ctx_dft, slot.id);
+        }
+        prompt_cache->disk->evict();  // TTL
+    }
+
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 

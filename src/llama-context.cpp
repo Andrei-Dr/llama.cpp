@@ -3375,6 +3375,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 class llama_io_write_cb : public llama_io_write_i {
 public:
     llama_io_write_cb(llama_state_write_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
+    ~llama_io_write_cb() override {
+        std::fill(temp_buffer.begin(), temp_buffer.end(), 0);  // plaintext state
+    }
 
     void write(const void * src, size_t size) override {
         if (size > 0 && !cb(src, size, user_data)) {
@@ -3403,6 +3406,9 @@ private:
 class llama_io_read_cb : public llama_io_read_i {
 public:
     llama_io_read_cb(llama_state_read_cb cb, void * user_data) : cb(cb), user_data(user_data) {}
+    ~llama_io_read_cb() override {
+        std::fill(temp_buffer.begin(), temp_buffer.end(), 0);  // plaintext state
+    }
 
     void read(void * dst, size_t size) override {
         if (size > 0 && !cb(dst, size, user_data)) {
@@ -3428,15 +3434,17 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
-size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, llama_state_write_cb write_cb, void * user_data) {
+size_t llama_context::state_seq_save_stream(llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_write_cb write_cb, void * user_data) {
+    GGML_ASSERT(!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && "a streamed state lives on the host");
     llama_io_write_cb io(write_cb, user_data);
     io.write(&io_magic, sizeof(io_magic));
     io.write(&seq_id, sizeof(seq_id));
-    state_seq_write_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+    state_seq_write_data(io, seq_id, flags);
     return io.n_bytes();
 }
 
-size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_state_read_cb read_cb, void * user_data) {
+size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_read_cb read_cb, void * user_data) {
+    GGML_ASSERT(!(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) && "a streamed state lives on the host");
     llama_io_read_cb io(read_cb, user_data);
     uint32_t magic_read = 0;
     io.read(&magic_read, sizeof(magic_read));
@@ -3445,7 +3453,7 @@ size_t llama_context::state_seq_load_stream(llama_seq_id seq_id, llama_state_rea
     }
     llama_seq_id seq_id_read;
     io.read(&seq_id_read, sizeof(seq_id_read));
-    if (state_seq_read_data(io, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == 0) {
+    if (state_seq_read_data(io, seq_id, flags) == 0) {
         throw std::runtime_error("failed to restore sequence state");
     }
     return io.n_bytes();
@@ -4411,26 +4419,31 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
-size_t llama_state_seq_save_stream(llama_context * ctx, llama_seq_id seq_id, llama_state_write_cb write_cb, void * user_data) {
+size_t llama_state_seq_save_stream(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, llama_state_write_cb write_cb, void * user_data) {
     ctx->synchronize();
 
     try {
-        return ctx->state_seq_save_stream(seq_id, write_cb, user_data);
+        return ctx->state_seq_save_stream(seq_id, flags, write_cb, user_data);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error streaming sequence state: %s\n", __func__, err.what());
         return 0;
     }
 }
 
-size_t llama_state_seq_load_stream(llama_context * ctx, llama_seq_id dest_seq_id, llama_state_read_cb read_cb, void * user_data) {
+size_t llama_state_seq_load_stream(llama_context * ctx, llama_seq_id dest_seq_id, llama_state_seq_flags flags, llama_state_read_cb read_cb, void * user_data) {
     ctx->synchronize();
 
+    size_t res = 0;
     try {
-        return ctx->state_seq_load_stream(dest_seq_id, read_cb, user_data);
+        res = ctx->state_seq_load_stream(dest_seq_id, flags, read_cb, user_data);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error restoring streamed sequence state: %s\n", __func__, err.what());
-        return 0;
     }
+    if (res == 0) {
+        // never leave a half-restored sequence behind (e.g. attention restored, recurrent part failed)
+        llama_memory_seq_rm(llama_get_memory(ctx), dest_seq_id, -1, -1);
+    }
+    return res;
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {

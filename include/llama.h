@@ -922,23 +922,14 @@ extern "C" {
                           size_t * n_token_count_out);
 
     // Stream a sequence's state through callbacks instead of one host buffer or a plain file, so the caller can
-    // encrypt, compress or store it elsewhere with bounded memory (one tensor chunk at a time). A callback returns
-    // false to abort. Returns the number of bytes streamed, 0 on failure. The stream is only valid for a context with
-    // the same model and memory layout.
+    // encrypt, compress or store it elsewhere without holding the whole state (peak: one tensor's cell range, e.g.
+    // ~38 MB for one layer's K at 131k tokens in q4_0). A callback returns false to abort. Returns the number of bytes
+    // streamed, 0 on failure. A failed load clears dest_seq_id. The load does not check for trailing input: a caller
+    // that frames the stream must verify it was fully consumed. The stream is only valid for a context with the same
+    // model and memory layout.
     typedef bool (*llama_state_write_cb)(const void * data, size_t size, void * user_data);
     typedef bool (*llama_state_read_cb)(void * data, size_t size, void * user_data);
 
-    LLAMA_API size_t llama_state_seq_save_stream(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-            llama_state_write_cb   write_cb,
-                            void * user_data);
-
-    LLAMA_API size_t llama_state_seq_load_stream(
-            struct llama_context * ctx,
-                    llama_seq_id   dest_seq_id,
-             llama_state_read_cb   read_cb,
-                            void * user_data);
 
 #define LLAMA_STATE_SEQ_FLAGS_NONE 0
 
@@ -953,6 +944,20 @@ extern "C" {
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
     typedef uint32_t llama_state_seq_flags;
+
+    LLAMA_API size_t llama_state_seq_save_stream(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+            llama_state_write_cb   write_cb,
+                            void * user_data);
+
+    LLAMA_API size_t llama_state_seq_load_stream(
+            struct llama_context * ctx,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags,
+             llama_state_read_cb   read_cb,
+                            void * user_data);
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,

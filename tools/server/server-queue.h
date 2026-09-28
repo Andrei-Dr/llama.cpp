@@ -122,6 +122,12 @@ public:
         callback_new_task = std::move(callback);
     }
 
+    // true when tasks are waiting to be processed (thread-safe)
+    bool has_pending() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty();
+    }
+
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
