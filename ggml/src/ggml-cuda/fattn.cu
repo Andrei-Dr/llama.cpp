@@ -742,14 +742,16 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
         case BEST_FATTN_KERNEL_TILE:
             if (ggml_cuda_fattn_tile_kv_q4_native(dst)) {
                 // q4_0-native tile: no f16 copy of its own. A 2-31 token batch (MTP verify) is never a reserved graph but can
-                // still pick the MMA kernel, which needs the whole-KV f16 copy: keep it where MMA is reachable on this device,
-                // sized for the KV length below which MMA may run (Turing / Volta: GGML_CUDA_FA_MMA_MAX_KV; AMD MFMA: no cap)
-                const int  cc  = ggml_cuda_info().devices[device].cc;
-                const bool hs  = Q->ne[0] != 40 && Q->ne[0] != 72;
-                const bool nv  = !ggml_cuda_fattn_mma_disabled() && (turing_mma_available(cc) || volta_mma_available(cc));
-                const bool amd = amd_mfma_available(cc) && Q->ne[0] <= 256;
-                need_f16_K = need_f16_V = hs && (nv || amd);
-                if (nv && !amd && ggml_cuda_fattn_mma_max_kv() != INT64_MAX) {
+                // still pick the MMA kernel, which needs the whole-KV f16 copy. That only happens when an env gate made the
+                // reserve pick this kernel: on Turing the reserve can only reach TILE through GGML_CUDA_FA_TILE_MIN_BATCH /
+                // GGML_CUDA_FA_MMA_MAX_KV; on Volta without them (and on AMD MFMA) the choice rises with the batch, so a
+                // smaller batch never picks MMA. Sized for the KV length below which MMA may run.
+                const int  cc    = ggml_cuda_info().devices[device].cc;
+                const bool gated = ggml_cuda_fattn_tile_min_batch() != INT64_MAX || ggml_cuda_fattn_mma_max_kv() != INT64_MAX;
+                const bool mma   = !ggml_cuda_fattn_mma_disabled() && Q->ne[0] != 40 && Q->ne[0] != 72 &&
+                    (turing_mma_available(cc) || (volta_mma_available(cc) && gated));
+                need_f16_K = need_f16_V = mma;
+                if (mma && ggml_cuda_fattn_mma_max_kv() != INT64_MAX) {
                     max_rows = ggml_cuda_fattn_mma_max_kv() - 1;
                 }
             } else {
