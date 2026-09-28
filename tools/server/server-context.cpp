@@ -301,6 +301,14 @@ struct server_slot {
             return false;
         }
 
+        bool saved = false;
+        if (prompt_cache.disk) {
+            saved = prompt_cache.disk->save(prompt, ctx_tgt, ctx_dft, id);
+        }
+        if (!prompt_cache.ram) {
+            return saved;
+        }
+
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
@@ -1348,8 +1356,10 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+        if (params_base.cache_ram_mib != 0 || !params_base.cache_disk_path.empty()) {
+            if (params_base.cache_ram_mib == 0) {
+                SRV_TRC("%s", "prompt cache RAM tier is off, disk tier only\n");
+            } else if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
@@ -1357,6 +1367,20 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache->ram = params_base.cache_ram_mib != 0;
+
+            if (!params_base.cache_disk_path.empty()) {
+                prompt_cache->disk = std::make_unique<server_prompt_disk>(
+                        params_base.cache_disk_path, prompt_disk_fingerprint(),
+                        (size_t) params_base.cache_disk_mib * 1024 * 1024, params_base.cache_disk_ttl,
+                        (size_t) params_base.cache_disk_reserve_mib * 1024 * 1024);
+                if (!prompt_cache->disk->ok()) {
+                    prompt_cache->disk.reset();
+                    if (!prompt_cache->ram) {
+                        prompt_cache.reset();
+                    }
+                }
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -4024,6 +4048,34 @@ private:
     }
 
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
+    // Directory name for the prompt cache disk tier: states are only valid for the same model files, context layout
+    // and KV cache types, so each combination gets its own subdirectory.
+    std::string prompt_disk_fingerprint() const {
+        auto file_id = [](const std::string & path) {
+            std::error_code ec;
+            const auto size = path.empty() ? 0 : std::filesystem::file_size(path, ec);
+            return std::filesystem::path(path).filename().string() + ":" + std::to_string(ec ? 0 : size);
+        };
+        char desc[256] = {};
+        llama_model_desc(model_tgt, desc, sizeof(desc));
+        std::string fp = string_format("pdc1|seq%d|%s|%s|%" PRIu64 "|ctx%d/%d|par%d|uni%d|k%d|v%d|swafull%d",
+                LLAMA_STATE_SEQ_VERSION, file_id(params_base.model.path).c_str(), desc,
+                llama_model_n_params(model_tgt), n_ctx, n_ctx_slot(), params_base.n_parallel,
+                (int) params_base.kv_unified, (int) params_base.cache_type_k, (int) params_base.cache_type_v,
+                (int) params_base.swa_full);
+        if (model_dft != nullptr) {
+            char desc_dft[256] = {};
+            llama_model_desc(model_dft, desc_dft, sizeof(desc_dft));
+            fp += string_format("|dft:%s|%s|k%d|v%d", file_id(params_base.speculative.draft.mparams.path).c_str(),
+                    desc_dft, (int) params_base.speculative.draft.cache_type_k,
+                    (int) params_base.speculative.draft.cache_type_v);
+        } else if (ctx_dft != nullptr) {
+            fp += "|dft:in-model";
+        }
+        SRV_INF("prompt disk cache fingerprint: %s\n", fp.c_str());
+        return server_prompt_disk_hash(fp.data(), fp.size());
+    }
+
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
 

@@ -1822,6 +1822,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (disk) {
+        float f_keep_disk = 0.0f;
+        float f_sim_disk  = 0.0f;
+        const auto * e = disk->find(tokens_new, f_keep_best, f_sim_best, f_keep_disk, f_sim_disk);
+        if (e != nullptr) {
+            SRV_TRC(" - found better prompt on disk with f_keep = %.3f, f_sim = %.3f\n", f_keep_disk, f_sim_disk);
+            return disk->load(*e, prompt, ctx_tgt, ctx_dft, id_slot);
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1868,6 +1878,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    if (disk) {
+        disk->evict();
+    }
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));

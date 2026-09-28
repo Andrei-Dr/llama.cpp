@@ -657,6 +657,10 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk_path;                // prompt cache disk tier root; empty = no disk tier
+    int32_t cache_disk_mib         = 32768;     // disk tier size cap in MiB (0 = no cap)
+    int32_t cache_disk_ttl         = 3600;      // seconds an unused entry is kept (0 = no expiry)
+    int32_t cache_disk_reserve_mib = 8192;      // free space the disk tier always leaves on its filesystem
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

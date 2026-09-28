@@ -1718,6 +1718,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-disk"}, "PATH",
+        "directory for the prompt cache disk tier: slot states that leave the slot are stored here and restored on a "
+        "later request sharing their prefix; works with --cache-ram 0 (default: disabled)",
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-size"}, "N",
+        string_format("prompt cache disk tier size cap in MiB, oldest entries evicted first (default: %d, 0 = no cap)",
+            params.cache_disk_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-size must be non-negative");
+            }
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-ttl"}, "SECONDS",
+        string_format("drop prompt cache disk entries unused for this long (default: %d, 0 = never)", params.cache_disk_ttl),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-ttl must be non-negative");
+            }
+            params.cache_disk_ttl = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_TTL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk-reserve"}, "N",
+        string_format("free space in MiB the prompt cache disk tier always leaves on its filesystem (default: %d)",
+            params.cache_disk_reserve_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-disk-reserve must be non-negative");
+            }
+            params.cache_disk_reserve_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -10,6 +10,9 @@
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
+#include "server-prompt-disk.h"
+
+#include <memory>
 
 
 enum server_task_type {
@@ -622,6 +625,12 @@ struct server_prompt_cache {
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
+
+    // false when only the disk tier is on (--cache-ram 0 --cache-disk PATH): states go straight to disk
+    bool ram = true;
+
+    // optional disk tier, consulted after the RAM states
+    std::unique_ptr<server_prompt_disk> disk;
 
     size_t size() const;
 
