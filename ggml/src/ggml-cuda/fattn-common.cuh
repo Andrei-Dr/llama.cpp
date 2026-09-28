@@ -85,8 +85,9 @@ static inline bool ggml_cuda_fattn_tile_kq_dp4a() {
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING;
 }
 
+// max_rows caps the KV rows the f16 copy is sized for (the worst-case reserve of a kernel that only runs below a KV length)
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const int64_t max_rows = INT64_MAX) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -103,7 +104,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += ggml_nelements(K)/K->ne[1]*std::min<int64_t>(K->ne[1], max_rows)*ggml_type_size(GGML_TYPE_F16);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -112,7 +113,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += ggml_nelements(V)/V->ne[1]*std::min<int64_t>(V->ne[1], max_rows)*ggml_type_size(GGML_TYPE_F16);
         }
     }
 

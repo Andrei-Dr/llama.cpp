@@ -734,16 +734,28 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
 
-    bool need_f16_K = false;
-    bool need_f16_V = false;
+    bool    need_f16_K = false;
+    bool    need_f16_V = false;
+    int64_t max_rows   = INT64_MAX;
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-            // q4_0-native tile: no f16 copy - unless a 2-31 token batch (MTP verify) can still pick the MMA kernel at this KV
-            // length, which needs the whole-KV f16 copy and is never a reserved graph: keep the scratch in the worst case then
-            need_f16_K = !ggml_cuda_fattn_tile_kv_q4_native(dst) ||
-                (!ggml_cuda_fattn_mma_disabled() && K->ne[1] < ggml_cuda_fattn_mma_max_kv());
-            need_f16_V = need_f16_K;
+            if (ggml_cuda_fattn_tile_kv_q4_native(dst)) {
+                // q4_0-native tile: no f16 copy of its own. A 2-31 token batch (MTP verify) is never a reserved graph but can
+                // still pick the MMA kernel, which needs the whole-KV f16 copy: keep it where MMA is reachable on this device,
+                // sized for the KV length below which MMA may run (Turing / Volta: GGML_CUDA_FA_MMA_MAX_KV; AMD MFMA: no cap)
+                const int  cc  = ggml_cuda_info().devices[device].cc;
+                const bool hs  = Q->ne[0] != 40 && Q->ne[0] != 72;
+                const bool nv  = !ggml_cuda_fattn_mma_disabled() && (turing_mma_available(cc) || volta_mma_available(cc));
+                const bool amd = amd_mfma_available(cc) && Q->ne[0] <= 256;
+                need_f16_K = need_f16_V = hs && (nv || amd);
+                if (nv && !amd && ggml_cuda_fattn_mma_max_kv() != INT64_MAX) {
+                    max_rows = ggml_cuda_fattn_mma_max_kv() - 1;
+                }
+            } else {
+                need_f16_K = true;
+                need_f16_V = true;
+            }
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
@@ -759,7 +771,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     }
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, max_rows);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }
