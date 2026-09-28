@@ -82,6 +82,11 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// a compute buffer (sched_reserve) could not be allocated: the one failure the MoE prefill mode recovers from
+struct llama_compute_alloc_error : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -675,7 +680,7 @@ void llama_context::sched_reserve() {
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
+                throw llama_compute_alloc_error("failed to allocate compute pp buffers");
             }
         }
 
@@ -687,7 +692,7 @@ void llama_context::sched_reserve() {
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute tg buffers");
+            throw llama_compute_alloc_error("failed to allocate compute tg buffers");
         }
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
@@ -712,7 +717,7 @@ void llama_context::sched_reserve() {
         };
 
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
+            throw llama_compute_alloc_error("failed to allocate compute pp buffers");
         }
     }
 
@@ -1833,14 +1838,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (moe_prefill_mode && sched_need_reserve) {
         // the prefill buffer is sized by the VRAM left after the context: when it does not fit, prompts run at n_ubatch for the
         // rest of this context's life (latched: retrying every chunk would re-reserve twice and wipe the cache slots each time)
-        try {
-            sched_reserve();
-        } catch (const std::runtime_error & e) {
-            if (std::string(e.what()).find("failed to allocate") == std::string::npos) {
-                throw; // not an allocation failure
+        // a first failure may be pool growth left by the previous decode (pools are only trimmed when prefill mode ends):
+        // trim and retry once before giving up
+        bool fit = false;
+        for (int attempt = 0; attempt < 2 && !fit; ++attempt) {
+            try {
+                sched_reserve();
+                fit = true;
+            } catch (const llama_compute_alloc_error & e) {
+                if (attempt == 0) {
+                    sched_need_reserve = true;
+                    trim_device_pools();
+                    continue;
+                }
+                LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): prompts run at ubatch %u from now on\n",
+                        __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
             }
-            LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): prompts run at ubatch %u from now on\n",
-                    __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
+        }
+        if (!fit) {
             prefill_unfit      = true;
             moe_prefill_mode   = false;
             sched_need_reserve = true;
