@@ -70,6 +70,16 @@ static inline bool ggml_cuda_fattn_tile_kv_q4_native(const ggml_tensor * dst) {
         K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0 && K->nb[1] < INT32_MAX && V->nb[1] < INT32_MAX;
 }
 
+// GGML_CUDA_FA_TILE_DP4A=1 (with the q4_0-native tile path): K.Q in int8 - Q quantized to q8_1 per 32 values, 8 dp4a per q4_0
+// block, the decode vec kernel's arithmetic. Changes prefill numerics (KLD-gated); off by default.
+static inline bool ggml_cuda_fattn_tile_kq_dp4a() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_FA_TILE_DP4A");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
         const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
