@@ -9996,6 +9996,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
 
+    // Qwen3.6-35B-A3B experts (256 experts, top-8): gate / up Q2_K 2048 -> 512 with the broadcast (per-token) input, down Q3_K
+    // 512 -> 2048, at prompt-batch token counts between the served decode (<= 128) and full prefill batches. Regression cases
+    // for an MMQ illegal memory access at 113 / 245 tokens (tile sized against the token count while each expert sees few)
+    for (int n : {64, 113, 128, 160, 200, 245, 256, 300}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_K, GGML_TYPE_F32, 256, 8, true,  512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 256, 8, false, 2048, n, 512));
+    }
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
