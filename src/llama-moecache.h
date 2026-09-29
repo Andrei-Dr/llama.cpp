@@ -87,9 +87,9 @@ bool llama_moe_cache_owned_by(const llama_model & model);
 // prefill mode: the cache chain only serves 1-4 token batches, so during a large batch the device slots are dead weight.
 // suspend() drops queued uploads, waits for one in progress, frees the device slot buffers (the host tables stay) and makes
 // lookups return nullptr, so graphs are built without the cache chain; returns the bytes freed. resume() re-allocates the
-// slots empty (all-or-nothing; false = could not, the cache stays off and outputs are unchanged) and keeps the routing counts
-// the prefill collected, so the next step() re-ranks the slots by the prompt. Call both between graph executions only,
-// with the backends synchronized.
+// slots empty: all of them when they fit, else as many per layer as fit with a margin left for the pools and CUDA graphs
+// (false = not even one, the cache stays off and outputs are unchanged), and keeps the routing counts the prefill collected,
+// so the next step() re-ranks the slots by the prompt. Call both between graph executions only, with the backends synchronized.
 size_t llama_moe_cache_suspend(bool pressure = false);
 bool   llama_moe_cache_resume();
 

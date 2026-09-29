@@ -82,6 +82,9 @@ struct moe_cache {
     int                     n_busy = 0;     // jobs popped by the worker and not yet in `done` (under wmtx)
     bool                    sync_publish = false; // LLAMA_MOE_CACHE_SYNC=1: step() waits for every scheduled upload
     std::vector<ggml_backend_buffer_type_t> ctx_bufts; // buffer type of each context in `ctxs` (host tables: CPU)
+    std::vector<std::vector<size_t>>        ctx_layers; // the layers whose tensors each context in `ctxs` holds
+    std::vector<int32_t>                    ctx_slots;  // the slot count each device context's tensors are shaped for
+    int32_t                 n_live    = 0;        // slots per layer now: params.n_slots, fewer after a resume that did not fit
     bool                    suspended = false;    // device slots released (prefill mode, memory pressure); lookups return nullptr
     bool                    pressure  = false;    // ... by suspend(pressure = true): a compute buffer needed the room
     const llama_model *     owner     = nullptr;  // the model whose host-resident experts this cache mirrors
@@ -206,7 +209,7 @@ bool on_host(const ggml_tensor * t) {
 // the next step() re-ranks the new slots by the prompt that was just processed.
 static void reset_slots(moe_cache * mc, bool keep_warm) {
     std::lock_guard<std::mutex> lock(mc->mtx);
-    const int32_t n_slots = mc->params.n_slots;
+    const int32_t n_slots = mc->n_live;
     for (size_t idx = 0; idx < mc->layers.size(); ++idx) {
         layer_state & ls = mc->layers[idx];
         const int64_t n_expert = ls.pub.down_src->ne[2];
@@ -241,6 +244,78 @@ static void reset_slots(moe_cache * mc, bool keep_warm) {
         ggml_backend_tensor_set(ls.pub.dev_table,  dummy.data(), 0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
     }
+}
+
+// (re)create the unallocated tensors of cache context ci for n_slots slots per layer. The host context (CPU buffer type) holds
+// the host tables only; a device context holds its layers' slot tensors (ne[2] = n_slots + 1), per-expert scale copies,
+// routing scales and device table. The previous tensors of the context must no longer be in use (no buffer, no graph).
+static bool build_ctx(moe_cache * mc, size_t ci, int32_t n_slots) {
+    const std::vector<size_t> & idxs = mc->ctx_layers[ci];
+    const bool tables_only = mc->ctx_bufts[ci] == ggml_backend_cpu_buffer_type();
+    ggml_init_params ip = {
+        /*.mem_size  =*/ ggml_tensor_overhead()*(idxs.size()*10 + 8),
+        /*.mem_buffer=*/ nullptr,
+        /*.no_alloc  =*/ true,
+    };
+    ggml_context * ctx = ggml_init(ip);
+    if (!ctx) {
+        return false;
+    }
+    if (mc->ctxs[ci]) {
+        ggml_free(mc->ctxs[ci]);
+    }
+    mc->ctxs[ci]      = ctx;
+    mc->ctx_slots[ci] = n_slots;
+
+    auto new_cache_tensor = [&](const ggml_tensor * src, const char * name, int il) {
+        ggml_tensor * t = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], n_slots + 1);
+        ggml_format_name(t, "moe_cache_%s.%d", name, il);
+        return t;
+    };
+
+    for (size_t idx : idxs) {
+        llama_moe_cache_layer & pub = mc->layers[idx].pub;
+        const int64_t n_expert = pub.down_src->ne[2];
+        if (tables_only) {
+            pub.host_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+            ggml_format_name(pub.host_table, "moe_cache_htbl.%d", pub.il);
+            continue;
+        }
+        pub.n_slots = n_slots;
+        if (pub.gate_up_src) {
+            pub.gate_up_c = new_cache_tensor(pub.gate_up_src, "gate_up", pub.il);
+        } else {
+            pub.up_c   = new_cache_tensor(pub.up_src,   "up",   pub.il);
+            pub.gate_c = new_cache_tensor(pub.gate_src, "gate", pub.il);
+        }
+        pub.down_c = new_cache_tensor(pub.down_src, "down", pub.il);
+        {
+            ggml_tensor ** const dst[3] = { &pub.up_s_c, &pub.gate_s_c, &pub.down_s_c };
+            for (int i = 0; i < 3; ++i) {
+                if (const ggml_tensor * s = mc->layers[idx].scale_src[i]) {
+                    *dst[i] = ggml_dup_tensor(ctx, s);
+                    ggml_format_name(*dst[i], "moe_cache_scale%d.%d", i, pub.il);
+                }
+            }
+        }
+        if (mc->params.bias > 0.0f) {
+            pub.sel_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+            ggml_format_name(pub.sel_scale, "moe_cache_sel.%d", pub.il);
+        }
+        pub.dev_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", pub.il);
+    }
+    return true;
+}
+
+static bool alloc_ctx(moe_cache * mc, size_t ci) {
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(mc->ctxs[ci], mc->ctx_bufts[ci]);
+    if (!buf) {
+        return false;
+    }
+    ggml_backend_buffer_clear(buf, 0);
+    mc->bufs[ci] = buf;
+    return true;
 }
 
 void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_params & params) {
@@ -321,82 +396,33 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
         return; // not final: a later model (e.g. after a dry-run estimate) may qualify
     }
 
-    auto new_cache_tensor = [&](ggml_context * ctx, const ggml_tensor * src, const char * name, int il) {
-        ggml_tensor * t = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], n_slots + 1);
-        ggml_format_name(t, "moe_cache_%s.%d", name, il);
-        return t;
-    };
-
-    auto alloc_group = [&](ggml_backend_buffer_type_t buft, const std::vector<size_t> & idxs, bool tables_only) -> bool {
-        ggml_init_params ip = {
-            /*.mem_size  =*/ ggml_tensor_overhead()*(idxs.size()*10 + 8),
-            /*.mem_buffer=*/ nullptr,
-            /*.no_alloc  =*/ true,
-        };
-        ggml_context * ctx = ggml_init(ip);
-        if (!ctx) {
-            return false;
-        }
-        mc->ctxs.push_back(ctx);
-        mc->ctx_bufts.push_back(buft);
-
-        for (size_t idx : idxs) {
-            llama_moe_cache_layer & pub = mc->layers[idx].pub;
-            const int64_t n_expert = pub.down_src->ne[2];
-            if (tables_only) {
-                pub.host_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-                ggml_format_name(pub.host_table, "moe_cache_htbl.%d", pub.il);
-                continue;
-            }
-            if (pub.gate_up_src) {
-                pub.gate_up_c = new_cache_tensor(ctx, pub.gate_up_src, "gate_up", pub.il);
-            } else {
-                pub.up_c   = new_cache_tensor(ctx, pub.up_src,   "up",   pub.il);
-                pub.gate_c = new_cache_tensor(ctx, pub.gate_src, "gate", pub.il);
-            }
-            pub.down_c    = new_cache_tensor(ctx, pub.down_src, "down", pub.il);
-            {
-                ggml_tensor ** const dst[3] = { &pub.up_s_c, &pub.gate_s_c, &pub.down_s_c };
-                for (int i = 0; i < 3; ++i) {
-                    if (const ggml_tensor * s = mc->layers[idx].scale_src[i]) {
-                        *dst[i] = ggml_dup_tensor(ctx, s);
-                        ggml_format_name(*dst[i], "moe_cache_scale%d.%d", i, pub.il);
-                    }
-                }
-            }
-            if (mc->params.bias > 0.0f) {
-                pub.sel_scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
-                ggml_format_name(pub.sel_scale, "moe_cache_sel.%d", pub.il);
-            }
-            pub.dev_table = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-            ggml_format_name(pub.dev_table, "moe_cache_tbl.%d", pub.il);
-        }
-
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
-        if (!buf) {
-            LLAMA_LOG_WARN("%s: failed to allocate MoE cache buffer on %s - cache disabled\n", __func__, ggml_backend_buft_name(buft));
-            return false;
-        }
-        ggml_backend_buffer_clear(buf, 0);
-        mc->bufs.push_back(buf);
-        return true;
-    };
-
-    std::vector<size_t> all(mc->layers.size());
-    for (size_t i = 0; i < all.size(); ++i) {
-        all[i] = i;
+    mc->ctx_bufts.push_back(ggml_backend_cpu_buffer_type()); // context 0: the host tables of every layer
+    mc->ctx_layers.emplace_back(mc->layers.size());
+    for (size_t i = 0; i < mc->layers.size(); ++i) {
+        mc->ctx_layers[0][i] = i;
     }
-    bool ok = alloc_group(ggml_backend_cpu_buffer_type(), all, /*tables_only=*/true);
     for (auto & g : groups) {
-        ok = ok && alloc_group(g.first, g.second, /*tables_only=*/false);
+        mc->ctx_bufts.push_back(g.first);
+        mc->ctx_layers.push_back(g.second);
+    }
+    mc->ctxs.assign(mc->ctx_bufts.size(), nullptr);
+    mc->bufs.assign(mc->ctx_bufts.size(), nullptr);
+    mc->ctx_slots.assign(mc->ctx_bufts.size(), 0);
+    bool ok = true;
+    for (size_t ci = 0; ok && ci < mc->ctxs.size(); ++ci) {
+        ok = build_ctx(mc, ci, n_slots) && alloc_ctx(mc, ci);
+        if (!ok) {
+            LLAMA_LOG_WARN("%s: failed to allocate MoE cache buffer on %s - cache disabled\n", __func__, ggml_backend_buft_name(mc->ctx_bufts[ci]));
+        }
     }
     if (!ok) {
-        for (auto * b : mc->bufs) { ggml_backend_buffer_free(b); }
-        for (auto * c : mc->ctxs) { ggml_free(c); }
+        for (auto * b : mc->bufs) { if (b) { ggml_backend_buffer_free(b); } }
+        for (auto * c : mc->ctxs) { if (c) { ggml_free(c); } }
         delete mc;
         g_init_done = true; // a real model was seen and allocation failed: stay disabled
         return;
     }
+    mc->n_live = n_slots;
 
     // init bookkeeping + tables (everything uncached -> dummy slot n_slots)
     reset_slots(mc, /*keep_warm=*/false);
@@ -498,33 +524,79 @@ size_t llama_moe_cache_suspend(bool pressure) {
     return freed;
 }
 
+// allocate every device context for n slots per layer (tensors re-created where the shape differs); all-or-nothing
+static bool alloc_device_slots(moe_cache * mc, int32_t n) {
+    for (size_t ci = 0; ci < mc->ctxs.size(); ++ci) {
+        if (mc->ctx_bufts[ci] == ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        if ((mc->ctx_slots[ci] != n && !build_ctx(mc, ci, n)) || !alloc_ctx(mc, ci)) {
+            free_device_bufs(mc, ci + 1); // ci too: a failed allocation may have placed some of its tensors before it gave up
+            return false;
+        }
+    }
+    return true;
+}
+
+// room left on the device after a resume that did not fit: the temporary pools and CUDA graphs grow back after it (the
+// startup layout leaves them about this much), so a smaller resume must not take the last byte
+static constexpr size_t k_resume_margin = 64u << 20;
+
+// the most slots per layer every device context could hold now, keeping k_resume_margin free
+static int32_t slots_that_fit(moe_cache * mc) {
+    int32_t n_fit = mc->params.n_slots;
+    for (size_t ci = 0; ci < mc->ctxs.size(); ++ci) {
+        if (mc->ctx_bufts[ci] == ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(mc->ctx_bufts[ci]);
+        size_t free = 0, total = 0;
+        if (dev) {
+            ggml_backend_dev_memory(dev, &free, &total);
+        }
+        size_t per_slot = 0; // one slot of every layer in this context (the dummy slot and the small tables count as one more)
+        for (size_t idx : mc->ctx_layers[ci]) {
+            const llama_moe_cache_layer & pub = mc->layers[idx].pub;
+            per_slot += pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
+        }
+        const int64_t n = free > k_resume_margin && per_slot > 0 ? (int64_t) ((free - k_resume_margin)/per_slot) - 2 : 0;
+        n_fit = (int32_t) std::min<int64_t>(n_fit, std::max<int64_t>(n, 0));
+    }
+    return n_fit;
+}
+
 bool llama_moe_cache_resume() {
     moe_cache * mc = g_cache;
     if (!mc || !mc->suspended) {
         return true;
     }
-    size_t got = 0;
-    for (size_t i = 0; i < mc->ctxs.size(); ++i) {
-        if (mc->ctx_bufts[i] == ggml_backend_cpu_buffer_type() || mc->bufs[i]) {
-            continue;
+    // all the configured slots when they fit (the prefill-mode round trip); otherwise as many as fit next to what grew in the
+    // meantime (a compute buffer's recorded floor, a draft context's buffers), so a larger buffer costs slots, not the cache.
+    // A later suspend / resume (the next prefill) tries the full count again.
+    int32_t n = mc->params.n_slots;
+    bool ok = alloc_device_slots(mc, n);
+    if (!ok) {
+        for (n = std::min(n - 1, slots_that_fit(mc)); n >= 1 && !(ok = alloc_device_slots(mc, n)); --n) {
         }
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(mc->ctxs[i], mc->ctx_bufts[i]);
-        if (!buf) {
-            LLAMA_LOG_WARN("moe-cache: could not re-allocate the device slots on %s - cache stays off (outputs unchanged, decode slower)\n",
-                    ggml_backend_buft_name(mc->ctx_bufts[i]));
-            free_device_bufs(mc, i); // all-or-nothing: give back what this pass took
-            mc->pressure = true; // the owning context retries, paced (llama_context::decode)
-            return false;
-        }
-        ggml_backend_buffer_clear(buf, 0);
-        mc->bufs[i] = buf;
-        got += ggml_backend_buffer_get_size(buf);
     }
+    if (!ok) {
+        LLAMA_LOG_WARN("moe-cache: could not re-allocate any device slots - cache stays off (outputs unchanged, decode slower)\n");
+        mc->pressure = true; // the owning context retries, paced (llama_context::decode)
+        return false;
+    }
+    size_t got = 0;
+    for (size_t ci = 0; ci < mc->ctxs.size(); ++ci) {
+        if (mc->ctx_bufts[ci] != ggml_backend_cpu_buffer_type()) {
+            got += ggml_backend_buffer_get_size(mc->bufs[ci]);
+        }
+    }
+    mc->n_live = n;
     reset_slots(mc, /*keep_warm=*/true);
     mc->suspended = false;
     mc->pressure  = false;
     g_generation++;
-    LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots (re-ranked by the prompt at the next step)\n", got/1024.0/1024.0);
+    LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots, %d of %d per layer (re-ranked by the prompt at the next step)\n",
+            got/1024.0/1024.0, n, mc->params.n_slots);
     return true;
 }
 
@@ -609,7 +681,7 @@ void llama_moe_cache_step() {
 
         int32_t  slot = -1;
         uint64_t best = UINT64_MAX;
-        for (int32_t s = 0; s < mc->params.n_slots; ++s) {
+        for (int32_t s = 0; s < mc->n_live; ++s) {
             if (ls.slot_in_flight[s]) {
                 continue;
             }
@@ -629,7 +701,7 @@ void llama_moe_cache_step() {
         } else {
             ls.expert_slot[victim] = -1;
             ls.slot_expert[slot]   = -1;
-            set_table_entry(ls.pub, victim, mc->params.n_slots);
+            set_table_entry(ls.pub, victim, mc->n_live);
             mc->n_evict++;
         }
         ls.slot_in_flight[slot]  = true;
@@ -655,7 +727,7 @@ void llama_moe_cache_step() {
             continue;
         }
         const int32_t n_expert = (int32_t) ls.warm_cnt.size();
-        const int32_t n_want   = std::min(mc->params.n_slots, n_expert);
+        const int32_t n_want   = std::min(mc->n_live, n_expert);
 
         std::vector<int32_t> order(n_expert);
         for (int32_t e = 0; e < n_expert; ++e) {
