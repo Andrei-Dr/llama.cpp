@@ -1475,6 +1475,9 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // held while a graph computes: an out-of-memory reclaim started by another context only touches this one while it is free
+    std::mutex compute_mutex;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
