@@ -251,9 +251,12 @@ public:
     // release the backends' temporary pools (MoE prefill mode, between graphs only)
     void trim_device_pools();
 
+    // release the temporary pools and CUDA graphs of every idle context on this context's devices (between graphs only)
+    void reclaim_device_memory();
+
     // a compute buffer could not grow for this ubatch's graph: free device memory step by step (temporary pools and CUDA graph
-    // executables, then the expert-cache slots of the owning context) and rebuild + allocate the graph again after each step;
-    // nullptr when nothing freed enough
+    // executables of every context on the device, then the expert-cache slots) and rebuild + allocate the graph again after
+    // each step; nullptr when nothing freed enough
     ggml_cgraph * recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams);
 
     // can reuse the llm_graph_result instance of the context (for example to update a memory module)
@@ -364,7 +367,6 @@ private:
     bool moe_prefill_mode   = false; // MoE prefill mode active (see decode)
     bool prefill_unfit      = false; // the prefill ubatch did not fit once: prefill mode stays off for this context
     bool model_host_experts = false; // the model keeps MoE experts in host memory (prefill mode without a cache applies)
-    bool moe_pressure_suspended = false; // cache slots released to let a compute buffer grow (recover_graph_alloc)
     uint64_t n_decode_calls = 0;         // decode() calls so far (paces the slot resume retries)
     uint64_t pressure_resume_at = 0;     // first decode() call that may try to bring the released slots back
 

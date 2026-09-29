@@ -82,7 +82,8 @@ struct moe_cache {
     int                     n_busy = 0;     // jobs popped by the worker and not yet in `done` (under wmtx)
     bool                    sync_publish = false; // LLAMA_MOE_CACHE_SYNC=1: step() waits for every scheduled upload
     std::vector<ggml_backend_buffer_type_t> ctx_bufts; // buffer type of each context in `ctxs` (host tables: CPU)
-    bool                    suspended = false;    // device slots released (prefill mode); lookups return nullptr
+    bool                    suspended = false;    // device slots released (prefill mode, memory pressure); lookups return nullptr
+    bool                    pressure  = false;    // ... by suspend(pressure = true): a compute buffer needed the room
     const llama_model *     owner     = nullptr;  // the model whose host-resident experts this cache mirrors
     std::deque<upload_job>  todo;
     std::vector<upload_job> done;
@@ -477,7 +478,7 @@ static size_t free_device_bufs(moe_cache * mc, size_t n) {
     return freed;
 }
 
-size_t llama_moe_cache_suspend() {
+size_t llama_moe_cache_suspend(bool pressure) {
     moe_cache * mc = g_cache;
     if (!mc || mc->suspended) {
         return 0;
@@ -491,8 +492,9 @@ size_t llama_moe_cache_suspend() {
     }
     const size_t freed = free_device_bufs(mc, mc->ctxs.size());
     mc->suspended = true;
+    mc->pressure  = pressure;
     g_generation++;
-    LLAMA_LOG_INFO("moe-cache: prefill mode: released %.1f MiB of device slots\n", freed/1024.0/1024.0);
+    LLAMA_LOG_INFO("moe-cache: %s: released %.1f MiB of device slots\n", pressure ? "memory pressure" : "prefill mode", freed/1024.0/1024.0);
     return freed;
 }
 
@@ -511,6 +513,7 @@ bool llama_moe_cache_resume() {
             LLAMA_LOG_WARN("moe-cache: could not re-allocate the device slots on %s - cache stays off (outputs unchanged, decode slower)\n",
                     ggml_backend_buft_name(mc->ctx_bufts[i]));
             free_device_bufs(mc, i); // all-or-nothing: give back what this pass took
+            mc->pressure = true; // the owning context retries, paced (llama_context::decode)
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
@@ -519,9 +522,19 @@ bool llama_moe_cache_resume() {
     }
     reset_slots(mc, /*keep_warm=*/true);
     mc->suspended = false;
+    mc->pressure  = false;
     g_generation++;
     LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots (re-ranked by the prompt at the next step)\n", got/1024.0/1024.0);
     return true;
+}
+
+bool llama_moe_cache_uses_buft(ggml_backend_buffer_type_t buft) {
+    return g_cache != nullptr && buft != ggml_backend_cpu_buffer_type() &&
+        std::find(g_cache->ctx_bufts.begin(), g_cache->ctx_bufts.end(), buft) != g_cache->ctx_bufts.end();
+}
+
+bool llama_moe_cache_pressure_suspended() {
+    return g_cache != nullptr && g_cache->suspended && g_cache->pressure;
 }
 
 uint64_t llama_moe_cache_generation() {

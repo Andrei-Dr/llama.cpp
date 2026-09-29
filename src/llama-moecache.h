@@ -31,6 +31,7 @@
 struct llama_model;
 struct ggml_context;
 struct ggml_tensor;
+typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
 
 struct llama_moe_cache_params {
     int32_t n_slots     = 0;  // slots per host-resident expert layer (0 = disabled)
@@ -89,8 +90,15 @@ bool llama_moe_cache_owned_by(const llama_model & model);
 // slots empty (all-or-nothing; false = could not, the cache stays off and outputs are unchanged) and keeps the routing counts
 // the prefill collected, so the next step() re-ranks the slots by the prompt. Call both between graph executions only,
 // with the backends synchronized.
-size_t llama_moe_cache_suspend();
+size_t llama_moe_cache_suspend(bool pressure = false);
 bool   llama_moe_cache_resume();
+
+// true while the slots are released by a suspend(pressure = true): a context's compute buffer had to grow into them
+// (llama_context::recover_graph_alloc, any context). The owning context brings them back (resume() clears it).
+bool llama_moe_cache_pressure_suspended();
+
+// true when the cache's device slots live in this buffer type (releasing them can make room for a buffer of that type)
+bool llama_moe_cache_uses_buft(ggml_backend_buffer_type_t buft);
 
 // changes with every suspend() and resume() that changes the state. A graph built under another generation has the other
 // topology (with or without the cache chain) or points at slot tensors that were freed or re-allocated, so no context may
