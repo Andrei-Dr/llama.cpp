@@ -365,6 +365,13 @@ private:
     bool prefill_unfit      = false; // the prefill ubatch did not fit once: prefill mode stays off for this context
     bool model_host_experts = false; // the model keeps MoE experts in host memory (prefill mode without a cache applies)
     bool moe_pressure_suspended = false; // cache slots released to let a compute buffer grow (recover_graph_alloc)
+    uint64_t n_decode_calls = 0;         // decode() calls so far (paces the slot resume retries)
+    uint64_t pressure_resume_at = 0;     // first decode() call that may try to bring the released slots back
+
+    // per backend (backend_ptrs index): the compute buffer size a runtime graph needed beyond the startup reserve; every later
+    // reserve starts at least this large, so the same shape cannot run out again (recover_graph_alloc records it)
+    std::vector<size_t> compute_buf_floor;
+    void apply_compute_buf_floors();
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

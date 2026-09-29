@@ -642,6 +642,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    apply_compute_buf_floors();
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -677,6 +678,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                apply_compute_buf_floors();
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -821,13 +823,34 @@ uint32_t llama_context::n_ubatch() const {
 //   1. this context's temporary pools and CUDA graph executables (rebuilt on demand)
 //   2. the expert-cache slots, if this context owns the cache (decode runs on the CPU experts until they come back at the
 //      next decode call, re-ranked like after a prefill)
+void llama_context::apply_compute_buf_floors() {
+    for (size_t i = 0; i < compute_buf_floor.size() && i < backend_ptrs.size(); ++i) {
+        if (compute_buf_floor[i] > 0) {
+            ggml_backend_sched_set_buffer_min_size(sched.get(), backend_ptrs[i], compute_buf_floor[i]);
+        }
+    }
+}
+
 ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams) {
     auto rebuild = [&]() -> ggml_cgraph * {
         res->reset();
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         ggml_cgraph * gf = model.build_graph(gparams);
-        return gf && ggml_backend_sched_alloc_graph(sched.get(), gf) ? gf : nullptr;
+        if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            return nullptr;
+        }
+        // the sizes this shape needed become the floor of every later reserve (the recovery must not repeat for it)
+        compute_buf_floor.resize(backend_ptrs.size(), 0);
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            const size_t sz = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+            if (sz > compute_buf_floor[i]) {
+                LLAMA_LOG_INFO("%s: %s compute buffer floor %.2f MiB from now on\n", __func__,
+                        ggml_backend_name(backend_ptrs[i]), sz/1024.0/1024.0);
+                compute_buf_floor[i] = sz;
+            }
+        }
+        return gf;
     };
 
     LLAMA_LOG_WARN("%s: a compute buffer could not grow for this batch: releasing the temporary pools and CUDA graphs\n", __func__);
@@ -852,7 +875,7 @@ ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const l
             }
             gf_res_prev_active = nullptr;
             if (ggml_cgraph * gf = rebuild()) {
-                LLAMA_LOG_WARN("%s: recovered after releasing %.1f MiB of expert-cache slots (back at the next decode call)\n",
+                LLAMA_LOG_WARN("%s: recovered after releasing %.1f MiB of expert-cache slots (back once they fit again)\n",
                         __func__, freed/1024.0/1024.0);
                 return gf;
             }
@@ -1887,16 +1910,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // cache slots released by recover_graph_alloc: a prefill takes them over (its end restores them), otherwise they come back
-    // now, at a batch boundary, after the compute buffers are reserved at their normal size again
+    // at a batch boundary once the compute buffers are reserved again (with the recorded floors, so the shape that needed the
+    // room keeps it); when the slots no longer fit next to the larger buffers, the next try waits 64 decode calls
+    n_decode_calls++;
     if (moe_pressure_suspended) {
-        moe_pressure_suspended = false;
-        if (!moe_prefill_mode) {
+        if (moe_prefill_mode) {
+            moe_pressure_suspended = false;
+        } else if (n_decode_calls >= pressure_resume_at) {
             synchronize();
             sched_need_reserve = true;
             sched_reserve();
             trim_device_pools();
             if (llama_moe_cache_resume()) {
+                moe_pressure_suspended = false;
                 LLAMA_LOG_INFO("%s: expert-cache slots restored after a compute buffer had to grow\n", __func__);
+            } else {
+                pressure_resume_at = n_decode_calls + 64;
             }
         }
     }

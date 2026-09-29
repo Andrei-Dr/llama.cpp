@@ -493,6 +493,8 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    size_t * min_sizes; // [n_buffers] lower bound of each buffer's size (ggml_gallocr_set_min_size), 0 = none
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -507,6 +509,9 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
     galloc->buf_tallocs = calloc(n_bufs, sizeof(struct ggml_dyn_tallocr *));
     GGML_ASSERT(galloc->buf_tallocs != NULL);
+
+    galloc->min_sizes = calloc(n_bufs, sizeof(size_t));
+    GGML_ASSERT(galloc->min_sizes != NULL);
 
     for (int i = 0; i < n_bufs; i++) {
         galloc->bufts[i] = bufts[i];
@@ -539,6 +544,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
     }
+    free(galloc->min_sizes);
 
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers != NULL) {
@@ -901,6 +907,14 @@ static bool ggml_gallocr_reserve_n_impl(
         }
     }
 
+    // a buffer never plans below its floor: a size some other graph shape was measured to need at runtime
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[i];
+        if (galloc->min_sizes[i] > 0 && alloc->n_chunks > 0 && alloc->chunks[0]->max_size < galloc->min_sizes[i]) {
+            alloc->chunks[0]->max_size = MIN(galloc->min_sizes[i], alloc->max_chunk_size);
+        }
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -1004,6 +1018,11 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
         node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[talloc->buffer_id], node);
     }
     return talloc->size_max >= node_size;
+}
+
+void ggml_gallocr_set_min_size(ggml_gallocr_t galloc, int buffer_id, size_t size) {
+    GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
+    galloc->min_sizes[buffer_id] = size;
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
