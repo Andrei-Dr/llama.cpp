@@ -1204,8 +1204,12 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+struct ggml_backend_cuda_context;
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
+
+    ggml_backend_cuda_context * owner = nullptr; // the context whose CUDA graph executables an out-of-memory growth may release
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
@@ -1268,11 +1272,17 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+#ifdef USE_CUDA_GRAPH
+// an executable was destroyed: the CUDA graph memory budget measures free memory again before it admits a new one (ggml-cuda.cu)
+void ggml_cuda_graph_budget_release();
+#endif
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(instance));
+            ggml_cuda_graph_budget_release();
         }
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
@@ -1283,6 +1293,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool disable_due_to_oom = false; // instantiation ran out of device memory: this split runs without a graph from now on
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
@@ -1296,7 +1307,7 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_due_to_oom || disable_cuda_graphs_due_to_env);
     }
 #endif
 };
@@ -1563,6 +1574,7 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool(int device) {
         if (pools[device][curr_stream_no] == nullptr) {
             pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
+            pools[device][curr_stream_no]->owner = this;
         }
         return *pools[device][curr_stream_no];
     }

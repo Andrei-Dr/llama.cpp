@@ -74,6 +74,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <thread>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -532,6 +534,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
+#ifdef USE_CUDA_GRAPH
+static size_t ggml_cuda_graph_release_executables(ggml_backend_cuda_context * cuda_ctx, const void * keep_key, bool all);
+#endif // USE_CUDA_GRAPH
+
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     static const size_t CUDA_POOL_VMM_MAX_SIZE = 1ull << 35; // 32 GB
 
@@ -585,7 +591,33 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            auto cr = cuMemCreate(&handle, reserve_size, &prop, 0);
+#if defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            if (cr == CUDA_ERROR_OUT_OF_MEMORY && owner != nullptr) {
+                // the owning context's CUDA graph executables are the one device allocation that can give memory back here:
+                // release them (they are captured again on later use) and retry. An executable still in flight frees its
+                // memory when it completes: outside a stream capture wait for that; inside one (no sync allowed) poll, bounded
+                // (the launches finish whatever the capture does; cuMemCreate is legal during a relaxed capture).
+                cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+                CUDA_CHECK(cudaStreamIsCapturing(owner->stream(device, owner->curr_stream_no), &cs));
+                const size_t n = ggml_cuda_graph_release_executables(owner, nullptr, true);
+                GGML_LOG_WARN("%s: device %d out of memory growing the pool by %.1f MiB: released %zu CUDA graph executables, retrying\n",
+                        __func__, device, reserve_size/1048576.0, n);
+                if (cs == cudaStreamCaptureStatusNone) {
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    cr = cuMemCreate(&handle, reserve_size, &prop, 0);
+                } else {
+                    for (int i = 0; i < 100; ++i) {
+                        cr = cuMemCreate(&handle, reserve_size, &prop, 0);
+                        if (cr != CUDA_ERROR_OUT_OF_MEMORY) {
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                }
+            }
+#endif // defined(USE_CUDA_GRAPH) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            CU_CHECK(cr);
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -2634,7 +2666,145 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+// Device-memory headroom kept free of CUDA graph executables (GGML_CUDA_GRAPH_HEADROOM_MIB, default 64). A context caches one
+// executable per split and graph shape (hundreds of KiB each; a split-heavy CPU/GPU MoE graph has ~160 splits per shape), and
+// none of it is in the startup VRAM budget: with VRAM spent on purpose (expert-cache slots) the cache grew until the next
+// allocation of anything failed (the temporary pools, or the next instantiation). The budget never queries the driver on the
+// per-split path: free memory is measured right after an instantiation, and once more after executables were destroyed.
+//   OPEN  new executables are admitted
+//   FULL  below the headroom: a split without an executable runs directly, exactly like graphs off
+//   STALE executables were destroyed since FULL: the next split that wants one measures free memory once -> OPEN or FULL
+// Caveat: kernels that pick a variant by whether graphs are enabled (argsort, mean) keep the graphs-on variant for a denied split.
+enum ggml_cuda_graph_budget : int { GGML_CUDA_GRAPH_BUDGET_OPEN = 0, GGML_CUDA_GRAPH_BUDGET_FULL = 1, GGML_CUDA_GRAPH_BUDGET_STALE = 2 };
+static std::atomic<int> ggml_cuda_graph_budget_state[GGML_CUDA_MAX_DEVICES];
+
+static size_t ggml_cuda_graph_headroom() {
+    static const size_t headroom = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_HEADROOM_MIB");
+        return (size_t) (e ? std::max(0, atoi(e)) : 64) << 20;
+    }();
+    return headroom;
+}
+
+static bool ggml_cuda_graph_headroom_ok(int device) {
+    const int st = ggml_cuda_graph_budget_state[device].load(std::memory_order_relaxed);
+    if (st == GGML_CUDA_GRAPH_BUDGET_OPEN) {
+        return true;
+    }
+    if (st == GGML_CUDA_GRAPH_BUDGET_FULL) {
+        return false;
+    }
+    size_t free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    const bool ok = free >= ggml_cuda_graph_headroom();
+    // only this STALE measurement decides: a FULL set meanwhile by a fresh instantiation stays FULL
+    int stale = GGML_CUDA_GRAPH_BUDGET_STALE;
+    if (!ggml_cuda_graph_budget_state[device].compare_exchange_strong(stale,
+            ok ? GGML_CUDA_GRAPH_BUDGET_OPEN : GGML_CUDA_GRAPH_BUDGET_FULL, std::memory_order_relaxed)) {
+        return stale == GGML_CUDA_GRAPH_BUDGET_OPEN;
+    }
+    return ok;
+}
+
+void ggml_cuda_graph_budget_release() {
+    for (auto & st : ggml_cuda_graph_budget_state) {
+        int full = GGML_CUDA_GRAPH_BUDGET_FULL;
+        st.compare_exchange_strong(full, GGML_CUDA_GRAPH_BUDGET_STALE, std::memory_order_relaxed);
+    }
+}
+
+static void ggml_cuda_graph_budget_update(ggml_backend_cuda_context * cuda_ctx) {
+    const size_t headroom = ggml_cuda_graph_headroom();
+    if (headroom == 0) {
+        return;
+    }
+    size_t free = 0, total = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    if (free < headroom &&
+            ggml_cuda_graph_budget_state[cuda_ctx->device].exchange(GGML_CUDA_GRAPH_BUDGET_FULL, std::memory_order_relaxed) == GGML_CUDA_GRAPH_BUDGET_OPEN) {
+        GGML_LOG_INFO("%s: %.1f MiB free (< %.0f MiB headroom) with %zu cached CUDA graphs in this context: new graphs wait\n",
+                __func__, free/1048576.0, headroom/1048576.0, cuda_ctx->cuda_graphs.size());
+    }
+}
+
+// destroy cached executables of this context (never keep_key's): the least recently used half, or all of them. They are
+// captured again after a warm-up like any new graph; splits disabled by an earlier out-of-memory may try again. Returns the count.
+static size_t ggml_cuda_graph_release_executables(ggml_backend_cuda_context * cuda_ctx, const void * keep_key, bool all) {
+    std::vector<ggml_cuda_graph *> live;
+    const bool budgeted = ggml_cuda_graph_headroom() > 0; // without the budget's damping, re-enabling would retry every OOM split
+    for (auto & it : cuda_ctx->cuda_graphs) {
+        if (budgeted) {
+            it.second->disable_due_to_oom = false;
+        }
+        if (it.first != keep_key && it.second->instance != nullptr) {
+            live.push_back(it.second.get());
+        }
+    }
+    std::sort(live.begin(), live.end(), [](const ggml_cuda_graph * a, const ggml_cuda_graph * b) {
+        return a->last_used_time < b->last_used_time;
+    });
+    const size_t n = all ? live.size() : (live.size() + 1) / 2;
+    for (size_t i = 0; i < n; ++i) {
+        CUDA_CHECK(cudaGraphExecDestroy(live[i]->instance));
+        live[i]->instance = nullptr;
+        live[i]->warmup_complete = false;
+    }
+    if (n > 0) {
+        ggml_cuda_graph_budget_release();
+    }
+    return n;
+}
+
+// instantiate + upload (the upload's device memory is paid here, where the budget measures it, not at the first launch)
+static cudaError_t ggml_cuda_graph_try_instantiate(ggml_backend_cuda_context * cuda_ctx, ggml_cuda_graph * graph) {
+    cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (err == cudaSuccess) {
+        err = cudaGraphUpload(graph->instance, cuda_ctx->stream());
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        }
+    }
+#else
+    GGML_UNUSED(cuda_ctx);
+#endif
+    if (err != cudaSuccess) {
+        graph->instance = nullptr;
+    }
+    return err;
+}
+
+// Instantiate the captured graph of graph_key. Out of memory is not fatal: the least recently used half of this context's other
+// executables is released (after in-flight launches completed, so their memory is really back) and the instantiation retried,
+// then all of them; if it still fails the split is marked to run without a CUDA graph (false returned, instance stays nullptr).
+static bool ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, const void * graph_key, ggml_cuda_graph * graph) {
+    cudaError_t err = ggml_cuda_graph_try_instantiate(cuda_ctx, graph);
+    size_t n_released = 0;
+    for (int attempt = 0; err == cudaErrorMemoryAllocation && attempt < 2; ++attempt) {
+        (void) cudaGetLastError();
+        n_released += ggml_cuda_graph_release_executables(cuda_ctx, graph_key, /*all =*/ attempt == 1);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        err = ggml_cuda_graph_try_instantiate(cuda_ctx, graph);
+    }
+    if (err == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        graph->disable_due_to_oom = true;
+        CUDA_CHECK(cudaGraphDestroy(graph->graph));
+        graph->graph = nullptr;
+        GGML_LOG_WARN("%s: out of device memory for a CUDA graph (released %zu cached executables): this split runs without one\n",
+                __func__, n_released);
+        return false;
+    }
+    CUDA_CHECK(err);
+    if (n_released > 0) {
+        GGML_LOG_INFO("%s: out of device memory for a CUDA graph: released %zu cached executables and retried\n", __func__, n_released);
+    }
+    ggml_cuda_graph_budget_update(cuda_ctx);
+    return true;
+}
+
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -2646,20 +2816,20 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
-    if (stat == cudaErrorGraphExecUpdateFailure) {
+    if (stat == cudaErrorGraphExecUpdateFailure || stat == cudaErrorMemoryAllocation) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
 
-        // The pre-existing graph exec cannot be updated due to violated constraints
+        // The pre-existing graph exec cannot be updated (violated constraints, or no memory for the update)
         // so instead clear error and re-instantiate
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
-    } else {
-        GGML_ASSERT(stat == cudaSuccess);
+        return ggml_cuda_graph_instantiate(cuda_ctx, graph_key, graph);
     }
+    GGML_ASSERT(stat == cudaSuccess);
+    return true;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4385,11 +4555,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool ok = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            ok = ggml_cuda_graph_instantiate(cuda_ctx, graph_key, graph);
+        } else if (cuda_graph_update_required) { // Update graph executable
+            ok = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (!ok) {
+            // no executable: the capture only recorded the kernels, nothing ran yet, so evaluate the nodes directly
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+            return;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
@@ -4432,7 +4607,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    // no executable and the graph memory budget is full: run exactly like graphs off (no node-property tracking either, it
+    // costs as much as the launch savings); the warm-up restarts once the budget admits new graphs
+    const bool budget_denied = graph->instance == nullptr && !ggml_cuda_graph_headroom_ok(cuda_ctx->device);
+    if (budget_denied) {
+        graph->warmup_complete = false;
+    }
+    if (graph->is_enabled() && !budget_denied) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -5689,6 +5870,9 @@ static void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
             ctx->pools[d][s].reset();
         }
     }
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_graph_budget_release(); // the pools gave memory back even if no executable is destroyed below
+#endif // USE_CUDA_GRAPH
 #ifdef USE_CUDA_GRAPH
     // captured graphs hold pool addresses in their kernel arguments (q8_1 activations, FA KV_max / dst_tmp, ...); a replay
     // after the pools are gone would read or write freed memory, so every graph is captured again on its next use
