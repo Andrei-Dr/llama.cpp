@@ -831,7 +831,8 @@ void llama_context::apply_compute_buf_floors() {
     }
 }
 
-ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams) {
+ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams_in) {
+    llm_graph_params gparams = gparams_in; // a suspend below changes the expert-cache generation the rebuilt graph records
     auto rebuild = [&]() -> ggml_cgraph * {
         res->reset();
         ggml_backend_sched_reset(sched.get());
@@ -867,13 +868,8 @@ ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const l
         const size_t freed = llama_moe_cache_suspend();
         if (freed > 0) {
             moe_pressure_suspended = true;
-            // every cached graph result may hold the released slot tensors: none may be reused
-            for (auto & r : gf_res_prev) {
-                if (r) {
-                    r->reset();
-                }
-            }
-            gf_res_prev_active = nullptr;
+            // no graph built before the suspend is reused (its generation differs), in this context or any other
+            gparams.moe_cache_gen = llama_moe_cache_generation();
             if (ggml_cgraph * gf = rebuild()) {
                 LLAMA_LOG_WARN("%s: recovered after releasing %.1f MiB of expert-cache slots (back once they fit again)\n",
                         __func__, freed/1024.0/1024.0);
@@ -2732,6 +2728,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.moe_cache_gen =*/ llama_moe_cache_generation(),
     };
 }
 

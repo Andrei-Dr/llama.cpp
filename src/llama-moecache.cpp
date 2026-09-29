@@ -7,6 +7,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdlib>
@@ -89,6 +90,7 @@ struct moe_cache {
 };
 
 moe_cache * g_cache = nullptr;
+std::atomic<uint64_t> g_generation{0}; // llama_moe_cache_generation(); read by any context
 float       g_cache_bias = 0.0f; // set once in init, before any table entry is written
 std::mutex  g_init_mtx;
 bool        g_init_done = false;
@@ -481,6 +483,7 @@ size_t llama_moe_cache_suspend() {
         }
     }
     mc->suspended = true;
+    g_generation++;
     LLAMA_LOG_INFO("moe-cache: prefill mode: released %.1f MiB of device slots\n", freed/1024.0/1024.0);
     return freed;
 }
@@ -513,8 +516,13 @@ bool llama_moe_cache_resume() {
     }
     reset_slots(mc, /*keep_warm=*/true);
     mc->suspended = false;
+    g_generation++;
     LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots (re-ranked by the prompt at the next step)\n", got/1024.0/1024.0);
     return true;
+}
+
+uint64_t llama_moe_cache_generation() {
+    return g_generation.load(std::memory_order_relaxed);
 }
 
 bool llama_moe_cache_active() {

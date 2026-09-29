@@ -92,6 +92,12 @@ bool llama_moe_cache_owned_by(const llama_model & model);
 size_t llama_moe_cache_suspend();
 bool   llama_moe_cache_resume();
 
+// changes with every suspend() and resume() that changes the state. A graph built under another generation has the other
+// topology (with or without the cache chain) or points at slot tensors that were freed or re-allocated, so no context may
+// reuse it (llm_graph_params::allow_reuse compares it): this covers every context that builds the cache chain, including a
+// draft / in-model MTP context whose graphs the owner's suspend() cannot reach.
+uint64_t llama_moe_cache_generation();
+
 // key = the layer's gate_up_exps tensor when fused, else its up_exps tensor.
 // nullptr when the cache is disabled or this tensor has no cached layer
 const llama_moe_cache_layer * llama_moe_cache_lookup(const ggml_tensor * key);

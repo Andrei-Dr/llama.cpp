@@ -810,6 +810,8 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    uint64_t moe_cache_gen = 0; // llama_moe_cache_generation() when the graph was built
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -868,6 +870,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // the expert cache was suspended or resumed since this graph was built (any context may have done it)
+        if (moe_cache_gen != other.moe_cache_gen) {
             return false;
         }
 
