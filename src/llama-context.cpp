@@ -814,6 +814,54 @@ uint32_t llama_context::n_ubatch() const {
     return cparams.n_ubatch;
 }
 
+// The startup reserve sizes each compute buffer for one worst-case graph, but ggml-alloc packs every graph shape on its own: a
+// smaller ubatch at a deep context can lay the offloaded expert-weight copies out higher and need more (measured: 36 tokens at
+// n_kv 102.7k wanted 230 MiB against a 160 MiB reserve). With VRAM spent on purpose (expert-cache slots) the buffer cannot grow,
+// and a failed ubatch makes the server drop the whole slot (a 100k prompt). So free memory in the order of what it costs:
+//   1. this context's temporary pools and CUDA graph executables (rebuilt on demand)
+//   2. the expert-cache slots, if this context owns the cache (decode runs on the CPU experts until they come back at the
+//      next decode call, re-ranked like after a prefill)
+ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams) {
+    auto rebuild = [&]() -> ggml_cgraph * {
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_cgraph * gf = model.build_graph(gparams);
+        return gf && ggml_backend_sched_alloc_graph(sched.get(), gf) ? gf : nullptr;
+    };
+
+    LLAMA_LOG_WARN("%s: a compute buffer could not grow for this batch: releasing the temporary pools and CUDA graphs\n", __func__);
+    synchronize();
+    trim_device_pools();
+    if (ggml_cgraph * gf = rebuild()) {
+        LLAMA_LOG_WARN("%s: recovered after releasing the temporary pools and CUDA graphs\n", __func__);
+        return gf;
+    }
+
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && llama_moe_cache_owned_by(model) && !moe_prefill_mode &&
+            !moe_pressure_suspended) {
+        synchronize();
+        const size_t freed = llama_moe_cache_suspend();
+        if (freed > 0) {
+            moe_pressure_suspended = true;
+            // every cached graph result may hold the released slot tensors: none may be reused
+            for (auto & r : gf_res_prev) {
+                if (r) {
+                    r->reset();
+                }
+            }
+            gf_res_prev_active = nullptr;
+            if (ggml_cgraph * gf = rebuild()) {
+                LLAMA_LOG_WARN("%s: recovered after releasing %.1f MiB of expert-cache slots (back at the next decode call)\n",
+                        __func__, freed/1024.0/1024.0);
+                return gf;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 void llama_context::trim_device_pools() {
     using trim_fn_t = void (*)(ggml_backend_t);
     for (auto & be : backends) {
@@ -1444,9 +1492,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            gf = recover_graph_alloc(res, gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
         }
 
         gf_res_prev_active = res;
@@ -1831,6 +1882,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 sched_reserve();           // decode-sized buffers first: the slots need the VRAM back
                 trim_device_pools();       // and the prefill's temporaries (backend pools never shrink by themselves)
                 llama_moe_cache_resume();
+            }
+        }
+    }
+
+    // cache slots released by recover_graph_alloc: a prefill takes them over (its end restores them), otherwise they come back
+    // now, at a batch boundary, after the compute buffers are reserved at their normal size again
+    if (moe_pressure_suspended) {
+        moe_pressure_suspended = false;
+        if (!moe_prefill_mode) {
+            synchronize();
+            sched_need_reserve = true;
+            sched_reserve();
+            trim_device_pools();
+            if (llama_moe_cache_resume()) {
+                LLAMA_LOG_INFO("%s: expert-cache slots restored after a compute buffer had to grow\n", __func__);
             }
         }
     }
