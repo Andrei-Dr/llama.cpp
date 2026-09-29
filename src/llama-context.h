@@ -251,8 +251,12 @@ public:
     // release the backends' temporary pools (MoE prefill mode, between graphs only)
     void trim_device_pools();
 
-    // release the temporary pools and CUDA graphs of every idle context on this context's devices (between graphs only)
-    void reclaim_device_memory();
+    // release the temporary pools and CUDA graphs of every idle context on this context's devices (between graphs only);
+    // returns the bytes the pools held (they grow back to about as much for the same graphs)
+    size_t reclaim_device_memory();
+
+    // the least free memory over this context's GPU devices
+    size_t device_free_min() const;
 
     // a compute buffer could not grow for this ubatch's graph: free device memory step by step (temporary pools and CUDA graph
     // executables of every context on the device, then the expert-cache slots) and rebuild + allocate the graph again after

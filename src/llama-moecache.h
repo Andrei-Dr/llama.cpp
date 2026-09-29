@@ -100,6 +100,11 @@ bool llama_moe_cache_pressure_suspended();
 // true when the cache's device slots live in this buffer type (releasing them can make room for a buffer of that type)
 bool llama_moe_cache_uses_buft(ggml_backend_buffer_type_t buft);
 
+// device memory a resume that does not fit must leave free beside the slots (default 64 MiB). A recovery calls this with the
+// temporary pools it released (they grow back to about their size; the larger value stays), and from then on every resume,
+// the full count included, leaves the margin free (llama_context::recover_graph_alloc)
+void llama_moe_cache_set_resume_margin(size_t bytes);
+
 // changes with every suspend() and resume() that changes the state. A graph built under another generation has the other
 // topology (with or without the cache chain) or points at slot tensors that were freed or re-allocated, so no context may
 // reuse it (llm_graph_params::allow_reuse compares it): this covers every context that builds the cache chain, including a

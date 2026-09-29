@@ -538,11 +538,19 @@ static bool alloc_device_slots(moe_cache * mc, int32_t n) {
     return true;
 }
 
-// room left on the device after a resume that did not fit: the temporary pools and CUDA graphs grow back after it (the
-// startup layout leaves them about this much), so a smaller resume must not take the last byte
-static constexpr size_t k_resume_margin = 64u << 20;
+// room left on the device after a resume that did not fit: the temporary pools and CUDA graphs grow back after it, so a smaller
+// resume must not take the last byte. At least 64 MiB (the startup layout leaves them about this much); a recovery raises it
+// to the pool size it had to release (llama_moe_cache_set_resume_margin)
+static constexpr size_t k_resume_margin_min = 64u << 20;
+static size_t           g_resume_margin     = k_resume_margin_min;
+static bool             g_after_recovery    = false; // a recovery ran: every resume leaves the margin, even the full count
 
-// the most slots per layer every device context could hold now, keeping k_resume_margin free
+void llama_moe_cache_set_resume_margin(size_t bytes) {
+    g_resume_margin  = std::max(g_resume_margin, bytes);
+    g_after_recovery = true;
+}
+
+// the most slots per layer every device context could hold now, keeping the resume margin free
 static int32_t slots_that_fit(moe_cache * mc) {
     int32_t n_fit = mc->params.n_slots;
     for (size_t ci = 0; ci < mc->ctxs.size(); ++ci) {
@@ -559,7 +567,7 @@ static int32_t slots_that_fit(moe_cache * mc) {
             const llama_moe_cache_layer & pub = mc->layers[idx].pub;
             per_slot += pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
         }
-        const int64_t n = free > k_resume_margin && per_slot > 0 ? (int64_t) ((free - k_resume_margin)/per_slot) - 2 : 0;
+        const int64_t n = free > g_resume_margin && per_slot > 0 ? (int64_t) ((free - g_resume_margin)/per_slot) - 2 : 0;
         n_fit = (int32_t) std::min<int64_t>(n_fit, std::max<int64_t>(n, 0));
     }
     return n_fit;
@@ -572,9 +580,16 @@ bool llama_moe_cache_resume() {
     }
     // all the configured slots when they fit (the prefill-mode round trip); otherwise as many as fit next to what grew in the
     // meantime (a compute buffer's recorded floor, a draft context's buffers), so a larger buffer costs slots, not the cache.
-    // A later suspend / resume (the next prefill) tries the full count again.
+    // A later suspend / resume (the next prefill) tries the full count again. Once a recovery ran, every resume leaves the
+    // margin free (at least 64 MiB, or the pools that recovery released), like the compute-buffer floors it goes with (both
+    // stay for the process).
     int32_t n = mc->params.n_slots;
-    bool ok = alloc_device_slots(mc, n);
+    if (g_after_recovery) {
+        // the full count fitting is not enough once memory ran out: taken to the last MiB, the pools of the contexts would trade
+        // places at every graph until one growth failed mid-graph (seen: 8 of 8 back with ~9 MiB free, 44 reclaims, an abort)
+        n = std::min(n, slots_that_fit(mc));
+    }
+    bool ok = n >= 1 && alloc_device_slots(mc, n);
     if (!ok) {
         for (n = std::min(n - 1, slots_that_fit(mc)); n >= 1 && !(ok = alloc_device_slots(mc, n)); --n) {
         }

@@ -862,10 +862,20 @@ ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const l
     LLAMA_LOG_WARN("%s: a compute buffer of the %s context could not grow for this batch: releasing the temporary pools and CUDA graphs\n",
             __func__, who);
     synchronize();
-    reclaim_device_memory();
-    if (ggml_cgraph * gf = rebuild()) {
-        LLAMA_LOG_WARN("%s: %s context recovered after releasing the temporary pools and CUDA graphs\n", __func__, who);
-        return gf;
+    // the released pools grow back when the graphs run (the flash-attention K/V conversion scratch alone is ~100 MiB at 100k
+    // tokens): a rebuilt graph whose compute buffer only fits in their place would fail its first pool growth mid-graph, where
+    // nothing is left to release (seen at 100k tokens with 9 slots: an abort). So step 1 only counts when they still fit.
+    const size_t regrow = reclaim_device_memory();
+    llama_moe_cache_set_resume_margin(regrow);
+    ggml_cgraph * gf1 = rebuild();
+    if (gf1) {
+        const size_t free = device_free_min();
+        if (free >= regrow) {
+            LLAMA_LOG_WARN("%s: %s context recovered after releasing the temporary pools and CUDA graphs\n", __func__, who);
+            return gf1;
+        }
+        LLAMA_LOG_WARN("%s: the compute buffer fits, but the %.1f MiB of pools released for it would not grow back (%.1f MiB free)\n",
+                __func__, regrow/1024.0/1024.0, free/1024.0/1024.0);
     }
 
     // the slots only help a buffer on their device. Which buffer failed is not reported, so: a context with a compute buffer
@@ -885,15 +895,34 @@ ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const l
                         __func__, who, freed/1024.0/1024.0);
                 return gf;
             }
+            return nullptr; // the rebuild above replaced gf1
         }
     }
 
-    return nullptr;
+    if (gf1) {
+        LLAMA_LOG_WARN("%s: %s context continues with the step-1 graph (no expert-cache slots left to release)\n", __func__, who);
+    }
+    return gf1;
 }
 
-void llama_context::reclaim_device_memory() {
-    using reclaim_fn_t = int (*)(ggml_backend_t);
+size_t llama_context::device_free_min() const {
+    size_t res = SIZE_MAX;
+    for (const auto & be : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        res = std::min(res, free);
+    }
+    return res;
+}
+
+size_t llama_context::reclaim_device_memory() {
+    using reclaim_fn_t = size_t (*)(ggml_backend_t);
     bool any_without = false;
+    size_t pool_bytes = 0;
     for (auto & be : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
         if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -902,11 +931,12 @@ void llama_context::reclaim_device_memory() {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto fn = reg ? (reclaim_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reclaim_device") : nullptr;
         if (fn) {
-            const int n = fn(be.get());
+            const size_t n = fn(be.get());
+            pool_bytes += n;
             size_t free = 0, total = 0;
             ggml_backend_dev_memory(dev, &free, &total);
-            LLAMA_LOG_INFO("%s: %s free %.1f of %.1f MiB after the pools of %d contexts were released\n",
-                    __func__, ggml_backend_dev_name(dev), free/1024.0/1024.0, total/1024.0/1024.0, n);
+            LLAMA_LOG_INFO("%s: %s free %.1f of %.1f MiB after %.1f MiB of pools were released\n",
+                    __func__, ggml_backend_dev_name(dev), free/1024.0/1024.0, total/1024.0/1024.0, n/1024.0/1024.0);
         } else {
             any_without = true;
         }
@@ -914,6 +944,7 @@ void llama_context::reclaim_device_memory() {
     if (any_without) {
         trim_device_pools(); // a backend without the device-wide release still trims its own pools
     }
+    return pool_bytes;
 }
 
 void llama_context::trim_device_pools() {

@@ -434,6 +434,7 @@ static size_t ggml_cuda_graph_release_executables(ggml_backend_cuda_context * cu
 struct ggml_cuda_reclaimed {
     size_t   n_exec    = 0; // CUDA graph executables destroyed
     int      n_trimmed = 0; // contexts whose temporary pools on the device were released
+    size_t   pool_bytes = 0; // device memory those pools held (they grow back to about this for the same graphs)
     uint64_t n_call    = 0; // reclaims so far in this process (a count that climbs per token = two contexts trading pools)
 };
 
@@ -477,6 +478,7 @@ static ggml_cuda_reclaimed ggml_cuda_reclaim_device(int device, ggml_backend_cud
         bool trimmed = false;
         for (int s = 0; trim_pools && s < GGML_CUDA_MAX_STREAMS; ++s) {
             if (c->pools[device][s]) {
+                r.pool_bytes += c->pools[device][s]->reserved_size();
                 c->pools[device][s].reset();
                 trimmed = true;
             }
@@ -532,6 +534,10 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 b.size = 0;
             }
         }
+    }
+
+    size_t reserved_size() const override {
+        return pool_size;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -669,6 +675,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
+    }
+
+    size_t reserved_size() const override {
+        return pool_size;
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
@@ -6014,17 +6024,17 @@ static void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
 
 // a graph allocation of this backend's context failed between graphs: after a device synchronization, every context on its
 // device that is not computing (this one included; a draft context's are on the same device) releases its temporary pools
-// there with all its CUDA graphs, or only its executables when it has no pool there. Returns the number of contexts whose
-// pools were released.
-static int ggml_backend_cuda_reclaim_device(ggml_backend_t backend) {
+// there with all its CUDA graphs, or only its executables when it has no pool there. Returns the bytes those pools held: they
+// grow back to about as much when the same graphs run again, so the caller must leave that much free.
+static size_t ggml_backend_cuda_reclaim_device(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) {
         return 0;
     }
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
     const ggml_cuda_reclaimed r = ggml_cuda_reclaim_device(ctx->device, nullptr, /*trim_pools =*/ true);
-    GGML_LOG_INFO("%s: device %d: released the pools of %d contexts and %zu CUDA graph executables (reclaim %llu)\n",
-            __func__, ctx->device, r.n_trimmed, r.n_exec, (unsigned long long) r.n_call);
-    return r.n_trimmed;
+    GGML_LOG_INFO("%s: device %d: released %.1f MiB of pools of %d contexts and %zu CUDA graph executables (reclaim %llu)\n",
+            __func__, ctx->device, r.pool_bytes/1048576.0, r.n_trimmed, r.n_exec, (unsigned long long) r.n_call);
+    return r.pool_bytes;
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
