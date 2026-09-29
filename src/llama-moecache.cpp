@@ -455,6 +455,28 @@ bool llama_moe_cache_owned_by(const llama_model & model) {
     return g_cache != nullptr && g_cache->owner == &model;
 }
 
+// free the device slot buffers of the first n cache contexts (the host tables stay); returns the bytes freed
+static size_t free_device_bufs(moe_cache * mc, size_t n) {
+    size_t freed = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (mc->ctx_bufts[i] == ggml_backend_cpu_buffer_type()) {
+            continue;
+        }
+        if (mc->bufs[i]) {
+            freed += ggml_backend_buffer_get_size(mc->bufs[i]);
+            ggml_backend_buffer_free(mc->bufs[i]);
+            mc->bufs[i] = nullptr;
+        }
+        // detach the tensors from the freed buffer: ggml_backend_alloc_ctx_tensors_from_buft only allocates tensors whose data
+        // is NULL, so a stale pointer would make resume() "allocate" nothing and fail
+        for (ggml_tensor * t = ggml_get_first_tensor(mc->ctxs[i]); t; t = ggml_get_next_tensor(mc->ctxs[i], t)) {
+            t->data   = nullptr;
+            t->buffer = nullptr;
+        }
+    }
+    return freed;
+}
+
 size_t llama_moe_cache_suspend() {
     moe_cache * mc = g_cache;
     if (!mc || mc->suspended) {
@@ -467,21 +489,7 @@ size_t llama_moe_cache_suspend() {
         mc->dcv.wait(wlk, [mc]() { return mc->n_busy == 0; });
         mc->done.clear();
     }
-    size_t freed = 0;
-    for (size_t i = 0; i < mc->ctxs.size(); ++i) {
-        if (mc->ctx_bufts[i] == ggml_backend_cpu_buffer_type() || !mc->bufs[i]) {
-            continue; // the host tables stay
-        }
-        freed += ggml_backend_buffer_get_size(mc->bufs[i]);
-        ggml_backend_buffer_free(mc->bufs[i]);
-        mc->bufs[i] = nullptr;
-        // detach the tensors from the freed buffer: ggml_backend_alloc_ctx_tensors_from_buft only allocates tensors whose data
-        // is NULL, so a stale pointer would make resume() "allocate" nothing and fail
-        for (ggml_tensor * t = ggml_get_first_tensor(mc->ctxs[i]); t; t = ggml_get_next_tensor(mc->ctxs[i], t)) {
-            t->data   = nullptr;
-            t->buffer = nullptr;
-        }
-    }
+    const size_t freed = free_device_bufs(mc, mc->ctxs.size());
     mc->suspended = true;
     g_generation++;
     LLAMA_LOG_INFO("moe-cache: prefill mode: released %.1f MiB of device slots\n", freed/1024.0/1024.0);
@@ -502,12 +510,7 @@ bool llama_moe_cache_resume() {
         if (!buf) {
             LLAMA_LOG_WARN("moe-cache: could not re-allocate the device slots on %s - cache stays off (outputs unchanged, decode slower)\n",
                     ggml_backend_buft_name(mc->ctx_bufts[i]));
-            for (size_t j = 0; j < i; ++j) { // all-or-nothing: give back what this pass took
-                if (mc->ctx_bufts[j] != ggml_backend_cpu_buffer_type() && mc->bufs[j]) {
-                    ggml_backend_buffer_free(mc->bufs[j]);
-                    mc->bufs[j] = nullptr;
-                }
-            }
+            free_device_bufs(mc, i); // all-or-nothing: give back what this pass took
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
