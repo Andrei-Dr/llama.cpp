@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-moecache.h"
+#include "llama-moe-hybrid.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -2178,6 +2179,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // cache of hot experts. Cached ids are skipped by the CPU chain (src[3] table) and served
     // by the cache chain; uncached ids map to the cache's zero slot. The two outputs sum to
     // the full result.
+    // the activation of the extra expert chains (expert cache, hybrid device chain) must be exactly the host path's (the SILU /
+    // GELU cases of the switch on type_op below, which those chains are limited to), or the rows they compute differ
+    auto moe_act_mirror = [&](ggml_tensor * gate, ggml_tensor * up) -> ggml_tensor * {
+        if (type_op == LLM_FFN_GELU) {
+            return ggml_geglu_split(ctx0, gate, up);
+        }
+        const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        constexpr float eps = 1e-6f;
+        if (gate_exps && limit > eps) {
+            if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) ||
+                    arch == LLM_ARCH_HY_V4) {
+                return ggml_swiglu_clamp(ctx0, gate, up, limit);
+            }
+            up = ggml_clamp(ctx0, up, -limit, limit);
+            ggml_tensor * gate_act = ggml_clamp(ctx0, ggml_silu(ctx0, gate), -INFINITY, limit);
+            return ggml_mul(ctx0, gate_act, up);
+        }
+        return ggml_swiglu_split(ctx0, gate, up);
+    };
+
     const llama_moe_cache_layer * mcache = nullptr;
     {
         const bool mc_gated   = gate_up_exps || gate_exps;
@@ -2200,6 +2221,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
     }
+    // mid-batch hybrid (llama-moe-hybrid.h): a prompt ubatch whose experts live in host memory splits them by routed token
+    // count, light ones on the CPU, heavy ones streamed to the GPU, both chains running at once
+    // Eligible only when: every expert tensor sits in plain host memory the GPU cannot use in place (not a CPU repack /
+    // extra buffer: those are not host-readable and their matmul ignores the skip table), backend 0 is a GPU (not e.g. a
+    // BLAS accelerator), the routing ids are distinct per row (not GROVEMOE's divided ids), the weights' expert count is
+    // n_expert and leaves room for distinct stand-ins, and no eval callback observes the graph (imatrix / debugging would
+    // count the device chain's stand-in ids as real activations).
+    ggml_backend_t hyb_backend = nullptr;
+    if (!mcache && llama_moe_hybrid_active(n_tokens) && il >= 0 && (gate_up_exps || gate_exps) && down_exps &&
+            !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b &&
+            (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU) && !weight_before_ffn && loras->empty() &&
+            arch != LLM_ARCH_GROVEMOE && cparams.cb_eval == nullptr && n_expert >= 2*n_expert_used &&
+            down_exps->ne[2] == n_expert && ggml_backend_sched_get_n_backends(sched) > 1) {
+        ggml_backend_t b0 = ggml_backend_sched_get_backend(sched, 0);
+        ggml_backend_dev_t d0 = b0 ? ggml_backend_get_device(b0) : nullptr;
+        const bool gpu = d0 && (ggml_backend_dev_type(d0) == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                ggml_backend_dev_type(d0) == GGML_BACKEND_DEVICE_TYPE_IGPU);
+        bool host_weights = gpu;
+        for (const ggml_tensor * w : { gate_up_exps, gate_exps, up_exps, down_exps }) {
+            if (w == nullptr || !host_weights) {
+                continue;
+            }
+            host_weights = w->buffer != nullptr && ggml_backend_buffer_is_host(w->buffer) && w->ne[2] == n_expert &&
+                !ggml_backend_supports_buft(b0, ggml_backend_buffer_get_type(w->buffer));
+        }
+        if (host_weights) {
+            hyb_backend = b0;
+        }
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
     // device side of the MoE expert cache. It only depends on the router output, so it is built and
@@ -2241,26 +2292,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         // mirrors the type_op switch below for the two enabled ops
-        ggml_tensor * mc_act = nullptr;
-        if (type_op == LLM_FFN_GELU) {
-            mc_act = ggml_geglu_split(ctx0, mc_gate, mc_up);
-        } else {
-            const float limit = hparams.swiglu_clamp_exp[il];
-            constexpr float eps = 1e-6f;
-            if (gate_exps && limit > eps) {
-                mc_up = ggml_clamp(ctx0, mc_up, -limit, limit);
-                if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
-                    mc_gate = ggml_clamp(ctx0, mc_gate, -INFINITY, limit);
-                    mc_act  = ggml_swiglu_split(ctx0, mc_gate, mc_up);
-                } else {
-                    ggml_tensor * ga = ggml_silu(ctx0, mc_gate);
-                    ga     = ggml_clamp(ctx0, ga, -INFINITY, limit);
-                    mc_act = ggml_mul(ctx0, ga, mc_up);
-                }
-            } else {
-                mc_act = ggml_swiglu_split(ctx0, mc_gate, mc_up);
-            }
-        }
+        ggml_tensor * mc_act = moe_act_mirror(mc_gate, mc_up);
         cb(mc_act, "ffn_moe_cache_act", il);
 
         mc_out = mc_mm(mcache->down_c, mc_act, mcache->down_s_c, "ffn_moe_cache_down");
@@ -2273,21 +2305,85 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // hybrid device chain: the same matmuls over the HOST expert weights with the rewritten ids, forced to the GPU (the
+    // scheduler uploads only the experts those ids use), light rows masked to zero. The host chain below computes the light
+    // experts and skips the heavy ones through the policy's table.
+    ggml_tensor * hyb_table = nullptr;
+    if (hyb_backend) {
+        ggml_tensor * ids_c = n_tokens > 1 ? ggml_cont(ctx0, selected_experts) : selected_experts;
+        ids_c = ggml_reshape_2d(ctx0, ids_c, n_expert_used, n_tokens);
+        ggml_tensor * dev_ids = llama_moe_hybrid_dev_ids(ctx0, ids_c, n_expert);
+        cb(dev_ids, "ffn_moe_hyb_ids", il);
+        ggml_tensor * mask = llama_moe_hybrid_mask(ctx0, ids_c, dev_ids);
+        cb(mask, "ffn_moe_hyb_mask", il);
+        hyb_table = llama_moe_hybrid_host_table(ctx0, ids_c, dev_ids, n_expert);
+        cb(hyb_table, "ffn_moe_hyb_table", il);
+        for (ggml_tensor * t : { dev_ids, mask, hyb_table }) {
+            ggml_backend_sched_set_tensor_backend(sched, t, backend_cpu);
+            // all three policy ops go into the graph here, i.e. into one host split BEFORE the device chain. Left to be
+            // pulled in by their consumers, the mask lands after the chain's last matmul as a host split of its own, which
+            // the chain's barrier then takes as its lookahead target instead of the host experts: their input copy waited
+            // for the whole chain (measured: 11.8 ms per layer at 256 tokens on a GTX 1650 SUPER)
+            ggml_build_forward_expand(gf, t);
+        }
+
+        auto hyb_mm = [&](ggml_tensor * w, ggml_tensor * inp, ggml_tensor * scale, const char * name) -> ggml_tensor * {
+            ggml_tensor * g = build_lora_mm_id(w, inp, dev_ids, scale);
+            ggml_tensor * mmid = g->op == GGML_OP_MUL_MAT_ID ? g : g->src[0];
+            ggml_backend_sched_set_tensor_backend(sched, mmid, hyb_backend);
+            // every chain matmul is a barrier: the scheduler copies the host chain's inputs at the FIRST of them in graph
+            // order (the later ones find those inputs already planned), before any chain split is queued, so the CPU computes
+            // the light experts while the GPU streams the heavy ones. Flagging only the first call is not enough: graph order
+            // follows expansion (the gate matmul is expanded before the up one here), and a lookahead from the second chain
+            // split waits for the first one's upload and matmul (measured: 4.8 ms per layer at 256 tokens)
+            mmid->flags |= GGML_TENSOR_FLAG_SCHED_BARRIER;
+            cb(g, name, il);
+            return g;
+        };
+        ggml_tensor * h_up   = nullptr;
+        ggml_tensor * h_gate = nullptr;
+        if (gate_up_exps) {
+            ggml_tensor * gu = hyb_mm(gate_up_exps, cur, up_exps_s, "ffn_moe_hyb_gate_up");
+            const int64_t n_ff_h = gu->ne[0] / 2;
+            h_gate = ggml_view_3d(ctx0, gu, n_ff_h, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+            h_up   = ggml_view_3d(ctx0, gu, n_ff_h, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff_h * gu->nb[0]);
+        } else {
+            h_up   = hyb_mm(up_exps,   cur, up_exps_s,   "ffn_moe_hyb_up");
+            h_gate = hyb_mm(gate_exps, cur, gate_exps_s, "ffn_moe_hyb_gate");
+        }
+        ggml_tensor * h_act = moe_act_mirror(h_gate, h_up);
+        cb(h_act, "ffn_moe_hyb_act", il);
+        mc_out = hyb_mm(down_exps, h_act, down_exps_s, "ffn_moe_hyb_down");
+        mc_out = ggml_mul(ctx0, mc_out, mask);
+        // pinned for the same reason as the merge below: the mask is a host tensor, so the scheduler would otherwise run
+        // this on the CPU, reading the chain's output back (a sync on the whole chain) before the host experts start
+        ggml_backend_sched_set_tensor_backend(sched, mc_out, hyb_backend);
+        cb(mc_out, "ffn_moe_hyb_masked", il);
+        ggml_build_forward_expand(gf, mc_out);
+    }
+
     // host side: hand the expert table to the CPU mul_mat_id so it skips cached ids, and keep the op on the
     // CPU (the device kernels do not read src[3]). build_lora_mm_id wraps the MUL_MAT_ID in a MUL when a
     // per-expert scale is present.
     bool mc_observe = true; // the first expert matmul of the layer reports the routing
     auto mc_host = [&](ggml_tensor * res) {
-        if (!mcache) {
+        if (!mcache && !hyb_table) {
             return;
         }
         ggml_tensor * mmid = res->op == GGML_OP_MUL_MAT_ID ? res : res->src[0];
         GGML_ASSERT(mmid->op == GGML_OP_MUL_MAT_ID);
-        mmid->src[3] = mcache->host_table;
-        mmid->op_params[0] = mcache->n_slots;
-        mmid->op_params[1] = mc_observe ? 1 : 0;
-        mmid->op_params[2] = il;
-        mc_observe = false;
+        if (mcache) {
+            mmid->src[3] = mcache->host_table;
+            mmid->op_params[0] = mcache->n_slots;
+            mmid->op_params[1] = mc_observe ? 1 : 0;
+            mmid->op_params[2] = il;
+            mc_observe = false;
+        } else {
+            mmid->src[3] = hyb_table;
+            mmid->op_params[0] = LLAMA_MOE_HYBRID_DUMMY;
+            mmid->op_params[1] = 0; // no routing observation: that callback belongs to the expert cache
+            mmid->op_params[2] = il;
+        }
         ggml_backend_sched_set_tensor_backend(sched, mmid, backend_cpu);
     };
 
@@ -2445,10 +2541,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
-    if (mcache) {
+    if (mcache || hyb_table) {
         mc_host(experts);
         experts = ggml_add(ctx0, experts, mc_out);
-        cb(experts, "ffn_moe_cache_merged", il);
+        cb(experts, mcache ? "ffn_moe_cache_merged" : "ffn_moe_hyb_merged", il);
+        if (hyb_table) {
+            // the merge belongs to the device: left unpinned, the scheduler puts it next to the host down matmul, the host
+            // split then takes the device chain's output as an input and its copy waits for the whole chain, i.e. the CPU
+            // experts only start once the GPU experts are done (measured: a 15 ms stream sync per layer at 256 tokens)
+            ggml_backend_sched_set_tensor_backend(sched, experts, hyb_backend);
+        }
     }
 
     if (down_exps_s) {
