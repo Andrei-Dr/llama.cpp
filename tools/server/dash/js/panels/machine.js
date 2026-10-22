@@ -1,7 +1,7 @@
 // the machine (GPU busy and idle while decoding, CPU, the server's CPU, power, RAM, the cost of the statistics) and the
 // critical link: CPU-expert phase vs everything else per generation decode, per layer (when the server reports it)
 
-import { $, isNum, txt, num, pct, bytes, figure, width, show } from "../util.js";
+import { $, isNum, txt, num, pct, bytes, figure, width, show, val } from "../util.js";
 import { spark } from "../spark.js";
 import { store, latest, lastNum, windowOf, sum } from "../store.js";
 
@@ -15,15 +15,18 @@ export function renderMachine(st) {
   const idle = dec.length ? 1 - sum(dec, (s) => s.gpu_sm) / dec.length / 100 : null;
   figure("k-idle", isNum(idle) ? (100 * idle).toFixed(0) : "—", "%");
   spark($("sp-gpu"), store.samples, ["gpu_sm", "cpu_pct"], store.now, { fixed: { lo: 0, hi: 100 } });
-  txt("k-cpu", isNum(lastNum("cpu_pct")) ? num(lastNum("cpu_pct"), 0) + "%" : "—");
+  const cpu = lastNum("cpu_pct"), io = lastNum("iowait_pct");
+  val("k-cpu", isNum(cpu) ? num(cpu, 0) + "%" : null);
   const srv = lastNum("server_cpu_pct");
-  txt("k-srv", isNum(srv) ? num(srv, 0) + "% of one core" : "—");
-  txt("k-io", isNum(lastNum("iowait_pct")) ? num(lastNum("iowait_pct"), 1) + "%" : "—");
-  txt("k-pwr", num(lastNum("gpu_power_w"), 0) + " W · " + num(lastNum("gpu_temp_c")) + " °C · " + num(lastNum("gpu_clock_mhz")) + " MHz");
+  val("k-srv", isNum(srv) ? [num(srv / 100, 2), "cores"] : null);
+  val("k-io", isNum(io) ? num(io, 1) + "%" : null);
+  const w = lastNum("gpu_power_w"), tc = lastNum("gpu_temp_c"), clk = lastNum("gpu_clock_mhz");
+  val("k-pwr", isNum(w) ? [num(w, 0), "W"] : null, isNum(tc) ? num(tc) + " °C" : null, isNum(clk) ? num(clk) + " MHz" : null);
   const avail = lastNum("mem_avail"), swap = lastNum("swap_used");
-  txt("k-ram", isNum(avail) ? bytes(avail) + " · " + bytes(swap) : "—");
+  val("k-ram", isNum(avail) ? bytes(avail) : null, isNum(swap) ? "swap " + bytes(swap) : null);
   const mp = st.moe_cache ? st.moe_cache.publish : null, sp = st.machine ? st.machine.sampler : null;
-  txt("k-pub", avgUs(st.publish) + " · " + avgUs(mp) + " · " + avgUs(sp));
+  val("k-pub", st.publish && st.publish.n ? avgUs(st.publish) : null, mp && mp.n ? avgUs(mp) : null, sp && sp.n ? avgUs(sp) : null);
+  show("k-plot-empty", !(isNum(sm) || isNum(cpu)));
   const nvml = st.machine ? st.machine.nvml : null;
   $("k-meta").title = nvml && nvml !== "ok" ? nvml : "";
   txt("k-meta", nvml && nvml !== "ok" ? (nvml === "off" ? "GPU sampling off" : "no GPU data (NVML not loaded)")
@@ -35,7 +38,6 @@ export function renderPhase() {
   const p = store.phase.view();
   const has = !!(p && isNum(p.step_ms));
   show("p-phase", has);
-  $("p-machine").classList.toggle("alone", !has);
   if (!has) return;
   const cpu = p.cpu_ms, other = Math.max(0, p.step_ms - cpu);
   figure("ph-cpu", num(cpu, 2), "ms");
@@ -44,6 +46,7 @@ export function renderPhase() {
   width("ph-b-dev", p.step_ms ? other / p.step_ms : 0);
   txt("ph-meta", "decode " + num(p.step_ms, 2) + " ms · CPU experts " + pct(p.step_ms ? cpu / p.step_ms : null, 0) + " · " + p.steps + " decodes");
   const L = p.layers_ms || [], il = p.il || [];
+  show("ph-layer-box", L.length > 0);
   const bars = $("ph-layers");
   if (bars.children.length !== L.length) bars.replaceChildren(...L.map(() => document.createElement("i")));
   const vmax = Math.max(1e-9, ...L.filter(isNum));

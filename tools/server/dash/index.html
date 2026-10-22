@@ -6,6 +6,7 @@
 <title>llama-server · dashboard</title>
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/layout.css">
 <link rel="stylesheet" href="css/panels.css">
 <link rel="stylesheet" href="css/charts.css">
 <script type="module" src="js/main.js"></script>
@@ -17,6 +18,7 @@
   <h1 id="title">llama-server</h1>
   <span class="chip" id="chip-build">—</span>
   <span class="chip" id="chip-model">—</span>
+  <nav class="vsw" id="vsw" aria-label="layout variant"><a href="?v=a">a</a><a href="?v=b">b</a><a href="?v=c">c</a></nav>
   <span class="ver" id="hdr-right">connecting…</span>
 </header>
 <div class="banner bad" id="banner-down" hidden></div>
@@ -33,148 +35,206 @@
   <div class="card"><div class="v" id="c-acc">—</div><div class="l">mtp acceptance</div><div class="s" id="c-acc-s"></div><svg class="spark" id="sp-acc" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
 </section>
 
-<section class="panel timeline" id="p-timeline">
-  <div class="phead"><span class="cap">Timeline</span>
-    <span class="aside"><span id="tl-meta">—</span>
-      <span class="seg" role="group" aria-label="range"><button type="button" id="tl-15m" class="on">15 min</button><button type="button" id="tl-24h">24 h</button></span>
-    </span>
-  </div>
-  <div class="pbody tlgrid" id="timeline"></div>
-</section>
-
 <div class="grid">
-  <section class="panel w2">
+  <section class="panel timeline" id="p-timeline">
+    <div class="phead"><span class="cap">Timeline</span>
+      <span class="aside"><span id="tl-meta">—</span>
+        <span class="seg" role="group" aria-label="range"><button type="button" id="tl-15m" class="on">15 min</button><button type="button" id="tl-24h">24 h</button></span>
+      </span>
+    </div>
+    <div class="pbody tlgrid" id="timeline"></div>
+  </section>
+
+  <h2 class="band" id="b-serve" data-for="p-requests p-slots p-spec">Serving</h2>
+  <section class="panel" id="p-requests">
     <div class="phead"><span class="cap">Requests</span><span class="aside" id="req-meta">—</span></div>
     <div class="pbody scroll"><table class="req">
+      <colgroup><col class="c-id"><col class="c-state"><col class="c-slot"><col class="c-prompt"><col class="c-out"><col class="c-ctx"><col class="c-kv"><col class="c-draft"><col class="c-queue"><col class="c-ttft"><col class="c-tps"><col class="c-prefix"><col class="c-age"></colgroup>
       <thead><tr>
-        <th>id</th><th>state</th><th>slot</th><th>prompt</th><th>out</th><th>ctx</th><th>kv</th><th>draft</th>
-        <th>queue</th><th>ttft</th><th>tok/s</th><th title="slot chosen by · f_sim/f_keep · disk restore">prefix</th><th title="running for / ended ago">age</th>
+        <th>id</th><th>state</th><th title="slot">slot</th><th title="prompt tokens, and how many of them the slot already held">prompt</th><th title="generated tokens">out</th><th title="tokens in the slot's context">ctx</th><th title="context fill of the slot">kv</th><th title="draft tokens accepted">draft</th>
+        <th title="time waiting for a slot">queue</th><th title="time to first token">ttft</th><th title="decode tokens per second">tok/s</th><th title="slot chosen by · f_sim/f_keep · disk restore">prefix</th><th title="running for / ended ago">age</th>
       </tr></thead>
       <tbody id="req-body"></tbody>
-    </table></div>
+    </table><div class="empty" id="req-empty" hidden>No requests yet. Completed requests appear here.</div></div>
   </section>
 
-  <section class="panel">
-    <div class="phead"><span class="cap">Slots</span><span class="aside" id="slots-meta">—</span></div>
-    <div class="pbody">
-      <div class="slotsq" id="slotsq"></div>
-      <div class="legend"><span class="lg-dec">● decode</span><span class="lg-pf">● prefill</span><span class="lg-wait">● waiting</span><span>● free</span></div>
-      <div class="kvrows">
-        <div><span>Waiting for a slot</span><b id="s-wait">—</b></div>
-        <div><span>Requests (this server)</span><b id="s-req">—</b></div>
-        <div><span>Decode calls</span><b id="s-steps">—</b></div>
-        <div><span>Truncated</span><b id="s-trunc">—</b></div>
-        <div><span>Slot chosen by</span><b id="s-sel">—</b></div>
-        <div><span>Stop reasons</span><b id="s-stop">—</b></div>
+  <div class="stack" id="st-serve">
+    <section class="panel" id="p-slots">
+      <div class="phead"><span class="cap">Slots</span><span class="aside" id="slots-meta">—</span></div>
+      <div class="pbody">
+        <div class="slotsq" id="slotsq"></div>
+        <div class="legend"><span class="lg-dec">decode</span><span class="lg-pf">prefill</span><span class="lg-wait">waiting</span><span class="lg-free">free</span></div>
+        <div class="grp">
+          <div class="kvrows">
+            <div class="kv" title="Requests deferred until a slot frees up"><span>Waiting</span><b id="s-wait">—</b></div>
+            <div class="kv" title="Requests this server has completed"><span>Requests</span><b id="s-req">—</b></div>
+            <div class="kv" title="Decode calls of the target model"><span>Decode calls</span><b id="s-steps">—</b></div>
+            <div class="kv" title="Prompts cut to fit the context"><span>Truncated</span><b id="s-trunc">—</b></div>
+          </div>
+        </div>
+        <div class="grp"><h3>Routing</h3>
+          <div class="kvrows">
+            <div class="kv" title="How a request's slot was chosen: longest common prefix · least recently used · by id"><span>Slot chosen by</span><b id="s-sel">—</b></div>
+            <div class="kv" title="Why requests ended"><span>Stop reasons</span><b id="s-stop">—</b></div>
+          </div>
+        </div>
       </div>
-    </div>
-  </section>
+    </section>
 
-  <section class="panel" id="p-accpos" hidden>
-    <div class="phead"><span class="cap">Draft acceptance by position</span><span class="aside">conditional on reaching j</span></div>
-    <div class="pbody"><div class="bars" id="accpos-bars"></div><div class="barlabels" id="accpos-labels"></div></div>
-  </section>
-
-  <section class="panel" id="p-spec" hidden>
-    <div class="phead"><span class="cap">Speculation</span><span class="aside" id="spec-meta">—</span></div>
-    <div class="pbody">
-      <div class="pair">
-        <div><div class="big" id="spec-tps">—</div><div class="lbl">tokens per step</div></div>
-        <div><div class="big" id="spec-acc">—</div><div class="lbl">accepted</div></div>
+    <section class="panel" id="p-spec" hidden>
+      <div class="phead"><span class="cap">Speculation</span><span class="aside" id="spec-meta">—</span></div>
+      <div class="pbody">
+        <div class="pair">
+          <div class="stat"><div class="big" id="spec-tps">—</div><div class="lbl">tokens per step</div></div>
+          <div class="stat"><div class="big" id="spec-acc">—</div><div class="lbl">accepted</div></div>
+        </div>
+        <div id="p-accpos" hidden>
+          <div class="sublbl">Acceptance by position <i>given the draft reached it</i></div>
+          <div class="bars" id="accpos-bars"></div><div class="barlabels" id="accpos-labels"></div>
+        </div>
+        <div class="grp"><h3>Counts</h3>
+          <div class="kvrows">
+            <div class="kv"><span>Drafted</span><b id="spec-drafted">—</b></div>
+            <div class="kv"><span>Accepted</span><b id="spec-accepted">—</b></div>
+            <div class="kv" title="Steps in which the target model verified a draft"><span>Verifications</span><b id="spec-verif">—</b></div>
+            <div class="kv" title="Target-model decode time per step"><span>Decode per step</span><b id="spec-dec">—</b></div>
+          </div>
+        </div>
       </div>
-      <div class="kvrows">
-        <div><span>Drafted</span><b id="spec-drafted">—</b></div>
-        <div><span>Accepted</span><b id="spec-accepted">—</b></div>
-        <div><span>Verification steps</span><b id="spec-verif">—</b></div>
-        <div><span>Target decode per step</span><b id="spec-dec">—</b></div>
-      </div>
-    </div>
-  </section>
+    </section>
+  </div>
 
-  <section class="panel">
+  <h2 class="band" id="b-mem" data-for="p-memory ssd">Memory</h2>
+  <section class="panel" id="p-memory">
     <div class="phead"><span class="cap">Memory</span><span class="aside" id="mem-meta">—</span></div>
+    <div class="pbody meters">
+      <div class="m"><div class="meter"><span>VRAM</span><b id="m-vram">—</b></div><div class="bar"><i id="m-vram-bar" class="fg"></i></div></div>
+      <div class="m"><div class="meter"><span title="Tokens held in the slots' contexts against their capacity">Context (KV)</span><b id="m-kv">—</b></div><div class="bar"><i id="m-kv-bar" class="fg"></i></div></div>
+      <div class="m"><div class="meter"><span title="Share of all prompt tokens the slots already held">Prompt reuse</span><b id="m-prefix">—</b></div><div class="bar"><i id="m-prefix-bar" class="fg"></i></div></div>
+    </div>
+  </section>
+
+  <section class="panel" id="ssd" hidden>
+    <div class="phead"><span class="cap">SSD tier</span><span class="aside" title="the prompt disk cache">prompt disk cache</span></div>
     <div class="pbody">
-      <div class="meter"><span>VRAM</span><b id="m-vram">—</b></div>
-      <div class="bar"><i id="m-vram-bar" class="fg"></i></div>
-      <div class="meter"><span>Context (KV)</span><b id="m-kv">—</b></div>
-      <div class="bar"><i id="m-kv-bar" class="fg"></i></div>
-      <div class="meter"><span>Prompt tokens reused</span><b id="m-prefix">—</b></div>
-      <div class="bar"><i id="m-prefix-bar" class="fg"></i></div>
-      <div id="ssd" hidden>
-        <div class="meter"><span>SSD tier · prompt disk cache</span><b id="d-bytes">—</b></div>
-        <div class="bar"><i id="d-bar" class="cool"></i></div>
-        <div class="kvrows">
-          <div><span>Entries</span><b id="d-entries">—</b></div>
-          <div><span>Lookups · hits</span><b id="d-find">—</b></div>
-          <div><span>Restores</span><b id="d-restore">—</b></div>
-          <div><span>Saves</span><b id="d-save">—</b></div>
-          <div><span>Not saved (skip · refused · cancel · fail)</span><b id="d-nosave">—</b></div>
-          <div><span>Evicted (ttl · space · superseded)</span><b id="d-evict">—</b></div>
+      <div class="m"><div class="meter"><span>Used</span><b id="d-bytes">—</b></div><div class="bar"><i id="d-bar" class="cool"></i></div></div>
+      <div class="cols">
+        <div class="grp"><h3>Cache</h3>
+          <div class="kvrows">
+            <div class="kv"><span>Entries</span><b id="d-entries">—</b></div>
+            <div class="kv" title="Lookups, hits, and the similarity of the last hit"><span>Hits</span><b id="d-find">—</b></div>
+          </div>
+        </div>
+        <div class="grp"><h3>Traffic</h3>
+          <div class="kvrows">
+            <div class="kv"><span>Restores</span><b id="d-restore">—</b></div>
+            <div class="kv"><span>Saves</span><b id="d-save">—</b></div>
+          </div>
+        </div>
+        <div class="grp"><h3>Dropped</h3>
+          <div class="kvrows">
+            <div class="kv" title="Not saved: skipped · refused · cancelled · failed"><span>Not saved</span><b id="d-nosave">—</b></div>
+            <div class="kv" title="Evicted: ttl · space · superseded"><span>Evicted</span><b id="d-evict">—</b></div>
+          </div>
         </div>
       </div>
     </div>
   </section>
 
-  <section class="panel w2" id="p-experts" hidden>
+  <h2 class="band" id="b-exp" data-for="p-experts p-phase x-counters">Experts</h2>
+  <section class="panel" id="p-experts" hidden>
     <div class="phead"><span class="cap">Expert residency</span><span class="aside" id="x-meta">—</span></div>
     <div class="pbody">
       <div class="bar tall"><i id="x-tier-v" class="fg"></i><i id="x-tier-p" class="mid"></i></div>
       <div class="kvrows tiers">
-        <div><span class="sw fg">vram · cache slots</span><b id="x-vram">—</b></div>
-        <div><span class="sw mid">pinned host · the CPU computes misses</span><b id="x-pinned">—</b></div>
+        <div class="kv" title="Experts resident in the GPU cache slots"><span class="sw fg">VRAM</span><b id="x-vram">—</b></div>
+        <div class="kv" title="Experts in pinned host memory: the CPU computes the misses"><span class="sw mid">Host</span><b id="x-pinned">—</b></div>
       </div>
-      <div class="meter"><span>Routed to a resident expert <i>hit rate</i></span><b id="x-hit">—</b></div>
-      <div class="bar"><i id="x-hit-bar" class="fg"></i></div>
-      <div class="meter"><span>Resident per layer <i>share of the layer's experts in VRAM</i></span><b id="x-res-meta">—</b></div>
-      <div class="layers" id="x-res"></div>
-      <div class="meter"><span>Hit rate per layer <i id="x-layer-win">last 60 s</i></span><b id="x-layer-meta">—</b></div>
-      <div class="layers" id="x-layers"></div>
-      <div class="axis"><span id="x-l0">L0</span><span id="x-ln">—</span></div>
-      <div class="meter"><span>Placement plane <i>layer × expert</i></span><b id="x-plane-meta">—</b></div>
-      <canvas class="plane" id="x-plane"></canvas>
+      <div class="m"><div class="meter"><span title="Share of expert routings that found the expert resident">Hit rate</span><b id="x-hit">—</b></div><div class="bar"><i id="x-hit-bar" class="fg"></i></div></div>
+      <div class="chartrow">
+        <div>
+          <div class="meter"><span title="Share of each layer's experts resident in VRAM">Resident per layer</span><b id="x-res-meta">—</b></div>
+          <div class="layers" id="x-res"></div>
+        </div>
+        <div>
+          <div class="meter"><span title="Hit rate per layer">Hit rate per layer</span><b id="x-layer-meta">—</b></div>
+          <div class="layers" id="x-layers"></div>
+          <div class="axis"><span id="x-l0">L0</span><span id="x-ln">—</span></div>
+        </div>
+      </div>
+      <div class="meter"><span title="Which experts are in VRAM, layer by layer">Placement</span><b id="x-plane-meta">—</b></div>
+      <div class="planebox" id="x-planebox">
+        <canvas class="plane" id="x-plane"></canvas>
+        <div class="legend plane-legend"><span class="lg-res">resident</span><span class="lg-none">not resident</span><span class="lg-axis">rows: layers · columns: experts</span></div>
+      </div>
     </div>
   </section>
 
+  <div class="stack" id="st-exp">
+    <section class="panel" id="p-phase" hidden>
+      <div class="phead"><span class="cap">Critical link</span><span class="aside" id="ph-meta">—</span></div>
+      <div class="pbody">
+        <div class="pair">
+          <div class="stat"><div class="big" id="ph-cpu">—</div><div class="lbl">CPU experts / step</div></div>
+          <div class="stat"><div class="big" id="ph-dev">—</div><div class="lbl">everything else / step</div></div>
+        </div>
+        <div class="bar tall"><i id="ph-b-cpu" class="warn"></i><i id="ph-b-dev" class="fg"></i></div>
+        <div id="ph-layer-box">
+          <div class="meter"><span title="CPU expert time per layer, ms per step over the last 60 s">CPU time per layer</span><b id="ph-layer-meta">—</b></div>
+          <div class="layers" id="ph-layers"></div>
+          <div class="axis"><span id="ph-l0">L0</span><span id="ph-ln">—</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="x-counters" hidden>
+      <div class="phead"><span class="cap">Expert cache</span><span class="aside">counters since start</span></div>
+      <div class="pbody cols">
+        <div class="grp"><h3>Admission</h3>
+          <div class="kvrows">
+            <div class="kv" title="Experts uploaded to VRAM, their bytes, and the prompt warm-up share"><span>Uploads</span><b id="x-up">—</b></div>
+            <div class="kv"><span>Evictions</span><b id="x-ev">—</b></div>
+            <div class="kv" title="Experts admitted again after an eviction"><span>Re-admitted</span><b id="x-readmit">—</b></div>
+          </div>
+        </div>
+        <div class="grp"><h3>Misses</h3>
+          <div class="kvrows">
+            <div class="kv" title="Misses the admission gate refused to upload"><span>Refused</span><b id="x-refused">—</b></div>
+            <div class="kv" title="Misses with no free slot to take the expert"><span>No free slot</span><b id="x-noslot">—</b></div>
+            <div class="kv" title="Misses of an expert whose upload was in flight"><span>While uploading</span><b id="x-inflight">—</b></div>
+          </div>
+        </div>
+        <div class="grp"><h3>Release</h3>
+          <div class="kvrows">
+            <div class="kv" title="Times the cache was released for prefill or memory pressure, and how often it resumed"><span>Released</span><b id="x-susp">—</b></div>
+            <div class="kv" title="VRAM currently lent to the prompt path"><span>Borrowed VRAM</span><b id="x-borrow">—</b></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <h2 class="band" id="b-mach" data-for="p-link p-machine">Link and machine</h2>
   <section class="panel" id="p-link">
     <div class="phead"><span class="cap">Interconnect</span><span class="aside" id="link-meta">—</span></div>
     <div class="pbody">
       <div class="pair">
-        <div><div class="big" id="l-rx">—</div><div class="lbl">host → GPU <i>20 ms sample</i></div></div>
-        <div><div class="big" id="l-moves">—</div><div class="lbl">expert moves</div></div>
+        <div class="stat"><div class="big" id="l-rx">—</div><div class="lbl" title="NVML counts a 20 ms window each second">host → GPU</div></div>
+        <div class="stat"><div class="big" id="l-moves">—</div><div class="lbl">expert moves</div></div>
       </div>
-      <div class="bar tall"><i id="l-b-up" class="ok"></i><i id="l-b-warm" class="warn"></i></div>
-      <div class="kvrows">
-        <div><span class="sw ok">Cache fills (admissions)</span><b id="l-up">—</b></div>
-        <div><span class="sw warn">Prompt warm-up uploads</span><b id="l-warm">—</b></div>
-        <div><span class="sw">PCIe host → GPU <i>NVML, a 20 ms window each second</i></span><b id="l-other">—</b></div>
-        <div><span class="sw">GPU → host</span><b id="l-tx">—</b></div>
+      <div class="bar tall" id="l-bar"><i id="l-b-up" class="ok"></i><i id="l-b-warm" class="warn"></i></div>
+      <div class="grp"><h3>Host → GPU traffic</h3>
+        <div class="kvrows">
+          <div class="kv" title="Expert-cache admissions, 1 s average"><span class="sw ok">Cache fills</span><b id="l-up">—</b></div>
+          <div class="kv" title="Prompt warm-up uploads, 1 s average"><span class="sw warn">Warm-up</span><b id="l-warm">—</b></div>
+          <div class="kv" title="PCIe host to GPU as NVML reports it, a 20 ms window each second"><span class="sw">PCIe in</span><b id="l-other">—</b></div>
+          <div class="kv" title="PCIe GPU to host (NVML)"><span class="sw">PCIe out</span><b id="l-tx">—</b></div>
+        </div>
       </div>
-      <div class="meter"><span>Moves a second <i>60 s · uploads / evictions</i></span><b id="l-mv-meta">—</b></div>
-      <svg class="spark tall" id="sp-moves" viewBox="0 0 200 40" preserveAspectRatio="none"><path/><path class="b"/></svg>
-      <div class="kvrows" id="x-counters" hidden>
-        <div><span>Uploads</span><b id="x-up">—</b></div>
-        <div><span>Evictions</span><b id="x-ev">—</b></div>
-        <div><span>Re-admitted</span><b id="x-readmit">—</b></div>
-        <div><span>Refused by the gate</span><b id="x-refused">—</b></div>
-        <div><span>No free slot</span><b id="x-noslot">—</b></div>
-        <div><span>Missed while uploading</span><b id="x-inflight">—</b></div>
-        <div><span>Released (prefill · pressure)</span><b id="x-susp">—</b></div>
-        <div><span>Borrowed VRAM</span><b id="x-borrow">—</b></div>
+      <div class="grp" id="l-moves-grp"><h3>Expert moves <i>60 s</i></h3>
+        <div class="meter"><span title="Uploads and evictions per second, last 60 s">uploads · evictions</span><b id="l-mv-meta">—</b></div>
+        <div class="plotbox sm"><svg class="spark tall" id="sp-moves" viewBox="0 0 200 40" preserveAspectRatio="none"><path/><path class="b"/></svg></div>
       </div>
-    </div>
-  </section>
-
-  <section class="panel w2" id="p-phase" hidden>
-    <div class="phead"><span class="cap">Critical link · CPU-expert vs device phase</span><span class="aside" id="ph-meta">—</span></div>
-    <div class="pbody">
-      <div class="pair">
-        <div><div class="big" id="ph-cpu">—</div><div class="lbl">CPU expert phase per step</div></div>
-        <div><div class="big" id="ph-dev">—</div><div class="lbl">everything else per step</div></div>
-      </div>
-      <div class="bar tall"><i id="ph-b-cpu" class="warn"></i><i id="ph-b-dev" class="fg"></i></div>
-      <div class="meter"><span>CPU expert time per layer <i>ms per step, last 60 s</i></span><b id="ph-layer-meta">—</b></div>
-      <div class="layers" id="ph-layers"></div>
-      <div class="axis"><span id="ph-l0">L0</span><span id="ph-ln">—</span></div>
     </div>
   </section>
 
@@ -182,34 +242,44 @@
     <div class="phead"><span class="cap">Machine</span><span class="aside" id="k-meta">—</span></div>
     <div class="pbody">
       <div class="pair">
-        <div><div class="big" id="k-gpu">—</div><div class="lbl">GPU busy (SM)</div></div>
-        <div><div class="big" id="k-idle">—</div><div class="lbl">GPU idle while decoding</div></div>
+        <div class="stat"><div class="big" id="k-gpu">—</div><div class="lbl">GPU busy (SM)</div></div>
+        <div class="stat"><div class="big" id="k-idle">—</div><div class="lbl" title="Share of decoding time the GPU sat idle, last 60 s">GPU idle in decode</div></div>
       </div>
-      <svg class="spark tall" id="sp-gpu" viewBox="0 0 200 40" preserveAspectRatio="none"><path/><path class="b"/></svg>
-      <div class="sub">white: GPU busy · amber: CPU busy (all cores) · 5 min</div>
-      <div class="kvrows">
-        <div><span>CPU (all cores)</span><b id="k-cpu">—</b></div>
-        <div><span>llama-server CPU</span><b id="k-srv">—</b></div>
-        <div><span>I/O wait</span><b id="k-io">—</b></div>
-        <div><span>GPU power · temp · clock</span><b id="k-pwr">—</b></div>
-        <div><span>Host RAM available · swap</span><b id="k-ram">—</b></div>
-        <div><span>Stats cost (snapshot · cache · sampler)</span><b id="k-pub">—</b></div>
+      <div class="plotbox" id="k-plot">
+        <div class="yax"><span>100</span><span>50</span><span>0</span></div>
+        <svg class="spark tall" id="sp-gpu" viewBox="0 0 200 40" preserveAspectRatio="none"><path/><path class="b"/></svg>
+        <div class="empty" id="k-plot-empty" hidden>no GPU or CPU samples</div>
+      </div>
+      <div class="legend"><span class="lg-gpu">GPU busy</span><span class="lg-cpu">CPU busy, all cores</span><span>last 5 min, %</span></div>
+      <div class="grp"><h3>CPU</h3>
+        <div class="kvrows">
+          <div class="kv" title="All cores"><span>Busy</span><b id="k-cpu">—</b></div>
+          <div class="kv" title="This process, in cores"><span>llama-server</span><b id="k-srv">—</b></div>
+          <div class="kv"><span>I/O wait</span><b id="k-io">—</b></div>
+        </div>
+      </div>
+      <div class="grp"><h3>GPU and memory</h3>
+        <div class="kvrows">
+          <div class="kv" title="GPU power, temperature and SM clock"><span>Power</span><b id="k-pwr">—</b></div>
+          <div class="kv" title="Host RAM available and swap used"><span>RAM free</span><b id="k-ram">—</b></div>
+          <div class="kv" title="What the statistics cost per call: snapshot, expert-cache publish, sampler"><span>Stats cost</span><b id="k-pub">—</b></div>
+        </div>
       </div>
     </div>
   </section>
 
-  <section class="panel w3">
+  <h2 class="band" id="b-dist" data-for="p-dist p-events">Distributions</h2>
+  <section class="panel" id="p-dist">
     <div class="phead"><span class="cap">Distributions</span><span class="aside">since the server started</span></div>
     <div class="pbody hists">
-      <div><div class="lbl">time to first token</div><div class="hist" id="h-ttft"></div><div class="axis" id="hl-ttft"></div></div>
-      <div><div class="lbl">decode ms per token</div><div class="hist" id="h-mpt"></div><div class="axis" id="hl-mpt"></div></div>
-      <div><div class="lbl">decode step ms</div><div class="hist" id="h-step"></div><div class="axis" id="hl-step"></div></div>
-      <div><div class="lbl">draft acceptance per request</div><div class="hist" id="h-acc"></div><div class="axis" id="hl-acc"></div></div>
+      <div class="h"><div class="lbl">time to first token</div><div class="hs" id="hs-ttft"></div><div class="hist" id="h-ttft"></div><div class="axis" id="hl-ttft"></div></div>
+      <div class="h"><div class="lbl">decode ms per token</div><div class="hs" id="hs-mpt"></div><div class="hist" id="h-mpt"></div><div class="axis" id="hl-mpt"></div></div>
+      <div class="h"><div class="lbl">decode step ms</div><div class="hs" id="hs-step"></div><div class="hist" id="h-step"></div><div class="axis" id="hl-step"></div></div>
+      <div class="h"><div class="lbl">draft acceptance per request</div><div class="hs" id="hs-acc"></div><div class="hist" id="h-acc"></div><div class="axis" id="hl-acc"></div></div>
     </div>
   </section>
 
-
-  <section class="panel w3">
+  <section class="panel" id="p-events">
     <div class="phead"><span class="cap">Events</span><span class="aside" id="ev-meta">—</span></div>
     <div class="pbody ev" id="events"></div>
   </section>

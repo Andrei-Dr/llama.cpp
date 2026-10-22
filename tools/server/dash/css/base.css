@@ -5,7 +5,8 @@
   --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --cool: #60a5fa; --pink: #f472b6; --mid: #6b6b73;
   --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --r: 12px;
+  --r: 12px; --gap: 14px;
+  --plane-none: #17171b; --plane-res: #d8d8de; --plane-up: var(--warn);
 }
 /* the scrollbar is part of the layout: panels appear as the first poll reveals them, and a gutter that comes and goes
    would move every panel sideways */
@@ -27,18 +28,17 @@ h1 { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; mi
 .banner.bad { background: #2a0f11; color: var(--bad); }
 .banner.warn { background: #2a2109; color: var(--warn); }
 
-.panel { background: var(--card); border: 1px solid var(--edge); border-radius: var(--r); min-width: 0; }
+.panel { background: var(--card); border: 1px solid var(--edge); border-radius: var(--r); min-width: 0; container-type: inline-size;
+         display: flex; flex-direction: column; }
 .phead { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 13px 16px 12px;
          border-bottom: 1px solid var(--rule); }
 .cap { font-size: 10.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 .aside { font: 11.5px var(--mono); color: var(--dim); text-align: right; }
-.pbody { padding: 14px 16px 16px; }
+.pbody { padding: 14px 16px 16px; flex: 1 1 auto; min-width: 0; }
 
-.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-flow: row dense; gap: 14px; margin-top: 14px; }
-.panel.w2 { grid-column: span 2; }
-.panel.w3 { grid-column: span 3; }
 
-@media (max-width: 1100px) {
-  .grid { grid-template-columns: 1fr; }
-  .panel.w2, .panel.w3 { grid-column: auto; }
-}
+/* the layout switcher (under review) */
+.vsw { display: inline-flex; border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; margin-left: 4px; }
+.vsw a { font: 11px var(--mono); color: var(--dim); padding: 3px 9px; text-decoration: none; }
+.vsw a + a { border-left: 1px solid var(--edge); }
+.vsw a.on { color: var(--fg); background: var(--hover); }

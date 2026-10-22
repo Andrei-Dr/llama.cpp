@@ -1,7 +1,8 @@
 // the dashboard: /stats and the newest /stats/history rows every second (one poll in flight at most), the minute rows
 // every minute, /props every 15 s; every panel renders from the store
 
-import { $, txt, dur, show } from "./util.js";
+import { $, txt, dur, show, tidy } from "./util.js";
+import "./variant.js";
 import { store, poll, failed, pollMinutes, pollProps, HttpError } from "./store.js";
 import * as cards from "./panels/cards.js";
 import * as timeline from "./panels/timeline.js";
@@ -58,6 +59,7 @@ function render() {
   guarded("phase", () => machine.renderPhase());
   guarded("hists", () => dist.renderHists(st));
   guarded("events", () => dist.renderEvents(store.events));
+  guarded("tidy", tidy);
 }
 
 let busy = false;

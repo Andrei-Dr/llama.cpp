@@ -1,0 +1,57 @@
+/* the page grid: 12 units a row. Every panel declares its desktop span (--sw); a row is a wrapping flex line whose items
+   grow in proportion to their span, so a row always fills and its panels share one height, and a panel that is hidden
+   (no expert cache, no disk tier, no drafting) gives its units to the others. Narrow screens halve or stack the spans. */
+.grid { display: flex; flex-wrap: wrap; gap: var(--gap); margin-top: var(--gap); }
+.grid > .panel, .grid > .band, .grid > .stack, .grid > .stack > .panel { --s: var(--sw, 12);
+  flex: var(--s) 1 calc(var(--s) / 12 * 100% - var(--gap) * (12 - var(--s)) / 12 - 1px); min-width: 0; }
+.stack { display: flex; flex-direction: column; gap: var(--gap); }
+.stack > .panel { flex: 1 1 auto; }
+@media (max-width: 1100px) {
+  .grid > .panel, .grid > .band, .grid > .stack, .grid > .stack > .panel { --s: clamp(6, (var(--sw, 12) - 6) * 100, 12); }
+  .grid > .stack { --s: 12; flex-direction: row; flex-wrap: wrap; }
+  .stack > .panel { flex: 1 1 320px; }
+}
+@media (max-width: 720px) {
+  .grid > .panel, .grid > .band, .grid > .stack, .grid > .stack > .panel { --s: 12; }
+  .wrap { padding: 16px 12px 64px; }
+}
+.band { display: none; margin: 10px 2px 0; font: 600 10.5px var(--ui); letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+
+/* variant a: topic pairs. Requests beside slots and speculation, memory with the disk tier, the expert cache beside the
+   critical link, the interconnect beside the machine */
+html[data-v="a"] #p-timeline { --sw: 12; }
+html[data-v="a"] #p-requests { --sw: 8; }
+html[data-v="a"] #st-serve { --sw: 4; }
+html[data-v="a"] #p-memory, html[data-v="a"] #ssd { --sw: 6; }
+html[data-v="a"] #p-experts { --sw: 7; }
+html[data-v="a"] #st-exp { --sw: 5; }
+html[data-v="a"] #p-link { --sw: 7; }
+html[data-v="a"] #p-machine { --sw: 5; }
+
+/* variant b: thirds. Everything small is a third of the row; the stacks dissolve into the grid */
+html[data-v="b"] #st-serve { display: contents; }
+html[data-v="b"] #p-requests { --sw: 12; order: 1; }
+html[data-v="b"] #p-requests .pbody.scroll, html[data-v="c"] #p-requests .pbody.scroll { flex-basis: auto; max-height: 520px; }
+html[data-v="b"] #p-slots { --sw: 4; order: 2; }
+html[data-v="b"] #p-spec { --sw: 4; order: 3; }
+html[data-v="b"] #p-memory { --sw: 4; order: 4; }
+html[data-v="b"] #ssd { --sw: 4; order: 5; }
+html[data-v="b"] #p-link { --sw: 4; order: 6; }
+html[data-v="b"] #p-machine { --sw: 4; order: 7; }
+html[data-v="b"] #st-exp { display: flex; --sw: 4; order: 9; }
+html[data-v="b"] #p-experts { --sw: 8; order: 8; }
+html[data-v="b"] #p-dist { --sw: 12; order: 11; }
+html[data-v="b"] #p-events { --sw: 12; order: 12; }
+
+/* variant c: banded. Headed sections; the wide expert plane gets a full row */
+html[data-v="c"] .stack { display: contents; }
+html[data-v="c"] .band { display: block; --sw: 12; }
+html[data-v="c"] #b-serve { order: 1; } html[data-v="c"] #p-requests { --sw: 12; order: 2; }
+html[data-v="c"] #p-slots { --sw: 5; order: 3; } html[data-v="c"] #p-spec { --sw: 7; order: 4; }
+html[data-v="c"] #b-mem { order: 5; } html[data-v="c"] #p-memory { --sw: 7; order: 6; } html[data-v="c"] #ssd { --sw: 5; order: 7; }
+html[data-v="c"] #b-exp { order: 8; } html[data-v="c"] #p-experts { --sw: 12; order: 9; }
+html[data-v="c"] #p-phase { --sw: 6; order: 10; } html[data-v="c"] #x-counters { --sw: 6; order: 11; }
+html[data-v="c"] #b-mach { order: 12; } html[data-v="c"] #p-link { --sw: 6; order: 13; } html[data-v="c"] #p-machine { --sw: 6; order: 14; }
+html[data-v="c"] #b-dist { order: 15; } html[data-v="c"] #p-dist { --sw: 12; order: 16; } html[data-v="c"] #p-events { --sw: 12; order: 17; }
+html[data-v="c"] .band[data-empty="1"] { display: none; }
+html[data-v="c"] #p-timeline { order: 0; }

@@ -1,7 +1,7 @@
 // interconnect: host -> GPU traffic (NVML) against the link's ceiling, split into expert-cache fills, prompt warm-up
 // uploads and the rest; expert moves a second; the expert-cache counters
 
-import { $, isNum, txt, num, pct, bytes, figure, width, show } from "../util.js";
+import { $, isNum, txt, num, pct, bytes, figure, width, show, val } from "../util.js";
 import { spark } from "../spark.js";
 import { pcieCeilingGBs } from "../derive.js";
 import { store, latest, lastNum } from "../store.js";
@@ -23,6 +23,9 @@ const linkText = (gen, w) => (isNum(gen) && isNum(w) ? "gen" + gen + " x" + w : 
 export function render(st) {
   const d = latest(), m = st.moe_cache;
   const gpus = (st.machine && st.machine.gpus) || [];
+  show("p-link", gpus.length > 0 || !!m);
+  show("l-bar", !!m);
+  show("l-moves-grp", !!m);
   // the ceiling of every link together (pcie_rx is summed over the GPUs too)
   const ceils = gpus.map(pcieCeilingGBs);
   const ceilGBs = ceils.length && ceils.every(isNum) ? ceils.reduce((a, b) => a + b, 0) : null;
@@ -39,26 +42,26 @@ export function render(st) {
   figure("l-moves", num(isNum(d.moe_upload_s) ? d.moe_upload_s : null, 1), "/s");
   width("l-b-up", fills / ceil);
   width("l-b-warm", warm / ceil);
-  txt("l-up", num(fills, 1) + " MB/s");
-  txt("l-warm", num(warm, 1) + " MB/s");
-  txt("l-other", isNum(rx) ? num(rx, 0) + " MB/s" : "—");
-  txt("l-tx", isNum(tx) ? num(tx, 0) + " MB/s" : "—");
+  val("l-up", m ? [num(fills, 1), "MB/s"] : null);
+  val("l-warm", m ? [num(warm, 1), "MB/s"] : null);
+  val("l-other", isNum(rx) ? [num(rx, 0), "MB/s"] : null);
+  val("l-tx", isNum(tx) ? [num(tx, 0), "MB/s"] : null);
 
   const ups = rowDelta("moe_upload", 60), evs = rowDelta("moe_evict", 60);
-  txt("l-mv-meta", num(ups, 0) + " up · " + num(evs, 0) + " evicted");
+  txt("l-mv-meta", isNum(ups) || isNum(evs) ? num(ups, 0) + " up · " + num(evs, 0) + " evicted" : "");
   spark($("sp-moves"), store.samples, ["moe_upload_s", "moe_evict_s"], store.now, { span: 60 });
 
   show("x-counters", !!m);
   if (!m) return;
   const c = m.counters;
-  txt("x-up", num(c.upload) + " · " + bytes(c.upload_bytes) + (c.upload_warm ? " · warm-up " + num(c.upload_warm) + " · " + bytes(c.upload_bytes_warm) : ""));
-  txt("x-ev", num(c.evict));
-  txt("x-readmit", num(c.readmit) + " · " + pct(c.upload ? c.readmit / c.upload : null, 0) + " of uploads");
-  txt("x-refused", num(c.refused) + " · " + pct(c.miss ? c.refused / c.miss : null, 0) + " of misses");
-  txt("x-noslot", num(c.no_slot));
-  txt("x-inflight", num(c.miss_in_flight));
-  txt("x-susp", num(c.suspend) + " · resumed " + num(c.resume) + (c.resume_partial ? " (" + c.resume_partial + " partial)" : ""));
-  txt("x-borrow", m.suspended ? bytes(c.bytes_released) + " released now"
-    : m.n_live < m.n_slots ? (m.n_slots - m.n_live) + " slots/layer short · " + bytes((m.n_slots - m.n_live) * m.slot_bytes)
-    : "none · last release " + bytes(c.bytes_released));
+  val("x-up", num(c.upload), bytes(c.upload_bytes), c.upload_warm ? "warm-up " + num(c.upload_warm) + " · " + bytes(c.upload_bytes_warm) : null);
+  val("x-ev", num(c.evict));
+  val("x-readmit", num(c.readmit), c.upload ? pct(c.readmit / c.upload, 0) + " of uploads" : null);
+  val("x-refused", num(c.refused), c.miss ? pct(c.refused / c.miss, 0) + " of misses" : null);
+  val("x-noslot", num(c.no_slot));
+  val("x-inflight", num(c.miss_in_flight));
+  val("x-susp", num(c.suspend), "resumed " + num(c.resume) + (c.resume_partial ? " (" + c.resume_partial + " partial)" : ""));
+  val("x-borrow", m.suspended ? bytes(c.bytes_released) + " released"
+    : m.n_live < m.n_slots ? bytes((m.n_slots - m.n_live) * m.slot_bytes) : "none", m.suspended ? null
+    : m.n_live < m.n_slots ? (m.n_slots - m.n_live) + " slots/layer short" : "last release " + bytes(c.bytes_released));
 }

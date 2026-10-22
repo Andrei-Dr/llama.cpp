@@ -14,8 +14,11 @@ function kvCell(tr, used, max) {
   td.append(b, document.createTextNode(max ? pct(used / max) : "—"));
 }
 
-function promptText(n, cached) {
-  return compact(n) + (cached ? " (" + compact(cached) + " hit)" : "");
+// the prompt size, then how much of it the slot already held (muted)
+function promptCell(tr, n, cached) {
+  const td = tr.insertCell();
+  td.append(document.createTextNode(compact(n)));
+  if (cached) td.appendChild(el("small", "", compact(cached) + " hit"));
 }
 
 // how the slot was chosen and how much of the prompt it already held
@@ -23,7 +26,8 @@ function prefixText(sel) {
   if (!sel || !sel.how) return "—";
   // how · f_sim/f_keep (share of the request, of the slot's old prompt) · a disk restore
   let s = sel.how;
-  if (isNum(sel.f_sim) && sel.f_sim >= 0) s += " " + sel.f_sim.toFixed(2) + "/" + (isNum(sel.f_keep) && sel.f_keep >= 0 ? sel.f_keep.toFixed(2) : "–");
+  const f = (v) => v.toFixed(2).replace(/^0/, "");
+  if (isNum(sel.f_sim) && sel.f_sim >= 0) s += " " + f(sel.f_sim) + "/" + (isNum(sel.f_keep) && sel.f_keep >= 0 ? f(sel.f_keep) : "–");
   if (sel.disk_restored) s += " ssd " + compact(sel.n_disk_tokens);
   return s;
 }
@@ -36,7 +40,7 @@ export function render(st) {
     tr.insertCell().textContent = "#" + s.id_task;
     stateCell(tr, s.state);
     tr.insertCell().textContent = s.id;
-    tr.insertCell().textContent = promptText(s.n_prompt, s.n_prompt_cached);
+    promptCell(tr, s.n_prompt, s.n_prompt_cached);
     tr.insertCell().textContent = num(s.n_gen);
     tr.insertCell().textContent = compact(s.n_ctx);
     kvCell(tr, s.n_ctx, s.n_ctx_max);
@@ -53,7 +57,7 @@ export function render(st) {
     tr.insertCell().textContent = "#" + t.id;
     stateCell(tr, t.stop || "none");
     tr.insertCell().textContent = t.id_slot;
-    tr.insertCell().textContent = promptText(t.n_prompt, t.n_prompt_cached);
+    promptCell(tr, t.n_prompt, t.n_prompt_cached);
     tr.insertCell().textContent = num(t.n_gen) + (t.truncated ? " ✂" : "");
     tr.insertCell().textContent = compact(t.n_ctx);
     kvCell(tr, t.n_ctx, (st.slots[t.id_slot] || {}).n_ctx_max || 0);
@@ -66,6 +70,7 @@ export function render(st) {
     frag.appendChild(tr);
   }
   $("req-body").replaceChildren(frag);
+  $("req-empty").hidden = frag.childNodes.length > 0;
   const dec = live.filter((s) => s.state === "generating").length;
   txt("req-meta", dec + " decoding · " + (live.length - dec) + " prefill · " + (st.n_deferred || 0) + " waiting · " + store.tasks.length + " shown");
 }

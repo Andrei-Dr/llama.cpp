@@ -47,10 +47,49 @@ export function compact(n) {
   return num(n);
 }
 
-// a big figure with its unit in a <small>
+const unknown = (v) => v === null || v === undefined || v === "" || v === "—";
+
+// a row's value: the main figure, then muted secondary parts. A row with no main figure has no source and is hidden
+// instead of showing a dash.
+export function val(id, main, ...rest) {
+  const e = $(id);
+  if (!e) return;
+  const [m, unit] = Array.isArray(main) ? main : [main, null];
+  const key = [m, unit, ...rest].join("\u0001");
+  const row = e.closest(".kv, .m");
+  if (e.dataset.k !== key) {
+    e.dataset.k = key;
+    const lead = el("span", "mv", unknown(m) ? "" : m);
+    if (unit && !unknown(m)) lead.appendChild(el("small", "u", unit));
+    e.replaceChildren(lead);
+    // a key-value row puts its figure at the right edge (row-reverse), so its secondary parts are appended backwards
+    const parts = rest.filter((r) => !unknown(r));
+    for (const r of row && row.classList.contains("kv") ? parts.reverse() : parts) e.appendChild(el("small", "", r));
+  }
+  if (row) row.hidden = unknown(m);
+}
+
+// "a · b" of the parts that exist
+export function known(...parts) {
+  const p = parts.filter((x) => !unknown(x));
+  return p.length ? p.join(" · ") : null;
+}
+
+// groups (subheads) with no visible row are hidden too
+export function tidy() {
+  for (const g of document.querySelectorAll(".grp")) {
+    g.hidden = !g.querySelector(".kv:not([hidden]), .plotbox");
+  }
+  // a section heading with every panel under it hidden is hidden too
+  for (const b of document.querySelectorAll(".band")) b.dataset.empty = b.dataset.for.split(" ").every((id) => $(id).hidden) ? "1" : "";
+}
+
+// a big figure with its unit in a <small>; a stat with no value has no source and is hidden
 export function figure(id, value, unit) {
   const e = $(id);
   if (!e) return;
+  const stat = e.closest(".stat");
+  if (stat) stat.hidden = unknown(value);
   e.textContent = value;
   if (unit) {
     const s = document.createElement("small");

@@ -1,8 +1,5 @@
 /* the timeline: a grid of small charts, one y axis each, a crosshair shared by all of them */
-.panel.timeline { margin-top: 14px; }
-.tlgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px 22px; }
-@media (max-width: 1100px) { .tlgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 640px) { .tlgrid { grid-template-columns: minmax(0, 1fr); } }
+.tlgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px 22px; }
 
 figure.tl { margin: 0; min-width: 0; }
 figure.tl figcaption { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
