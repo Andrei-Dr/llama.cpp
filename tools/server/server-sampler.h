@@ -1,7 +1,7 @@
 #pragma once
 
 // The machine sampler of /stats and /stats/history: one thread of its own that wakes every period
-// (LLAMA_SERVER_SAMPLE_MS, default 1000; 0 = no thread, no history, no machine data), reads the GPUs through NVML
+// (LLAMA_SERVER_SAMPLE_MS, default 1000, at least 20; 0 = no thread, no history, no machine data), reads the GPUs through NVML
 // (libnvidia-ml loaded at run time, LLAMA_SERVER_NVML_LIB overrides the name, LLAMA_SERVER_NVML=0 skips it; without it the
 // GPU fields are null), this process's CPU time and the host's CPU and memory (/proc on Linux), lets the server add the
 // columns of its latest /stats snapshot, and appends the row to the history. It never posts a task, never takes a lock
@@ -26,11 +26,15 @@ struct server_gpu_sample {
     double mem_util   = NAN; // % of time device memory was read or written
     double vram_used  = NAN; // bytes
     double vram_total = NAN;
-    double pcie_rx    = NAN; // bytes/s, host -> GPU
-    double pcie_tx    = NAN; // bytes/s, GPU -> host
+    double pcie_rx    = NAN; // bytes/s, host -> GPU, over NVML's 20 ms window at the sample
+    double pcie_tx    = NAN; // bytes/s, GPU -> host, same
     double temp_c     = NAN;
     double power_w    = NAN;
     double clock_mhz  = NAN; // SM clock
+    double pcie_gen       = NAN; // PCIe link now (it trains down when idle) and the most the device supports
+    double pcie_width     = NAN;
+    double pcie_gen_max   = NAN;
+    double pcie_width_max = NAN;
 
     json to_json() const;
 };

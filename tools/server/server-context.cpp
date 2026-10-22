@@ -925,10 +925,6 @@ public:
         return sampler ? sampler->history() : nullptr;
     }
 
-    int64_t stats_sample_period_us() const {
-        return sampler ? sampler->period() : 0;
-    }
-
     server_metrics get_metrics() const {
         return metrics;
     }
@@ -1580,8 +1576,8 @@ private:
 
         metrics.init();
 
-        // once per process (init() runs again at every wake): the thread outlives model reloads
-        if (params_base.endpoint_metrics && !sampler) {
+        // init() runs once per process (not at a wake): the thread outlives the model reloads of sleep / wake
+        if (params_base.endpoint_metrics) {
             sampler = std::make_unique<server_sampler>(server_sampler::period_us_from_env(), [this](server_stats_row & r) {
                 stats_fill_row(r);
             });
@@ -4577,13 +4573,22 @@ private:
             }
         }
 
+        // one read: the header and the layers from the same snapshot (the buffer only grows; a snapshot with more layers
+        // than it holds is read again)
         llama_moe_cache_stats h = {};
-        if (llama_moe_cache_get_stats(&h, nullptr, 0, nullptr, 0)) {
-            sampler_moe_layers.resize((size_t) std::max(0, h.n_layer));
-            llama_moe_cache_get_stats(&h, sampler_moe_layers.data(), sampler_moe_layers.size(), nullptr, 0);
+        if (sampler_moe_layers.size() < 64) {
+            sampler_moe_layers.resize(64);
+        }
+        bool got = llama_moe_cache_get_stats(&h, sampler_moe_layers.data(), sampler_moe_layers.size(), nullptr, 0);
+        if (got && (size_t) h.n_layer > sampler_moe_layers.size()) {
+            sampler_moe_layers.resize((size_t) h.n_layer);
+            got = llama_moe_cache_get_stats(&h, sampler_moe_layers.data(), sampler_moe_layers.size(), nullptr, 0) &&
+                  (size_t) h.n_layer <= sampler_moe_layers.size();
+        }
+        if (got) {
             double resident = 0;
-            for (const auto & l : sampler_moe_layers) {
-                resident += l.n_resident;
+            for (int32_t li = 0; li < h.n_layer; ++li) {
+                resident += sampler_moe_layers[li].n_resident;
             }
             r[SSC_moe_t_us]                 = (double) h.t_us;
             r[SSC_moe_steps]                = (double) h.n_steps;

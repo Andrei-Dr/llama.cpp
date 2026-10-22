@@ -93,6 +93,7 @@ def test_history_rows_and_fake_gpu(fake_nvml, monkeypatch):
     assert m["nvml"] == "ok"
     assert m["gpus"][0]["name"] == "Fake GPU"
     assert m["gpus"][0]["util"] == 42
+    assert (m["gpus"][0]["pcie_gen"], m["gpus"][0]["pcie_gen_max"], m["gpus"][0]["pcie_width_max"]) == (1, 3, 16)
     assert m["sampler"]["n"] >= 3
 
 
@@ -163,3 +164,31 @@ def test_nvml_off(fake_nvml, monkeypatch):
     h = wait_history(lambda h: h["n"] >= 1)
     assert all(v is None for v in h["cols"]["gpu_util"])
     assert server.make_request("GET", "/stats").body["machine"]["nvml"] == "off"
+
+
+def test_history_through_sleep_and_wake():
+    server.sleep_idle_seconds = 1
+    server.start()
+    res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
+    assert res.status_code == 200
+    # asleep (the model unloaded): the sampler keeps sampling, the last snapshot's counters stay
+    deadline = time.time() + 10
+    while not server.make_request("GET", "/props").body.get("is_sleeping") and time.time() < deadline:
+        time.sleep(0.1)
+    assert server.make_request("GET", "/props").body.get("is_sleeping")
+    n0 = history()["n"]
+    time.sleep(0.5)
+    h = history()
+    assert h["n"] > n0
+    assert h["cols"]["tasks"][-1] == 1
+    # awake again: the next task shows up in the rows
+    res = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 4})
+    assert res.status_code == 200
+    h = wait_history(lambda h: h["n"] > 0 and h["cols"]["tasks"][-1] == 2)
+    assert h["cols"]["tasks"][-1] == 2
+
+
+def test_sample_period_floor(monkeypatch):
+    monkeypatch.setenv("LLAMA_SERVER_SAMPLE_MS", "1")
+    server.start()
+    assert history()["period_ms"] == 20

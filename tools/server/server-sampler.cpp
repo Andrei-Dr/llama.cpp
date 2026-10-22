@@ -28,6 +28,8 @@ static constexpr int k_nvml_pcie_rx_bytes  = 1; // NVML_PCIE_UTIL_RX_BYTES
 static constexpr int k_nvml_temperature_gpu = 0; // NVML_TEMPERATURE_GPU
 static constexpr int k_nvml_clock_sm       = 1; // NVML_CLOCK_SM
 
+static constexpr int k_min_period_ms = 20;
+
 class server_nvml {
 public:
     // false with the reason in why
@@ -41,7 +43,7 @@ public:
         lib = dlopen(name, RTLD_NOW | RTLD_LOCAL);
         if (!lib) {
             const char * e = dlerror();
-            why = std::string("cannot load ") + name + (e ? std::string(": ") + e : std::string());
+            why = std::string("cannot load ") + name + (e ? std::string(": ") + std::string(e).substr(0, 160) : std::string());
             return false;
         }
         bool all = true;
@@ -65,6 +67,11 @@ public:
             why = std::string(name) + " lacks an NVML function";
             return false;
         }
+        // optional: the PCIe link, for the page's bandwidth ceiling
+        link_gen       = (nvml_return_t (*)(nvml_device_t, unsigned int *)) dlsym(lib, "nvmlDeviceGetCurrPcieLinkGeneration");
+        link_width     = (nvml_return_t (*)(nvml_device_t, unsigned int *)) dlsym(lib, "nvmlDeviceGetCurrPcieLinkWidth");
+        link_gen_max   = (nvml_return_t (*)(nvml_device_t, unsigned int *)) dlsym(lib, "nvmlDeviceGetMaxPcieLinkGeneration");
+        link_width_max = (nvml_return_t (*)(nvml_device_t, unsigned int *)) dlsym(lib, "nvmlDeviceGetMaxPcieLinkWidth");
         if (init() != 0) {
             why = "nvmlInit failed";
             return false;
@@ -111,8 +118,9 @@ public:
                 g.vram_total = (double) mi.total;
             }
             unsigned int v = 0;
+            // NVML counts the bytes of one 20 ms window per call (KB/s, taken as 1024 bytes): a point sample, not an average
             if (pcie(d, k_nvml_pcie_rx_bytes, &v) == 0) {
-                g.pcie_rx = 1024.0 * v; // KB/s
+                g.pcie_rx = 1024.0 * v;
             }
             if (pcie(d, k_nvml_pcie_tx_bytes, &v) == 0) {
                 g.pcie_tx = 1024.0 * v;
@@ -126,6 +134,16 @@ public:
             if (clock(d, k_nvml_clock_sm, &v) == 0) {
                 g.clock_mhz = v;
             }
+            auto link = [&](nvml_return_t (*f)(nvml_device_t, unsigned int *), double & out) {
+                unsigned int x = 0;
+                if (f && f(d, &x) == 0) {
+                    out = x;
+                }
+            };
+            link(link_gen,       g.pcie_gen);
+            link(link_width,     g.pcie_width);
+            link(link_gen_max,   g.pcie_gen_max);
+            link(link_width_max, g.pcie_width_max);
         }
     }
 
@@ -155,6 +173,10 @@ private:
     nvml_return_t (*temp)(nvml_device_t, int, unsigned int *)  = nullptr;
     nvml_return_t (*power)(nvml_device_t, unsigned int *)      = nullptr;
     nvml_return_t (*clock)(nvml_device_t, int, unsigned int *) = nullptr;
+    nvml_return_t (*link_gen)(nvml_device_t, unsigned int *)       = nullptr;
+    nvml_return_t (*link_width)(nvml_device_t, unsigned int *)     = nullptr;
+    nvml_return_t (*link_gen_max)(nvml_device_t, unsigned int *)   = nullptr;
+    nvml_return_t (*link_width_max)(nvml_device_t, unsigned int *) = nullptr;
 
     std::vector<nvml_device_t> devs;
     std::vector<std::string>   names;
@@ -220,6 +242,10 @@ json server_gpu_sample::to_json() const {
         { "temp_c",     num_or_null(temp_c)    },
         { "power_w",    num_or_null(power_w)   },
         { "clock_mhz",  num_or_null(clock_mhz) },
+        { "pcie_gen",       num_or_null(pcie_gen)       },
+        { "pcie_width",     num_or_null(pcie_width)     },
+        { "pcie_gen_max",   num_or_null(pcie_gen_max)   },
+        { "pcie_width_max", num_or_null(pcie_width_max) },
     };
 }
 
@@ -260,7 +286,19 @@ json server_machine_sample::to_json() const {
 
 int64_t server_sampler::period_us_from_env() {
     const char * e = getenv("LLAMA_SERVER_SAMPLE_MS");
-    return e ? std::max(0, atoi(e)) * 1000LL : 1000 * 1000LL;
+    if (!e) {
+        return 1000 * 1000LL;
+    }
+    const int ms = atoi(e);
+    if (ms <= 0) {
+        return 0;
+    }
+    // a sample takes tens of ms (NVML's PCIe counters wait 20 ms each): a shorter period would only sample back to back
+    if (ms < k_min_period_ms) {
+        fprintf(stderr, "%s: LLAMA_SERVER_SAMPLE_MS=%d raised to %d\n", __func__, ms, k_min_period_ms);
+        return k_min_period_ms * 1000LL;
+    }
+    return ms * 1000LL;
 }
 
 server_sampler::server_sampler(int64_t period_us, fill_t fill) : period_us(period_us), fill(std::move(fill)), hist(period_us > 0 ? period_us : 1) {
@@ -305,13 +343,16 @@ void server_sampler::run() {
         if (!use_nvml) {
             m.gpus.clear();
         }
+        const auto t0 = std::chrono::steady_clock::now();
         sample_once(nvml, use_nvml ? state : std::string());
+        const auto now = std::chrono::steady_clock::now();
 
         next += period;
-        const auto now = std::chrono::steady_clock::now();
         if (now > next + period) {
             next = now; // fell behind (a suspended machine): no burst of catch-up samples
         }
+        // never busier than half the time: a sample slower than the period waits as long as it took
+        next = std::max(next, now + (now - t0));
         std::unique_lock<std::mutex> lock(mutex);
         if (cv.wait_until(lock, next, [this] { return stopping; })) {
             break;

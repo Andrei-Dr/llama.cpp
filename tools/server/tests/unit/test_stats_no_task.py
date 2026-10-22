@@ -59,7 +59,7 @@ def test_stats_reads_post_no_task():
     p0 = posted()
     assert p0["completion"] == 1
     for _ in range(25):
-        for path in ("/stats", "/stats?tasks=4", "/stats/history", "/stats/history?tier=m", "/slots", "/metrics", "/dash/"):
+        for path in ("/stats", "/stats?tasks=4", "/stats/history", "/stats/history?tier=m", "/slots", "/metrics", "/props", "/dash/"):
             assert get_raw(path) == 200, path
     p1 = posted()
     assert p1 == p0

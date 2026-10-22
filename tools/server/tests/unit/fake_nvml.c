@@ -17,3 +17,7 @@ int nvmlDeviceGetPcieThroughput(void * d, int c, unsigned int * v) { (void) d; *
 int nvmlDeviceGetTemperature(void * d, int s, unsigned int * v) { (void) d; (void) s; *v = 61; return 0; }
 int nvmlDeviceGetPowerUsage(void * d, unsigned int * v) { (void) d; *v = 70500; return 0; }
 int nvmlDeviceGetClockInfo(void * d, int t, unsigned int * v) { (void) d; *v = t == 1 ? 1905 : 0; return 0; }
+int nvmlDeviceGetCurrPcieLinkGeneration(void * d, unsigned int * v) { (void) d; *v = 1; return 0; }
+int nvmlDeviceGetCurrPcieLinkWidth(void * d, unsigned int * v) { (void) d; *v = 16; return 0; }
+int nvmlDeviceGetMaxPcieLinkGeneration(void * d, unsigned int * v) { (void) d; *v = 3; return 0; }
+int nvmlDeviceGetMaxPcieLinkWidth(void * d, unsigned int * v) { (void) d; *v = 16; return 0; }
