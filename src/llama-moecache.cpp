@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -42,6 +43,13 @@ struct layer_state {
     // prompt warm-up: routing counts of the large batches since the last step()
     std::vector<uint32_t> warm_cnt; // [n_expert]
     bool                  warm_seen = false;
+
+    // statistics (llama_moe_cache_get_stats), cumulative
+    uint64_t             n_hit    = 0;
+    uint64_t             n_miss   = 0;
+    uint64_t             n_upload = 0;
+    uint64_t             n_evict  = 0;
+    std::vector<uint8_t> ever_evicted; // [n_expert]: the expert was resident once and evicted (a later upload re-admits it)
 };
 
 struct upload_job {
@@ -62,6 +70,21 @@ struct moe_cache {
     uint64_t n_evict     = 0;
     uint64_t n_warm      = 0; // uploads scheduled by the prompt warm-up (included in n_upload)
     uint64_t upload_bytes = 0;
+
+    // statistics only (llama_moe_cache_get_stats); see struct llama_moe_cache_stats
+    uint64_t n_miss_in_flight  = 0;
+    uint64_t n_refused         = 0;
+    uint64_t n_readmit         = 0;
+    uint64_t n_no_slot         = 0;
+    uint64_t upload_bytes_warm = 0;
+    uint64_t n_suspend         = 0;
+    uint64_t n_resume          = 0;
+    uint64_t n_resume_partial  = 0;
+    uint64_t bytes_released    = 0;
+    uint64_t stats_seq         = 0;
+    uint64_t publish_n         = 0;
+    uint64_t publish_us_sum    = 0;
+    uint64_t publish_us_max    = 0;
 
     std::mutex mtx; // guards layer bookkeeping (observe runs during graph exec)
 
@@ -99,6 +122,16 @@ float       g_cache_bias = 0.0f; // set once in init, before any table entry is 
 std::mutex  g_init_mtx;
 bool        g_init_done = false;
 
+// the published statistics: rebuilt under the cache lock at a token boundary, swapped in whole, read without a lock
+struct stats_snapshot {
+    llama_moe_cache_stats                    hdr = {};
+    std::vector<llama_moe_cache_layer_stats> layers;
+    std::vector<int32_t>                     slot_expert; // [n_layer * n_slots], layer-major
+};
+std::shared_ptr<const stats_snapshot> g_stats;                    // std::atomic_load / std::atomic_store only
+int64_t                               g_stats_period_us = 250000; // LLAMA_MOE_CACHE_STATS_MS, set once in init
+int64_t                               g_stats_last_us   = 0;      // under the cache lock
+
 // called by the CPU mul_mat_id (thread 0) for the first expert matmul of a cached layer
 void moe_obs_cb(int32_t il, const struct ggml_tensor * ids, void * ud) {
     moe_cache * mc = (moe_cache *) ud;
@@ -124,11 +157,14 @@ void moe_obs_cb(int32_t il, const struct ggml_tensor * ids, void * ud) {
             const int32_t slot = ls.expert_slot[id];
             if (slot >= 0) {
                 mc->n_hit++;
+                ls.n_hit++;
                 ls.slot_last_use[slot] = ++mc->clock;
                 continue;
             }
             mc->n_miss++;
+            ls.n_miss++;
             if (ls.expert_in_flight[id]) {
+                mc->n_miss_in_flight++;
                 continue;
             }
 
@@ -143,6 +179,7 @@ void moe_obs_cb(int32_t il, const struct ggml_tensor * ids, void * ud) {
                 admitted = oldest != 0 && tok - oldest < window;
             }
             if (!admitted) {
+                mc->n_refused++;
                 continue;
             }
 
@@ -202,6 +239,97 @@ bool on_host(const ggml_tensor * t) {
     return t && t->data && t->buffer && ggml_backend_buffer_is_host(t->buffer);
 }
 
+// bytes of one expert of the layer: what one upload copies, what one slot holds
+size_t expert_bytes(const llama_moe_cache_layer & pub) {
+    return pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
+}
+
+// build and swap in a statistics snapshot. Caller holds mc->mtx (no graph is executing: the slots are consistent)
+void publish_stats(moe_cache * mc, int64_t t_now) {
+    auto snap = std::make_shared<stats_snapshot>();
+    llama_moe_cache_stats & h = snap->hdr;
+
+    const int32_t n_layer = (int32_t) mc->layers.size();
+    const int32_t n_slots = mc->params.n_slots;
+
+    h.seq               = ++mc->stats_seq;
+    h.t_us              = t_now;
+    h.n_layer           = n_layer;
+    h.n_expert          = n_layer > 0 ? (int32_t) mc->layers[0].pub.down_src->ne[2] : 0;
+    h.n_slots           = n_slots;
+    h.n_live            = mc->n_live;
+    h.suspended         = mc->suspended;
+    h.pressure          = mc->pressure;
+    h.sync_publish      = mc->sync_publish;
+    h.n_steps           = mc->n_steps;
+    h.n_hit             = mc->n_hit;
+    h.n_miss            = mc->n_miss;
+    h.n_miss_in_flight  = mc->n_miss_in_flight;
+    h.n_refused         = mc->n_refused;
+    h.n_upload          = mc->n_upload;
+    h.n_upload_warm     = mc->n_warm;
+    h.n_readmit         = mc->n_readmit;
+    h.n_evict           = mc->n_evict;
+    h.n_no_slot         = mc->n_no_slot;
+    h.upload_bytes      = mc->upload_bytes;
+    h.upload_bytes_warm = mc->upload_bytes_warm;
+    h.n_suspend         = mc->n_suspend;
+    h.n_resume          = mc->n_resume;
+    h.n_resume_partial  = mc->n_resume_partial;
+    h.bytes_released    = mc->bytes_released;
+    h.publish_n         = mc->publish_n;
+    h.publish_us_sum    = mc->publish_us_sum;
+    h.publish_us_max    = mc->publish_us_max;
+
+    snap->layers.resize(n_layer);
+    snap->slot_expert.assign((size_t) n_layer*n_slots, -1);
+    int32_t n_in_flight = 0;
+    for (int32_t li = 0; li < n_layer; ++li) {
+        const layer_state           & ls = mc->layers[li];
+        llama_moe_cache_layer_stats & l  = snap->layers[li];
+
+        h.slot_bytes += expert_bytes(ls.pub);
+
+        l.il       = ls.pub.il;
+        l.n_hit    = ls.n_hit;
+        l.n_miss   = ls.n_miss;
+        l.n_upload = ls.n_upload;
+        l.n_evict  = ls.n_evict;
+        if (mc->suspended) {
+            continue; // the slots are gone
+        }
+        const int32_t n = std::min<int32_t>(n_slots, (int32_t) ls.slot_expert.size());
+        for (int32_t s = 0; s < n; ++s) {
+            int32_t e = ls.slot_expert[s];
+            if (ls.slot_in_flight[s]) {
+                e = -2;
+                n_in_flight++;
+            } else if (e >= 0) {
+                l.n_resident++;
+            }
+            snap->slot_expert[(size_t) li*n_slots + s] = e;
+        }
+    }
+    h.n_in_flight = n_in_flight;
+
+    std::atomic_store(&g_stats, std::shared_ptr<const stats_snapshot>(std::move(snap)));
+    g_stats_last_us = t_now;
+
+    const uint64_t dt = (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_now);
+    mc->publish_n++;
+    mc->publish_us_sum += dt;
+    mc->publish_us_max  = std::max(mc->publish_us_max, dt);
+}
+
+// a snapshot outside the step's rate limit (init, suspend, resume): the state changed as a whole
+void publish_stats_now(moe_cache * mc) {
+    if (g_stats_period_us <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    publish_stats(mc, ggml_time_us());
+}
+
 } // namespace
 
 // every slot empty, every table entry -> the dummy slot, per-expert scale copies re-uploaded. Used at init and when the
@@ -222,6 +350,9 @@ static void reset_slots(moe_cache * mc, bool keep_warm) {
         ls.miss_ring.assign((size_t) n_expert*mc->params.admit, 0);
         ls.miss_pos.assign(n_expert, 0);
         ls.pending.clear();
+        if (ls.ever_evicted.empty()) {
+            ls.ever_evicted.assign(n_expert, 0);
+        }
         if (!keep_warm) {
             ls.warm_cnt.assign(n_expert, 0);
             ls.warm_seen = false;
@@ -340,6 +471,10 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     {
         const char * e = getenv("LLAMA_MOE_CACHE_SYNC");
         mc->sync_publish = e && atoi(e) != 0;
+    }
+    {
+        const char * e = getenv("LLAMA_MOE_CACHE_STATS_MS");
+        g_stats_period_us = e ? std::max(0, atoi(e)) * 1000LL : 250 * 1000LL;
     }
     mc->params.bias        = std::max(0.0f, params.bias);
     g_cache_bias           = mc->params.bias;
@@ -468,6 +603,7 @@ void llama_moe_cache_init(const llama_model & model, const llama_moe_cache_param
     ggml_set_moe_obs_callback(moe_obs_cb, mc);
     g_cache     = mc;
     g_init_done = true;
+    publish_stats_now(mc);
 
     LLAMA_LOG_INFO("%s: MoE expert cache enabled: %zu layers x %d slots, %d inserts/step, admit %d misses / %d tokens, %.1f MiB device memory\n",
             __func__, mc->layers.size(), n_slots, mc->params.max_inserts, mc->params.admit, mc->params.window, vram/1024.0/1024.0);
@@ -519,7 +655,10 @@ size_t llama_moe_cache_suspend(bool pressure) {
     const size_t freed = free_device_bufs(mc, mc->ctxs.size());
     mc->suspended = true;
     mc->pressure  = pressure;
+    mc->n_suspend++;
+    mc->bytes_released = freed;
     g_generation++;
+    publish_stats_now(mc);
     LLAMA_LOG_INFO("moe-cache: %s: released %.1f MiB of device slots\n", pressure ? "memory pressure" : "prefill mode", freed/1024.0/1024.0);
     return freed;
 }
@@ -597,6 +736,7 @@ bool llama_moe_cache_resume() {
     if (!ok) {
         LLAMA_LOG_WARN("moe-cache: could not re-allocate any device slots - cache stays off (outputs unchanged, decode slower)\n");
         mc->pressure = true; // the owning context retries, paced (llama_context::decode)
+        publish_stats_now(mc);
         return false;
     }
     size_t got = 0;
@@ -609,7 +749,10 @@ bool llama_moe_cache_resume() {
     reset_slots(mc, /*keep_warm=*/true);
     mc->suspended = false;
     mc->pressure  = false;
+    mc->n_resume++;
+    mc->n_resume_partial += n < mc->params.n_slots ? 1 : 0;
     g_generation++;
+    publish_stats_now(mc);
     LLAMA_LOG_INFO("moe-cache: decode mode: restored %.1f MiB of device slots, %d of %d per layer (re-ranked by the prompt at the next step)\n",
             got/1024.0/1024.0, n, mc->params.n_slots);
     return true;
@@ -718,13 +861,16 @@ void llama_moe_cache_step() {
             ls.slot_expert[slot]   = -1;
             set_table_entry(ls.pub, victim, mc->n_live);
             mc->n_evict++;
+            ls.n_evict++;
+            ls.ever_evicted[victim] = 1;
         }
         ls.slot_in_flight[slot]  = true;
         ls.expert_in_flight[id]  = true;
 
-        const llama_moe_cache_layer & pub = ls.pub;
         mc->n_upload++;
-        mc->upload_bytes += pub.down_src->nb[2] + (pub.gate_up_src ? pub.gate_up_src->nb[2] : pub.up_src->nb[2] + pub.gate_src->nb[2]);
+        ls.n_upload++;
+        mc->n_readmit    += ls.ever_evicted[id];
+        mc->upload_bytes += expert_bytes(ls.pub);
 
         std::lock_guard<std::mutex> wlk(mc->wmtx);
         mc->todo.push_back({li, id, slot});
@@ -762,9 +908,11 @@ void llama_moe_cache_step() {
                 continue;
             }
             if (!place(li, id, &keep)) {
+                mc->n_no_slot++;
                 break;
             }
             n_warm++;
+            mc->upload_bytes_warm += expert_bytes(ls.pub);
         }
 
         std::fill(ls.warm_cnt.begin(), ls.warm_cnt.end(), 0);
@@ -787,6 +935,7 @@ void llama_moe_cache_step() {
                 continue;
             }
             if (!place(li, id, nullptr)) {
+                mc->n_no_slot++;
                 break; // every slot is in flight; try again next step
             }
             --budget;
@@ -803,4 +952,29 @@ void llama_moe_cache_step() {
                 mc->n_steps, n ? 100.0*mc->n_hit/n : 0.0, mc->n_upload, mc->upload_bytes/1024.0/1024.0,
                 mc->upload_bytes/1024.0/1024.0/mc->n_steps, mc->n_evict, mc->n_warm);
     }
+
+    if (g_stats_period_us > 0) {
+        const int64_t t_now = ggml_time_us();
+        if (t_now - g_stats_last_us >= g_stats_period_us) {
+            publish_stats(mc, t_now);
+        }
+    }
+}
+
+bool llama_moe_cache_get_stats(llama_moe_cache_stats * stats, llama_moe_cache_layer_stats * layers, size_t n_layers,
+                               int32_t * slot_expert, size_t n_slot_expert) {
+    const std::shared_ptr<const stats_snapshot> snap = std::atomic_load(&g_stats);
+    if (!snap) {
+        return false;
+    }
+    if (stats) {
+        *stats = snap->hdr;
+    }
+    if (layers && n_layers >= snap->layers.size()) {
+        std::copy(snap->layers.begin(), snap->layers.end(), layers);
+    }
+    if (slot_expert && n_slot_expert >= snap->slot_expert.size()) {
+        std::copy(snap->slot_expert.begin(), snap->slot_expert.end(), slot_expert);
+    }
+    return true;
 }

@@ -743,7 +743,10 @@ void server_prompt_disk::evict() {
         auto next = std::next(it);
         if (expired(*it)) {
             SRV_TRC("prompt disk cache: expired entry %s (%d tokens)\n", it->id.c_str(), (int) it->tokens.size());
-            freed += remove(it);
+            const size_t n = remove(it);
+            freed += n;
+            stats.n_evict_expired++;
+            stats.evict_bytes += n;
         }
         it = next;
     }
@@ -752,7 +755,10 @@ void server_prompt_disk::evict() {
     while (!entries.empty() && ((limit_bytes > 0 && size() > limit_bytes) || avail + freed < reserve_bytes)) {
         auto it = victim();
         SRV_TRC("prompt disk cache: evicting entry %s (%.1f MiB)\n", it->id.c_str(), it->bytes / 1048576.0);
-        freed += remove(it);
+        const size_t n = remove(it);
+        freed += n;
+        stats.n_evict_space++;
+        stats.evict_bytes += n;
     }
 }
 
@@ -762,6 +768,7 @@ bool server_prompt_disk::save(const server_prompt & prompt, llama_context * ctx_
         return save_impl(prompt, ctx_tgt, ctx_dft, seq, abort);
     } catch (const std::exception & e) {
         SRV_ERR("prompt disk cache: save failed: %s\n", e.what());
+        stats.n_save_failed++;
         return false;
     }
 }
@@ -774,10 +781,12 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     llama_tokens tokens;
     if (!text_tokens(prompt.tokens, tokens)) {
         SRV_TRC("%s", "prompt disk cache: skipping a prompt that contains media\n");
+        stats.n_save_skipped++;
         return false;
     }
     if (stored(prompt)) {
         SRV_TRC("%s", "prompt disk cache: prompt already stored\n");
+        stats.n_save_skipped++;
         return false;
     }
 
@@ -791,18 +800,23 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     need += need / 64 + (1u << 20);  // record framing
     if (limit_bytes > 0 && need > limit_bytes) {
         SRV_WRN("prompt disk cache: state %.1f MiB exceeds the limit, not stored\n", need / 1048576.0);
+        stats.n_save_refused++;
         return false;
     }
     // refuse before evicting anything if even an empty cache would not leave the reserve
     const uintmax_t avail = available();
     if (avail != UINTMAX_MAX && avail + size() < need + reserve_bytes) {
         SRV_WRN("prompt disk cache: %.1f MiB free is below state + reserve, not stored\n", avail / 1048576.0);
+        stats.n_save_refused++;
         return false;
     }
     size_t freed = 0;
     while (!entries.empty() && ((limit_bytes > 0 && size() + need > limit_bytes)
                                 || (avail != UINTMAX_MAX && avail + freed < need + reserve_bytes))) {
-        freed += remove(victim());
+        const size_t n = remove(victim());
+        freed += n;
+        stats.n_evict_space++;
+        stats.evict_bytes += n;
     }
 
     const int64_t t0 = ggml_time_us();
@@ -822,8 +836,10 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     if (!ok) {
         if (abort && abort()) {
             SRV_INF("prompt disk cache: idle save of %d tokens cancelled by a new request\n", (int) tokens.size());
+            stats.n_save_cancelled++;
         } else {
             SRV_ERR("prompt disk cache: failed to write entry %s\n", e.id.c_str());
+            stats.n_save_failed++;
         }
         std::error_code ec;
         for (const char * ext : { ".tgt", ".dft", ".ckpt" }) {
@@ -848,15 +864,21 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
         auto next = std::next(it);
         if (covers(e, server_tokens(it->tokens, false)) || redundancy(*it, e) >= PDC_SUPERSEDE) {
             SRV_TRC("prompt disk cache: entry %s superseded\n", it->id.c_str());
-            remove(it);
+            stats.n_superseded++;
+            stats.evict_bytes += remove(it);
         }
         it = next;
     }
     entries.push_back(std::move(e));
 
+    const int64_t t_save = ggml_time_us() - t0;
     SRV_INF("prompt disk cache: saved %d tokens, %.1f MiB, %zu checkpoints in %.0f ms (%zu entries, %.1f MiB)\n",
             (int) tokens.size(), entries.back().bytes / 1048576.0, prompt.checkpoints.size(),
-            (ggml_time_us() - t0) / 1000.0, entries.size(), size() / 1048576.0);
+            t_save / 1000.0, entries.size(), size() / 1048576.0);
+    stats.n_save++;
+    stats.save_tokens += tokens.size();
+    stats.save_bytes  += entries.back().bytes;
+    stats.save_us     += t_save;
     return true;
 }
 
@@ -869,6 +891,7 @@ const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & 
     if (!ready || tokens_new.size() == 0) {
         return nullptr;
     }
+    stats.n_find++;
     for (const auto & e : entries) {
         if (expired(e)) {
             continue;
@@ -888,6 +911,11 @@ const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & 
         f_keep_out = f_keep;
         f_sim_out  = f_sim;
         best = &e;
+    }
+    if (best) {
+        stats.n_find_hit++;
+        stats.f_keep_hit = f_keep_out;
+        stats.f_sim_hit  = f_sim_out;
     }
     return best;
 }
@@ -914,6 +942,7 @@ bool server_prompt_disk::load(const server_prompt_disk_entry & entry, server_pro
     }
     SRV_ERR("prompt disk cache: failed to restore entry %s, deleting it\n", it->id.c_str());
     remove(it);
+    stats.n_restore_failed++;
     return false;
 }
 
@@ -940,7 +969,13 @@ bool server_prompt_disk::load_impl(std::list<server_prompt_disk_entry>::iterator
     prompt.checkpoints = std::move(ckpts);
     touch(it);
 
+    const int64_t t_restore = ggml_time_us() - t0;
     SRV_INF("prompt disk cache: restored %d tokens (%.1f MiB) in %.0f ms\n", (int) entries.back().tokens.size(),
-            entries.back().bytes / 1048576.0, (ggml_time_us() - t0) / 1000.0);
+            entries.back().bytes / 1048576.0, t_restore / 1000.0);
+    stats.n_restore++;
+    stats.restore_tokens     += entries.back().tokens.size();
+    stats.restore_bytes      += entries.back().bytes;
+    stats.restore_us         += t_restore;
+    stats.last_restore_tokens = (int32_t) entries.back().tokens.size();
     return true;
 }

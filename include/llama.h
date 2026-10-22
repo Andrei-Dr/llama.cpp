@@ -1641,6 +1641,66 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     //
+    // MoE expert cache statistics (llama_context_params.n_moe_cache_slots, CLI --moe-expert-cache)
+    //
+    // The cache publishes a snapshot from its step at a token boundary, where its lock is already held, at most every
+    // LLAMA_MOE_CACHE_STATS_MS (default 250, 0 = off), and at every suspend and resume. Reading the snapshot takes no lock
+    // the decode path uses. All counters are cumulative since the cache was built.
+
+    struct llama_moe_cache_stats {
+        uint64_t seq;               // snapshots published so far (0 = none yet)
+        int64_t  t_us;              // ggml_time_us() at publish
+        int32_t  n_layer;           // cached layers
+        int32_t  n_expert;          // experts per layer
+        int32_t  n_slots;           // configured slots per layer
+        int32_t  n_live;            // slots per layer now (fewer after a resume that did not fit)
+        int32_t  n_in_flight;       // uploads scheduled and not yet published, all layers
+        bool     suspended;         // device slots released (prefill mode or memory pressure); none are resident
+        bool     pressure;          // ... released for memory pressure
+        bool     sync_publish;      // LLAMA_MOE_CACHE_SYNC: uploads publish at the next step (deterministic)
+        uint64_t slot_bytes;        // device bytes of one slot in every layer (one expert per layer)
+        uint64_t n_steps;           // steps (token boundaries) with the slots allocated
+        uint64_t n_hit;             // routed (token, expert) pairs served by a resident expert
+        uint64_t n_miss;            // ... computed on the CPU
+        uint64_t n_miss_in_flight;  // misses whose expert was being uploaded
+        uint64_t n_refused;         // misses the admission gate did not admit
+        uint64_t n_upload;          // uploads scheduled, warm-up included
+        uint64_t n_upload_warm;     // ... by the prompt warm-up
+        uint64_t n_readmit;         // uploads of an expert that had been evicted before (ever: prompt warm-up uploads count too)
+        uint64_t n_evict;           // resident experts replaced
+        uint64_t n_no_slot;         // steps x layers where admissions stopped because no slot could be taken (all in flight, or
+                                    // in the warm-up, every free one holds an expert the prompt ranked higher)
+        uint64_t upload_bytes;      // bytes scheduled for upload, warm-up included
+        uint64_t upload_bytes_warm; // ... by the prompt warm-up
+        uint64_t n_suspend;         // slot releases (prefill mode, memory pressure)
+        uint64_t n_resume;          // slot re-allocations
+        uint64_t n_resume_partial;  // ... with fewer than n_slots per layer
+        uint64_t bytes_released;    // device bytes the last suspend released
+        uint64_t publish_n;         // snapshots built before this one, and their cost
+        uint64_t publish_us_sum;
+        uint64_t publish_us_max;
+    };
+
+    struct llama_moe_cache_layer_stats {
+        int32_t  il;         // model layer
+        int32_t  n_resident; // slots holding a published expert
+        uint64_t n_hit;
+        uint64_t n_miss;
+        uint64_t n_upload;
+        uint64_t n_evict;
+    };
+
+    // Copy the latest snapshot. layers: n_layer entries; slot_expert: n_layer * n_slots entries, layer-major, the expert
+    // each slot holds (-1 empty, -2 upload in flight, -1 beyond n_live). An array that is NULL or smaller than that is
+    // left untouched. Returns false when there is no cache or no snapshot yet (stats is then left untouched too).
+    LLAMA_API bool llama_moe_cache_get_stats(
+            struct llama_moe_cache_stats       * stats,
+            struct llama_moe_cache_layer_stats * layers,
+            size_t                               n_layers,
+            int32_t                            * slot_expert,
+            size_t                               n_slot_expert);
+
+    //
     // training
     //
 

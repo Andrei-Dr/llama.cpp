@@ -25,6 +25,19 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
 
+// the queue entry time (/stats queue wait), on the task and the child tasks it carries (n_cmpl > 1)
+static void stamp_posted(server_task & task) {
+    const int64_t t = ggml_time_us();
+    if (task.t_posted_us == 0) {
+        task.t_posted_us = t;
+    }
+    for (auto & child : task.child_tasks) {
+        if (child.t_posted_us == 0) {
+            child.t_posted_us = t;
+        }
+    }
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
@@ -32,6 +45,7 @@ int server_queue::post(server_task && task, bool front) {
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
+    stamp_posted(task);
     const int  task_id     = task.id;
     const bool reset_timer = task_resets_idle_timer(task.type);
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
@@ -54,6 +68,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
         if (task.id == -1) {
             task.id = id++;
         }
+        stamp_posted(task);
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);

@@ -36,6 +36,35 @@ struct server_prompt_disk_entry {
     std::chrono::steady_clock::time_point t_used;  // last save or restore
 };
 
+// cumulative counters of the disk tier (GET /stats), kept by the server's main loop thread
+struct server_prompt_disk_stats {
+    uint64_t n_find        = 0;    // lookups for a stored prompt that reuses more than the slot (or RAM) offers
+    uint64_t n_find_hit    = 0;    // ... that found one
+    float    f_keep_hit    = -1.0f; // the last hit: share of the entry reused
+    float    f_sim_hit     = -1.0f; // ... share of the new prompt reused
+
+    uint64_t n_save           = 0;
+    uint64_t n_save_skipped   = 0; // already stored, or contains media
+    uint64_t n_save_refused   = 0; // larger than the cap, or would break the free-space reserve
+    uint64_t n_save_cancelled = 0; // an idle save a new request interrupted
+    uint64_t n_save_failed    = 0;
+    uint64_t save_tokens      = 0;
+    uint64_t save_bytes       = 0;
+    uint64_t save_us          = 0;
+
+    uint64_t n_restore        = 0;
+    uint64_t n_restore_failed = 0;
+    uint64_t restore_tokens   = 0;
+    uint64_t restore_bytes    = 0;
+    uint64_t restore_us       = 0;
+    int32_t  last_restore_tokens = 0;
+
+    uint64_t n_evict_expired  = 0; // past --cache-disk-ttl
+    uint64_t n_evict_space    = 0; // for the size cap or the free-space reserve
+    uint64_t n_superseded     = 0; // replaced by a new entry that restores them (or >= 90% of them)
+    uint64_t evict_bytes      = 0; // all three
+};
+
 struct server_prompt_disk {
     // can_truncate: the model's memory can be rolled back to any position (no recurrent/SWA state), so a stored
     // prompt is reusable up to the common prefix; otherwise only up to the prompt's end or one of its checkpoints.
@@ -75,6 +104,10 @@ struct server_prompt_disk {
 
     size_t size() const;
     size_t count() const { return entries.size(); }
+    size_t limit() const { return limit_bytes; }
+
+    // find() is const (a lookup), and counts
+    mutable server_prompt_disk_stats stats;
 
 private:
     std::filesystem::path dir;

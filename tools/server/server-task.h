@@ -164,6 +164,9 @@ struct server_task {
 
     server_task_type type;
 
+    // when the task entered the queue (ggml_time_us), set by server_queue::post(); /stats derives the queue wait from it
+    int64_t t_posted_us = 0;
+
     // used by SERVER_TASK_TYPE_SLOT_SAVE, SERVER_TASK_TYPE_SLOT_RESTORE, SERVER_TASK_TYPE_SLOT_ERASE
     struct slot_action {
         int id_slot;
