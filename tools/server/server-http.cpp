@@ -6,6 +6,7 @@
 
 #include <cpp-httplib/httplib.h>
 
+#include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
@@ -203,14 +204,20 @@ bool server_http_context::init(const common_params & params) {
         return endpoints;
     }();
 
-    auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
+    // the statistics dashboard's files (--dash-path): public like the UI assets, they hold no data
+    const std::string dash_mount = params.dash_path.empty() ? std::string() : params.api_prefix + "/dash";
+    auto is_dash_path = [dash_mount](const std::string & path) {
+        return !dash_mount.empty() && (path == dash_mount || path.compare(0, dash_mount.size() + 1, dash_mount + "/") == 0);
+    };
+
+    auto middleware_validate_api_key = [api_keys = params.api_keys, is_dash_path](const httplib::Request & req, httplib::Response & res) {
         // If API key is not set, skip validation
         if (api_keys.empty()) {
             return true;
         }
 
         // If path is public or a UI asset, skip validation
-        if (get_public_endpoints.count(req.path)) {
+        if (get_public_endpoints.count(req.path) || is_dash_path(req.path)) {
             return true;
         }
 
@@ -250,9 +257,9 @@ bool server_http_context::init(const common_params & params) {
         return false;
     };
 
-    auto middleware_server_state = [this](const httplib::Request & req, httplib::Response & res) {
+    auto middleware_server_state = [this, is_dash_path](const httplib::Request & req, httplib::Response & res) {
         if (!is_ready.load()) {
-            if (frontend_paths.count(req.path)) {
+            if (frontend_paths.count(req.path) || is_dash_path(req.path)) {
                 return true; // frontend asset, allow it to load and show "loading"
             }
             // no endpoints are allowed to be accessed when the server is not ready
@@ -331,6 +338,12 @@ bool server_http_context::init(const common_params & params) {
     } else {
         // register static assets routes
         if (!params.public_path.empty()) {
+            // a mount point answers before any route: a dash/ under it would hide the dashboard and be served without the key
+            std::error_code ec;
+            if (!params.dash_path.empty() && std::filesystem::exists(std::filesystem::path(params.public_path) / "dash", ec)) {
+                SRV_ERR("%s/dash exists: it would shadow --dash-path at /dash/\n", params.public_path.c_str());
+                return false;
+            }
             // Set the base directory for serving static files
             if (const auto is_found = srv->set_mount_point(params.api_prefix + "/", params.public_path); !is_found) {
                 SRV_ERR("static assets path not found: %s\n", params.public_path.c_str());

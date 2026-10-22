@@ -3447,6 +3447,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_STATIC_PATH"));
     add_opt(common_arg(
+        {"--dash-path"}, "PATH",
+        "directory of the live statistics dashboard (index.html, css/, js/), served at /dash/ without an API key (the data "
+        "it reads, /stats and /stats/history, keeps the key and needs --metrics) (default: none, /dash/ is off)",
+        [](common_params & params, const std::string & value) {
+            params.dash_path = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DASH_PATH"));
+    add_opt(common_arg(
         {"--cors-origins"}, "ORIGINS",
         string_format(
             "comma-separated list of allowed origins for CORS (default: %s)\n"

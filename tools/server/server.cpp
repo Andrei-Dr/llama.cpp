@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-dash.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -249,6 +250,23 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/stats",                    ex_wrapper(routes.get_stats));
+    if (!params.dash_path.empty()) {
+        // the dashboard's static files, read by the HTTP thread (public, like the UI's assets: they hold no data)
+        if (is_router_server) {
+            SRV_WRN("%s", "--dash-path is ignored in router mode (the statistics are the model instances')\n");
+        } else {
+            std::shared_ptr<const server_dash_assets> dash;
+            try {
+                dash = std::make_shared<const server_dash_assets>(params.dash_path);
+            } catch (const std::exception & e) {
+                SRV_ERR("%s\n", e.what());
+                return 1;
+            }
+            ctx_http.get("/dash",                  ex_wrapper(server_dash_redirect(params.api_prefix)));
+            ctx_http.get("/dash/(.*)",             ex_wrapper(server_dash_handler(dash, params.api_prefix)));
+            SRV_INF("dashboard: %s at %s/dash/\n", params.dash_path.c_str(), params.api_prefix.c_str());
+        }
+    }
     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));
     ctx_http.post("/props",                    ex_wrapper(routes.post_props));
     ctx_http.get ("/models",                   ex_wrapper(routes.get_models));
