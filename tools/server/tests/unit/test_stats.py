@@ -1,4 +1,4 @@
-import time
+import json, time
 
 import pytest
 from utils import *
@@ -250,3 +250,79 @@ def test_stats_disk_idle_save_is_published(tmp_path):
     s = wait_stats(lambda s: (s.get("disk_cache") or {}).get("save", 0) >= 1, timeout_s=10.0)
     assert s["disk_cache"]["save"] == 1
     assert s["disk_cache"]["entries"] == 1
+
+
+def _run_slots_sequence() -> tuple[list, str]:
+    server.server_slots = True
+    server.start()
+    complete("Once upon a time", 12)
+    complete("Once upon a time there was", 9)
+    time.sleep(0.3)
+    slots = server.make_request("GET", "/slots")
+    metrics = server.make_request("GET", "/metrics")
+    assert slots.status_code == 200 and metrics.status_code == 200
+    server.stop()
+    return slots.body, metrics.body
+
+
+def _metric_values(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        if line and not line.startswith("#"):
+            k, v = line.rsplit(" ", 1)
+            out[k] = float(v)
+    return out
+
+
+def test_slots_and_metrics_from_snapshot_match_the_task_path():
+    # same deterministic sequence twice: published snapshot (default) vs the upstream task path (snapshots off)
+    snap_slots, snap_metrics = _run_slots_sequence()
+    os.environ["LLAMA_SERVER_STATS_MS"] = "0"
+    try:
+        task_slots, task_metrics = _run_slots_sequence()
+    finally:
+        del os.environ["LLAMA_SERVER_STATS_MS"]
+    assert snap_slots == task_slots
+    a, b = _metric_values(snap_metrics), _metric_values(task_metrics)
+    assert a.keys() == b.keys()
+    assert [l for l in snap_metrics.splitlines() if l.startswith("#")] == [l for l in task_metrics.splitlines() if l.startswith("#")]
+    for k in ("llamacpp:prompt_tokens_total", "llamacpp:tokens_predicted_total", "llamacpp:prompt_tokens_cached_total",
+              "llamacpp:n_decode_total", "llamacpp:requests_processing", "llamacpp:requests_deferred"):
+        assert a[k] == b[k], k
+
+
+def test_metrics_rate_window_resets_per_scrape():
+    server.start()
+    complete("Once upon a time", 16)
+    time.sleep(0.3)
+    first = _metric_values(server.make_request("GET", "/metrics").body)
+    second = _metric_values(server.make_request("GET", "/metrics").body)
+    assert first["llamacpp:predicted_tokens_seconds"] > 0
+    assert second["llamacpp:predicted_tokens_seconds"] == 0, "nothing generated since the previous scrape"
+    assert second["llamacpp:tokens_predicted_total"] == first["llamacpp:tokens_predicted_total"]
+    complete("Once upon a time", 16)
+    time.sleep(0.3)
+    third = _metric_values(server.make_request("GET", "/metrics").body)
+    assert third["llamacpp:predicted_tokens_seconds"] > 0
+
+
+def test_slots_shows_a_running_task():
+    server.server_slots = True
+    server.n_predict = 200
+    server.start()
+    import threading
+    t = threading.Thread(target=lambda: complete("Once upon a time", 200))
+    t.start()
+    seen = False
+    deadline = time.time() + 10
+    while time.time() < deadline and t.is_alive():
+        rows = server.make_request("GET", "/slots").body
+        if rows[0]["is_processing"]:
+            seen = True
+            break
+        time.sleep(0.005)
+    t.join()
+    assert seen
+    time.sleep(0.3)
+    assert server.make_request("GET", "/slots").body[0]["is_processing"] is False
+    assert server.make_request("GET", "/slots?fail_on_no_slot=1").status_code == 200

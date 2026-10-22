@@ -246,6 +246,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         worker.yielding = true;
     }
     worker.cv.notify_one();
+    t_blocking_since = 0; // the worker answers tasks meanwhile
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -273,6 +274,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
         // make sure to avoid idle timeout here
         time_last_task = ggml_time_ms();
+        t_blocking_since = ggml_time_us();
 
         // an exception from work() takes precedence over the one from the worker
         if (!exception) {
@@ -312,6 +314,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     };
 
     while (true) {
+        t_blocking_since = ggml_time_us();
         QUE_DBG("%s", "processing new tasks\n");
         if (process_new_tasks(false)) {
             break; // terminate
@@ -332,6 +335,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
+        t_blocking_since = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
@@ -342,6 +346,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
+                a_sleeping = true;
                 // Call order cb0 -> cb1 -> cb{N}
                 for (auto & cb : callback_sleeping_state) {
                     cb(true);
@@ -361,6 +366,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     callback_sleeping_state[i - 1](false);
                 }
                 sleeping = false;
+                a_sleeping = false;
                 time_last_task = ggml_time_ms();
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks

@@ -100,7 +100,7 @@ struct server_stats_task {
 struct server_stats_slot {
     int         id      = -1;
     int         id_task = -1;
-    std::string state;                  // "idle", "waiting", "started", "prompt", "generating"
+    const char * state = "idle";        // "idle", "waiting", "started", "prompt", "generating" (static strings)
     int32_t     n_prompt           = 0;
     int32_t     n_prompt_cached    = 0;
     int32_t     n_prompt_processed = 0;
@@ -117,6 +117,41 @@ struct server_stats_slot {
     json to_json() const;
 };
 
+// one GET /slots row: what server_slot::to_json() writes, captured as values so a snapshot copies no JSON.
+// server_slot_row_json() is the one serializer for the task path and the snapshot path, so both answer byte for byte alike
+struct server_slot_row {
+    int      id            = -1;
+    int32_t  n_ctx         = 0;
+    bool     speculative   = false;
+    bool     is_processing = false;
+    bool     has_task      = false; // the slot ran a task (current or previous): the task fields below are set
+    int      id_task       = -1;
+    int32_t  n_prompt_tokens = 0;
+    uint64_t n_prompt_tokens_processed = 0;
+    uint64_t n_prompt_tokens_cache     = 0;
+    std::shared_ptr<const json> params;  // the task's params.to_json(only_metrics); built once per task
+    bool     has_next_token = false;
+    bool     has_new_line   = false;
+    int32_t  n_remain       = 0;
+    uint64_t n_decoded      = 0;
+};
+
+json server_slot_row_json(const server_slot_row & r);
+
+// what changes only when a task completes: rebuilt then and shared by every snapshot until the next completion
+struct server_stats_done {
+    server_stats_hist h_ttft_ms;
+    server_stats_hist h_gen_ms_per_tok;
+    server_stats_hist h_accept;
+
+    uint64_t n_tasks     = 0;
+    uint64_t n_truncated = 0;
+    std::map<std::string, uint64_t> n_stop; // by stop reason
+    std::map<std::string, uint64_t> n_sel;  // completed tasks by slot selection ("id", "lcp", "lru", "cache_update", "disk_restored")
+
+    std::vector<server_stats_task> tasks;   // completed, oldest first
+};
+
 struct server_stats_snapshot {
     uint64_t seq        = 0;            // publishes so far
     int64_t  t_us       = 0;            // ggml_time_us at publish
@@ -124,8 +159,14 @@ struct server_stats_snapshot {
 
     // upstream's cumulative counters (server_metrics); its *_bucket members are /metrics' scrape windows, unused here
     server_metrics metrics;
-    int32_t        n_slots    = 0;
-    int32_t        n_deferred = 0; // tasks waiting for a slot
+    int32_t        n_slots      = 0;
+    int32_t        n_deferred   = 0; // tasks waiting for a slot
+    int32_t        n_processing = 0; // slots processing a task
+
+    // GET /slots served from the snapshot (rows serialized by the HTTP thread); false = not captured (/slots off, or
+    // LLAMA_SERVER_SLOTS_DEBUG, whose rows carry the detokenized prompt)
+    bool                         has_slot_rows = false;
+    std::vector<server_slot_row> slot_rows;
 
     // decode wall time of one target batch with output (llama_decode + synchronize), by kind: gen = no prompt tokens.
     // prompt: only the synchronized (last) batch of a prompt is timed, and it can include earlier unsynchronized batches
@@ -133,19 +174,10 @@ struct server_stats_snapshot {
     server_stats_timer decode_prompt;
     // one main-loop iteration that only generated (drafting, decode, sampling, speculative accept): the decode step
     server_stats_timer step_gen;
-
-    server_stats_hist h_ttft_ms;
-    server_stats_hist h_gen_ms_per_tok;
-    server_stats_hist h_accept;
-    server_stats_hist h_step_ms;
-
-    uint64_t n_tasks     = 0;
-    uint64_t n_truncated = 0;
-    std::map<std::string, uint64_t> n_stop; // by stop reason
-    std::map<std::string, uint64_t> n_sel;  // completed tasks by slot selection ("id", "lcp", "lru", "cache_update", "disk_restored")
+    server_stats_hist  h_step_ms;
 
     std::vector<server_stats_slot> slots;
-    std::shared_ptr<const std::vector<server_stats_task>> tasks; // completed, oldest first
+    std::shared_ptr<const server_stats_done> done; // never null in a published snapshot
 
     // the prompt cache disk tier (--cache-disk), when there is one
     bool                     has_disk     = false;
@@ -175,6 +207,9 @@ public:
     // the working copy the hooks update; published by publish()
     server_stats_snapshot & cur() { return w; }
 
+    // the per-completion part (histograms, counters, the ring): changing it marks it for the next publish
+    server_stats_done & done() { done_dirty = true; return d; }
+
     // a completed task: the ring, the histograms and the counters
     void add_task(server_stats_task && t);
 
@@ -182,7 +217,8 @@ public:
     bool due(int64_t t_now_us) const;
 
     // fill (may be null) writes the volatile fields (metrics, slots) into the working copy, which is then copied into a
-    // new immutable snapshot and swapped in. The whole call is timed and reported by the next snapshot.
+    // new immutable snapshot and swapped in; the per-completion part is copied only when it changed. The whole call is
+    // timed and reported by the next snapshot.
     void publish(int64_t t_now_us, const std::function<void(server_stats_snapshot &)> & fill);
 
     int64_t period() const { return period_us; }
@@ -195,8 +231,9 @@ private:
     const int64_t period_us;
 
     server_stats_snapshot         w;
+    server_stats_done             d;  // tasks unused: the ring below is copied in at publish
     std::deque<server_stats_task> ring;
-    bool                          ring_dirty = true;
+    bool                          done_dirty = true;
     int64_t                       t_last_publish_us = 0;
     bool                          published = false;
 

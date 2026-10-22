@@ -699,37 +699,38 @@ struct server_slot {
         common_speculative_print_stats(spec);
     }
 
-    json to_json(bool only_metrics = false) const {
-        json res;
-
-        res = {
-            {"id",            id},
-            {"n_ctx",         n_ctx},
-            {"speculative",   can_speculate()},
-            {"is_processing", is_processing()},
-        };
+    // the GET /slots row as values (server_slot_row_json() writes it); params: the task's params.to_json(), shared
+    server_slot_row row(std::shared_ptr<const json> params) const {
+        server_slot_row r;
+        r.id            = id;
+        r.n_ctx         = n_ctx;
+        r.speculative   = can_speculate();
+        r.is_processing = is_processing();
 
         const auto & ptask = task ? task : task_prev;
-
         if (ptask) {
-            res["id_task"] = ptask->id;
-            res["n_prompt_tokens"]           = (int32_t) prompt.tokens.size();
-            res["n_prompt_tokens_processed"] = stats.n_prompt_processed;
-            res["n_prompt_tokens_cache"]     = stats.n_prompt_cached;
-            res["params"] = ptask->params.to_json(only_metrics);
-            res["next_token"] = json::array({
-                {
-                    {"has_next_token", has_next_token},
-                    {"has_new_line",   has_new_line},
-                    {"n_remain",       n_remaining()},
-                    {"n_decoded",      stats.n_gen},
-                }
-            });
+            r.has_task                  = true;
+            r.id_task                   = ptask->id;
+            r.n_prompt_tokens           = (int32_t) prompt.tokens.size();
+            r.n_prompt_tokens_processed = stats.n_prompt_processed;
+            r.n_prompt_tokens_cache     = stats.n_prompt_cached;
+            r.params                    = std::move(params);
+            r.has_next_token            = has_next_token;
+            r.has_new_line              = has_new_line;
+            r.n_remain                  = n_remaining();
+            r.n_decoded                 = stats.n_gen;
+        }
+        return r;
+    }
 
-            if (!only_metrics) {
-                res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
-                res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
-            }
+    json to_json(bool only_metrics = false) const {
+        const auto & ptask = task ? task : task_prev;
+
+        json res = server_slot_row_json(row(ptask ? std::make_shared<const json>(ptask->params.to_json(only_metrics)) : nullptr));
+
+        if (ptask && !only_metrics) {
+            res["prompt"] = ptask->tokens.detokenize(ctx_tgt, true);
+            res["generated"] = generated_text.empty() ? debug_generated_text : generated_text;
         }
 
         return res;
@@ -880,7 +881,31 @@ public:
         }
     }
 
+    // /slots and /metrics from the HTTP thread: the latest snapshot when it describes the server now, else nullptr (the
+    // caller then posts the upstream task). Current = the loop thread is waiting for tasks, or yielding while a decode runs
+    // (the task would then be answered by the worker from the same state), or has been working without yielding for less
+    // than LLAMA_SERVER_READ_STALE_MS (default 500); and no slot is being prepared (prompt cache swap) and the model is
+    // loaded. A long stretch without yielding (a restore, a big save) keeps upstream's behavior: the read waits for it.
+    std::shared_ptr<const server_stats_snapshot> read_snapshot() const {
+        static const int64_t stale_us = [] {
+            const char * e = getenv("LLAMA_SERVER_READ_STALE_MS");
+            return (e ? std::max(0, atoi(e)) : 500) * 1000LL;
+        }();
+        if (!stats_slots_valid || stats_slot_prep || queue_tasks.sleeping_now()) {
+            return nullptr;
+        }
+        const int64_t since = queue_tasks.blocking_since_us();
+        if (since != 0 && ggml_time_us() - since > stale_us) {
+            return nullptr;
+        }
+        return stats_plane.latest();
+    }
+
     // GET /stats from the HTTP thread: the latest published snapshot (thread-safe, takes no lock of the main loop)
+    std::shared_ptr<const server_stats_snapshot> stats_snapshot() const {
+        return stats_plane.latest();
+    }
+
     json stats_json(int max_tasks) const {
         const auto s = stats_plane.latest();
         json j = s ? s->to_json(max_tasks) : json { { "schema", 1 }, { "seq", 0 } };
@@ -956,6 +981,15 @@ private:
     // LLAMA_SERVER_STATS_MS (default 250 ms, 0 = off), read by the HTTP thread without a task
     server_stats stats_plane { 128, stats_period_us_from_env() };
     bool stats_dirty       = false; // recorded since the last publish
+    bool stats_force       = false; // a slot changed state (task launched, released, saved, restored): publish now
+    std::atomic<bool> stats_slots_valid{false}; // the snapshot's slot rows describe the loaded model (false across sleep)
+    struct stats_params_entry {
+        const server_task * task = nullptr; // the task whose params are cached (a task is never mutated once on a slot);
+        int                 id   = -1;      // with its id: a freed task's address can come back for another task
+        std::shared_ptr<const json> params;
+    };
+    std::vector<stats_params_entry> stats_params_cache; // per slot, for the /slots rows
+    std::atomic<bool> stats_slot_prep{false};   // get_available_slot() is updating the prompt cache: rows are about to change
     bool stats_iter_prompt = false; // this main-loop iteration decoded prompt tokens
     bool stats_iter_gen    = false; // ... generated tokens
 
@@ -1002,6 +1036,8 @@ private:
             }
             SRV_INF("%s", "server is entering sleeping state\n");
             destroy();
+            stats_slots_valid = false; // the slots go with the model; /slots takes the task path until the next publish
+            stats_params_cache.clear();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -1474,7 +1510,29 @@ private:
 
         // wiring up server queues
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
-            return process_single_task(std::move(task), is_yielding);
+            // a launch, cancel, save, restore or erase changes what /slots shows: publish before the next decode. Not the
+            // NEXT_RESPONSE task update_slots() posts at every step, nor reads or lora queries (rate-limited publishes)
+            bool changes_slots = false;
+            switch (task.type) {
+                case SERVER_TASK_TYPE_COMPLETION:
+                case SERVER_TASK_TYPE_EMBEDDING:
+                case SERVER_TASK_TYPE_RERANK:
+                case SERVER_TASK_TYPE_INFILL:
+                case SERVER_TASK_TYPE_CANCEL:
+                case SERVER_TASK_TYPE_SLOT_SAVE:
+                case SERVER_TASK_TYPE_SLOT_RESTORE:
+                case SERVER_TASK_TYPE_SLOT_ERASE:
+                    changes_slots = true;
+                    break;
+                default:
+                    break;
+            }
+            const bool done = process_single_task(std::move(task), is_yielding);
+            if (!is_yielding && changes_slots) {
+                stats_force = true;
+                stats_publish(ggml_time_us());
+            }
+            return done;
         });
         queue_tasks.on_update_slots([this]() {
             const int64_t t_iter = ggml_time_us();
@@ -1745,6 +1803,12 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const uint64_t n_restore0 = prompt_disk ? prompt_disk->stats.n_restore : 0;
+                // seconds with a disk restore: /slots readers wait for it, as with the task path
+                struct slot_prep_flag {
+                    std::atomic<bool> & f;
+                    explicit slot_prep_flag(std::atomic<bool> & f) : f(f) { f = true; }
+                    ~slot_prep_flag() { f = false; }
+                } prep { stats_slot_prep };
 
                 const int64_t t_start = ggml_time_us();
 
@@ -4261,6 +4325,7 @@ private:
         metrics_queue_prompt(n_prompt_tokens);
 
         stats_on_decode(n_prompt_tokens, n_tokens, t_synced);
+        stats_publish(t_synced > 0 ? t_synced : ggml_time_us()); // a long prompt runs many decodes in one iteration
 
         if (has_output) {
             // the context is already synchronized, so the timings are correct
@@ -4365,7 +4430,7 @@ private:
         t.n_graphs_reused     = llama_perf_context(ctx_tgt).n_reused;
         if (slot.sel.id_task == t.id) { // a child task launched on a free slot has no selection of its own
             t.sel = slot.sel;
-            auto & s = stats_plane.cur();
+            auto & s = stats_plane.done();
             s.n_sel[t.sel.how]++;
             if (t.sel.cache_update) {
                 s.n_sel["cache_update"]++;
@@ -4422,10 +4487,10 @@ private:
     }
 
     void stats_publish(int64_t t_now) {
-        if (!params_base.endpoint_metrics || stats_plane.period() <= 0) {
+        if (!(params_base.endpoint_metrics || params_base.endpoint_slots) || stats_plane.period() <= 0) {
             return;
         }
-        bool due = stats_plane.due(t_now);
+        bool due = stats_force || stats_plane.due(t_now);
         if (!due && stats_dirty) {
             due = std::none_of(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); });
         }
@@ -4443,8 +4508,28 @@ private:
                 s.disk_bytes   = prompt_disk->size();
                 s.disk_limit   = prompt_disk->limit();
             }
-            s.n_slots    = (int32_t) slots.size();
-            s.n_deferred = (int32_t) queue_tasks.queue_tasks_deferred_size();
+            s.n_slots      = (int32_t) slots.size();
+            s.n_deferred   = (int32_t) queue_tasks.queue_tasks_deferred_size();
+            s.n_processing = (int32_t) std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.is_processing(); });
+            // /slots rows, as SLOT_GET builds them; not with LLAMA_SERVER_SLOTS_DEBUG (rows carry the detokenized prompt)
+            // /slots rows as values (the HTTP thread serializes them); a task's params do not change while it runs, so
+            // they are serialized once per task. Not with LLAMA_SERVER_SLOTS_DEBUG (its rows carry the prompt text)
+            s.has_slot_rows = params_base.endpoint_slots && slots_debug == 0;
+            s.slot_rows.resize(s.has_slot_rows ? slots.size() : 0);
+            if (s.has_slot_rows) {
+                stats_params_cache.resize(slots.size());
+                for (size_t i = 0; i < slots.size(); ++i) {
+                    const server_slot & slot  = slots[i];
+                    const server_task * ptask = slot.task ? slot.task.get() : slot.task_prev.get();
+                    auto & pc = stats_params_cache[i];
+                    if (ptask && (pc.task != ptask || pc.id != ptask->id)) {
+                        pc.task   = ptask;
+                        pc.id     = ptask->id;
+                        pc.params = std::make_shared<const json>(ptask->params.to_json(true));
+                    }
+                    s.slot_rows[i] = slot.row(ptask ? pc.params : nullptr);
+                }
+            }
             s.slots.resize(slots.size());
             for (size_t i = 0; i < slots.size(); ++i) {
                 const server_slot       & slot = slots[i];
@@ -4469,6 +4554,8 @@ private:
             }
         });
         stats_dirty = false;
+        stats_force = false;
+        stats_slots_valid = true;
     }
 };
 
@@ -4993,6 +5080,36 @@ void server_routes::init_routes() {
             return res;
         }
 
+        // from the published snapshot: no task on the main loop. The rate gauges keep their meaning (throughput since the
+        // previous scrape, every scraper sharing one window as before): the window is the counters' delta since the last scrape
+        if (const auto snap = ctx_server.stats_snapshot()) {
+            server_task_result_metrics tmp;
+            tmp.metrics            = snap->metrics;
+            tmp.n_processing_slots = snap->n_processing;
+            tmp.n_tasks_deferred   = snap->n_deferred;
+            {
+                std::lock_guard<std::mutex> lock(mutex_scrape); // HTTP threads only
+                const bool same = scrape_base.t_start == snap->metrics.t_start;
+                auto window = [&](const server_metrics::bucket & now, const server_metrics::bucket & base) {
+                    server_metrics::bucket b;
+                    if (same && now.count >= base.count && now.steps >= base.steps && now.time >= base.time) {
+                        b.add(now.count - base.count, now.steps - base.steps, now.time - base.time);
+                    } else {
+                        b = now;
+                    }
+                    return b;
+                };
+                tmp.metrics.prompt_bucket  = window(snap->metrics.prompt,  scrape_base.prompt);
+                tmp.metrics.predict_bucket = window(snap->metrics.predict, scrape_base.predict);
+                scrape_base = snap->metrics;
+            }
+            res->headers["Process-Start-Time-Unix"] = std::to_string(snap->metrics.t_start);
+            res->content_type = "text/plain; version=0.0.4";
+            res->status = 200;
+            res->data = tmp.to_metrics();
+            return res;
+        }
+
         // render response using cached_metrics
         auto use_cached_metrics = [&]() {
             std::unique_lock<std::mutex> lock(mutex_cache);
@@ -5077,6 +5194,19 @@ void server_routes::init_routes() {
         if (!params.endpoint_slots) {
             res->error(format_error_response("This server does not support slots endpoint. Start it with `--slots`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
+        }
+
+        // the published snapshot holds the same rows SLOT_GET builds; ?fail_on_no_slot asks for an admission-time answer
+        if (req.get_param("fail_on_no_slot").empty()) {
+            const auto snap = ctx_server.read_snapshot();
+            if (snap && snap->has_slot_rows) {
+                json rows = json::array();
+                for (const server_slot_row & r : snap->slot_rows) {
+                    rows.push_back(server_slot_row_json(r));
+                }
+                res->ok(rows);
+                return res;
+            }
         }
 
         // request slots data using task queue

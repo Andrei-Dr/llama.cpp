@@ -182,6 +182,10 @@ private:
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
+    // /metrics from the stats snapshot: the counters at the previous scrape (the rate gauges' window)
+    std::mutex     mutex_scrape;
+    server_metrics scrape_base;
+
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;
     json           cached_models  = nullptr;

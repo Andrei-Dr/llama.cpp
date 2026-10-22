@@ -72,12 +72,12 @@ static void test_ring(testing & t) {
 
     auto s = st.latest();
     t.assert_true("published", s != nullptr);
-    t.assert_equal("the ring keeps the last n_ring tasks", (size_t) 3, s->tasks->size());
-    t.assert_equal("oldest first", 2, s->tasks->front().id);
-    t.assert_equal(4, s->tasks->back().id);
-    t.assert_equal("counters cover every task, not only the ring", (uint64_t) 5, s->n_tasks);
-    t.assert_equal((uint64_t) 5, s->h_ttft_ms.n);
-    t.assert_equal("stop reasons", (uint64_t) 5, s->n_stop.at("eos"));
+    t.assert_equal("the ring keeps the last n_ring tasks", (size_t) 3, s->done->tasks.size());
+    t.assert_equal("oldest first", 2, s->done->tasks.front().id);
+    t.assert_equal(4, s->done->tasks.back().id);
+    t.assert_equal("counters cover every task, not only the ring", (uint64_t) 5, s->done->n_tasks);
+    t.assert_equal((uint64_t) 5, s->done->h_ttft_ms.n);
+    t.assert_equal("stop reasons", (uint64_t) 5, s->done->n_stop.at("eos"));
 }
 
 static void test_task_derived(testing & t) {
@@ -99,8 +99,8 @@ static void test_task_derived(testing & t) {
     server_stats st(4, 1);
     st.add_task(server_stats_task(b));
     st.publish(10, nullptr);
-    t.assert_equal("an unmeasured rate stays out of its histogram", (uint64_t) 0, st.latest()->h_gen_ms_per_tok.n);
-    t.assert_equal((uint64_t) 0, st.latest()->h_accept.n);
+    t.assert_equal("an unmeasured rate stays out of its histogram", (uint64_t) 0, st.latest()->done->h_gen_ms_per_tok.n);
+    t.assert_equal((uint64_t) 0, st.latest()->done->h_accept.n);
 }
 
 static void test_publish_period(testing & t) {
@@ -137,11 +137,45 @@ static void test_snapshot_immutable(testing & t) {
 
     t.assert_true("a new snapshot", first.get() != second.get());
     t.assert_equal("a reader's snapshot never changes under it", std::string("generating"), first->slots[0].state);
-    t.assert_equal((size_t) 1, first->tasks->size());
+    t.assert_equal((size_t) 1, first->done->tasks.size());
     t.assert_equal(std::string("idle"), second->slots[0].state);
-    t.assert_equal((size_t) 2, second->tasks->size());
+    t.assert_equal((size_t) 2, second->done->tasks.size());
     t.assert_equal((uint64_t) 2, second->seq);
     t.assert_equal("the publish cost of the first snapshot is in the second", (uint64_t) 1, second->publish.n);
+}
+
+static void test_done_shared(testing & t) {
+    server_stats st(4, 1);
+    st.add_task(make_task(1, 1.0, 10.0, 100.0, 11, 0, 0));
+    st.publish(10, nullptr);
+    const auto a = st.latest();
+    st.cur().step_gen.add(1000);
+    st.publish(20, nullptr);
+    const auto b = st.latest();
+    t.assert_true("no task completed: the per-completion part is shared, not copied", a->done.get() == b->done.get());
+    t.assert_equal((uint64_t) 1, b->step_gen.n);
+    st.add_task(make_task(2, 1.0, 10.0, 100.0, 11, 0, 0));
+    st.publish(30, nullptr);
+    t.assert_true("a completion publishes a new one", st.latest()->done.get() != b->done.get());
+    t.assert_equal((size_t) 1, a->done->tasks.size());
+}
+
+static void test_slot_row_json(testing & t) {
+    server_slot_row r;
+    r.id = 3; r.n_ctx = 4096; r.is_processing = true;
+    json j = server_slot_row_json(r);
+    t.assert_equal("no task: four keys", (size_t) 4, j.size());
+    r.has_task = true; r.id_task = 9; r.n_remain = -1; r.n_decoded = 5;
+    r.params = std::make_shared<const json>(json { { "seed", 42 } });
+    j = server_slot_row_json(r);
+    std::vector<std::string> keys;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        keys.push_back(it.key());
+    }
+    t.assert_equal("upstream's key order", std::string("id,n_ctx,speculative,is_processing,id_task,n_prompt_tokens,n_prompt_tokens_processed,n_prompt_tokens_cache,params,next_token"),
+                   [&] { std::string s; for (auto & k : keys) { s += (s.empty() ? "" : ",") + k; } return s; }());
+    t.assert_equal(42, j.at("params").at("seed").get<int>());
+    t.assert_equal((uint64_t) 5, j.at("next_token").at(0).at("n_decoded").get<uint64_t>());
 }
 
 static void test_json_shape(testing & t) {
@@ -151,7 +185,7 @@ static void test_json_shape(testing & t) {
     task.sel.how  = "lcp";
     task.sel.f_sim = 0.9f;
     st.add_task(std::move(task));
-    st.cur().n_sel["lcp"]++;
+    st.done().n_sel["lcp"]++;
     st.publish(10, nullptr);
 
     const json j = st.latest()->to_json();
@@ -182,6 +216,8 @@ int main(int argc, char ** argv) {
     t.test("publish_period",     test_publish_period);
     t.test("snapshot_immutable", test_snapshot_immutable);
     t.test("json_shape",         test_json_shape);
+    t.test("done_shared",        test_done_shared);
+    t.test("slot_row_json",      test_slot_row_json);
 
     return t.summary();
 }

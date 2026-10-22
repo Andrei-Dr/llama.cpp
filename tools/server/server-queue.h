@@ -41,6 +41,9 @@ private:
     };
     worker_t worker;
 
+    std::atomic<int64_t> t_blocking_since{0}; // blocking_since_us()
+    std::atomic<bool>    a_sleeping{false};   // sleeping_now()
+
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
@@ -74,6 +77,12 @@ public:
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
     }
+
+    // for readers that answer from a published snapshot instead of posting a task (/slots, /metrics), lock-free: since
+    // when the loop thread has been working without yielding to the queue (0 = waiting for tasks, or yielding while a
+    // decode runs), and whether the server sleeps
+    int64_t blocking_since_us() const { return t_blocking_since.load(std::memory_order_relaxed); }
+    bool    sleeping_now()      const { return a_sleeping.load(std::memory_order_relaxed); }
 
     // end the start_loop routine
     void terminate();

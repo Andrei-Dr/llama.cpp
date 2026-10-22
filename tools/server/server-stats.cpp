@@ -123,7 +123,7 @@ json server_stats_slot::to_json() const {
     return json {
         { "id",                 id                 },
         { "id_task",            id_task            },
-        { "state",              state              },
+        { "state",              std::string(state) },
         { "n_prompt",           n_prompt           },
         { "n_prompt_cached",    n_prompt_cached    },
         { "n_prompt_processed", n_prompt_processed },
@@ -176,12 +176,14 @@ json server_stats_snapshot::to_json(int max_tasks) const {
     for (const auto & s : slots) {
         slots_j.push_back(s.to_json());
     }
+    static const server_stats_done none;
+    const server_stats_done & dn = done ? *done : none;
     json tasks_j = json::array();
-    if (tasks) {
-        const size_t n     = tasks->size();
+    {
+        const size_t n     = dn.tasks.size();
         const size_t first = max_tasks < 0 || (size_t) max_tasks >= n ? 0 : n - (size_t) max_tasks;
         for (size_t i = first; i < n; ++i) {
-            tasks_j.push_back((*tasks)[i].to_json());
+            tasks_j.push_back(dn.tasks[i].to_json());
         }
     }
 
@@ -207,9 +209,9 @@ json server_stats_snapshot::to_json(int max_tasks) const {
             { "draft_accepted",       m.n_draft_accepted    },
             { "draft_verif_steps",    m.n_draft_verif_steps },
             { "accepted_per_pos",     m.n_accepted_per_pos  },
-            { "tasks",                n_tasks               },
-            { "truncated",            n_truncated           },
-            { "stop",                 counts_to_json(n_stop) },
+            { "tasks",                dn.n_tasks            },
+            { "truncated",            dn.n_truncated        },
+            { "stop",                 counts_to_json(dn.n_stop) },
         }},
         { "decode", {
             { "gen",      decode_gen.to_json()    },
@@ -217,17 +219,42 @@ json server_stats_snapshot::to_json(int max_tasks) const {
             { "step_gen", step_gen.to_json()      },
         }},
         { "hist", {
-            { "ttft_ms",          h_ttft_ms.to_json()        },
-            { "gen_ms_per_token", h_gen_ms_per_tok.to_json() },
-            { "accept",           h_accept.to_json()         },
+            { "ttft_ms",          dn.h_ttft_ms.to_json()        },
+            { "gen_ms_per_token", dn.h_gen_ms_per_tok.to_json() },
+            { "accept",           dn.h_accept.to_json()         },
             { "step_ms",          h_step_ms.to_json()        },
         }},
-        { "selection",  counts_to_json(n_sel) },
+        { "selection",  counts_to_json(dn.n_sel) },
         { "slots",      slots_j           },
         { "tasks",      tasks_j           },
         { "disk_cache", has_disk ? disk_json() : json(nullptr) },
         { "publish",    publish.to_json() },
     };
+}
+
+json server_slot_row_json(const server_slot_row & r) {
+    json res = {
+        {"id",            r.id},
+        {"n_ctx",         r.n_ctx},
+        {"speculative",   r.speculative},
+        {"is_processing", r.is_processing},
+    };
+    if (r.has_task) {
+        res["id_task"] = r.id_task;
+        res["n_prompt_tokens"]           = r.n_prompt_tokens;
+        res["n_prompt_tokens_processed"] = r.n_prompt_tokens_processed;
+        res["n_prompt_tokens_cache"]     = r.n_prompt_tokens_cache;
+        res["params"] = r.params ? *r.params : json();
+        res["next_token"] = json::array({
+            {
+                {"has_next_token", r.has_next_token},
+                {"has_new_line",   r.has_new_line},
+                {"n_remain",       r.n_remain},
+                {"n_decoded",      r.n_decoded},
+            }
+        });
+    }
+    return res;
 }
 
 json server_stats_moe_cache_json() {
@@ -304,25 +331,25 @@ json server_stats_moe_cache_json() {
 }
 
 server_stats::server_stats(size_t n_ring, int64_t period_us) : n_ring(std::max<size_t>(1, n_ring)), period_us(period_us) {
-    w.h_ttft_ms        = server_stats_hist(k_edges_ttft_ms);
-    w.h_gen_ms_per_tok = server_stats_hist(k_edges_ms_per_tk);
-    w.h_accept         = server_stats_hist(k_edges_accept);
+    d.h_ttft_ms        = server_stats_hist(k_edges_ttft_ms);
+    d.h_gen_ms_per_tok = server_stats_hist(k_edges_ms_per_tk);
+    d.h_accept         = server_stats_hist(k_edges_accept);
     w.h_step_ms        = server_stats_hist(k_edges_step_ms);
 }
 
 void server_stats::add_task(server_stats_task && t) {
-    w.n_tasks++;
-    w.n_truncated += t.truncated ? 1 : 0;
-    w.n_stop[t.stop]++;
-    w.h_ttft_ms.add(t.ttft_ms());
-    w.h_gen_ms_per_tok.add(t.gen_ms_per_token());
-    w.h_accept.add(t.accept_rate());
+    d.n_tasks++;
+    d.n_truncated += t.truncated ? 1 : 0;
+    d.n_stop[t.stop]++;
+    d.h_ttft_ms.add(t.ttft_ms());
+    d.h_gen_ms_per_tok.add(t.gen_ms_per_token());
+    d.h_accept.add(t.accept_rate());
 
     ring.push_back(std::move(t));
     while (ring.size() > n_ring) {
         ring.pop_front();
     }
-    ring_dirty = true;
+    done_dirty = true;
 }
 
 bool server_stats::due(int64_t t_now_us) const {
@@ -338,9 +365,11 @@ void server_stats::publish(int64_t t_now_us, const std::function<void(server_sta
     if (fill) {
         fill(w);
     }
-    if (ring_dirty || !w.tasks) {
-        w.tasks    = std::make_shared<const std::vector<server_stats_task>>(ring.begin(), ring.end());
-        ring_dirty = false;
+    if (done_dirty || !w.done) {
+        auto nd = std::make_shared<server_stats_done>(d);
+        nd->tasks.assign(ring.begin(), ring.end());
+        w.done     = std::move(nd);
+        done_dirty = false;
     }
     w.seq++;
     w.t_us = t_now_us;
