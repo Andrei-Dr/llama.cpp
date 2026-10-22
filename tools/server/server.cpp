@@ -250,6 +250,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
     ctx_http.get ("/stats",                    ex_wrapper(routes.get_stats));
+    ctx_http.get ("/stats/history",            ex_wrapper(routes.get_stats_history));
     if (!params.dash_path.empty()) {
         // the dashboard's static files, read by the HTTP thread (public, like the UI's assets: they hold no data)
         if (is_router_server) {

@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-sampler.h"
 #include "server-stats.h"
 #include "server-stream.h"
 
@@ -874,6 +875,7 @@ public:
     }
 
     ~server_context_impl() {
+        sampler.reset(); // its thread reads the stats plane
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -912,7 +914,18 @@ public:
         // the serve time, same clock as t_us: an idle server publishes nothing, so t_us can be old
         j["t_serve_us"] = ggml_time_us();
         j["moe_cache"] = server_stats_moe_cache_json();
+        const auto m = sampler ? sampler->latest() : nullptr;
+        j["machine"] = m ? m->to_json() : json(nullptr);
         return j;
+    }
+
+    // GET /stats/history from the HTTP thread: the sampler's latest published rows; nullptr with the sampler off
+    std::shared_ptr<const server_stats_history::view> stats_history() const {
+        return sampler ? sampler->history() : nullptr;
+    }
+
+    int64_t stats_sample_period_us() const {
+        return sampler ? sampler->period() : 0;
     }
 
     server_metrics get_metrics() const {
@@ -993,6 +1006,11 @@ private:
     bool stats_iter_prompt = false; // this main-loop iteration decoded prompt tokens
     bool stats_iter_gen    = false; // ... generated tokens
     bool stats_cpu_timed   = false; // the target context times its CPU splits (llama_set_cpu_timing)
+
+    // the machine sampler and the history (server-sampler.h): its own thread, started by init() with --metrics. Declared
+    // after stats_plane, which its thread reads
+    std::unique_ptr<server_sampler> sampler;
+    std::vector<llama_moe_cache_layer_stats> sampler_moe_layers; // the sampler thread's only
 
     static int64_t stats_period_us_from_env() {
         const char * e = getenv("LLAMA_SERVER_STATS_MS");
@@ -1560,6 +1578,13 @@ private:
         });
 
         metrics.init();
+
+        // once per process (init() runs again at every wake): the thread outlives model reloads
+        if (params_base.endpoint_metrics && !sampler) {
+            sampler = std::make_unique<server_sampler>(server_sampler::period_us_from_env(), [this](server_stats_row & r) {
+                stats_fill_row(r);
+            });
+        }
 
         if (params_base.cache_idle_slots) {
             if (params_base.cache_ram_mib == 0) {
@@ -4501,6 +4526,78 @@ private:
         stats_publish(t_now);
     }
 
+    // the server's columns of a history row, on the sampler thread: only the published snapshots (stats plane, expert
+    // cache) are read, never the main loop's working state
+    void stats_fill_row(server_stats_row & r) {
+        if (const auto s = stats_plane.latest()) {
+            const server_metrics & m = s->metrics;
+            double live_gen = 0, live_draft = 0, live_acc = 0, kv = 0, kv_max = 0;
+            for (const server_stats_slot & sl : s->slots) {
+                live_gen   += sl.n_gen;
+                live_draft += sl.n_draft;
+                live_acc   += sl.n_draft_accepted;
+                kv         += sl.n_ctx;
+                kv_max     += sl.n_ctx_max;
+            }
+            r[SSC_t_start_us]     = (double) s->t_start_us;
+            r[SSC_snap_t_us]      = (double) s->t_us;
+            // the cumulative counters move when a task ends; the live slots carry the rest
+            r[SSC_gen_tokens]     = (double) m.predict.count + live_gen;
+            r[SSC_draft_tokens]   = (double) m.n_draft_tokens + live_draft;
+            r[SSC_draft_accepted] = (double) m.n_draft_accepted + live_acc;
+            r[SSC_prompt_tokens]  = (double) m.prompt.count;
+            r[SSC_prompt_us]      = (double) m.prompt.time;
+            r[SSC_prompt_cached]  = (double) m.n_prompt_cached;
+            r[SSC_tasks]          = s->done ? (double) s->done->n_tasks : 0.0;
+            r[SSC_n_decode]       = (double) m.n_decode;
+            r[SSC_step_n]         = (double) s->step_gen.n;
+            r[SSC_step_us]        = (double) s->step_gen.sum_us;
+            r[SSC_decode_n]       = (double) s->decode_gen.n;
+            r[SSC_decode_us]      = (double) s->decode_gen.sum_us;
+            r[SSC_phase_graphs]   = (double) s->phase.n_graphs;
+            r[SSC_phase_cpu_us]   = (double) s->phase.cpu_us;
+            r[SSC_publish_n]      = (double) s->publish.n;
+            r[SSC_publish_us]     = (double) s->publish.sum_us;
+            r[SSC_n_busy]         = (double) s->n_processing;
+            r[SSC_n_deferred]     = (double) s->n_deferred;
+            r[SSC_kv_used]        = kv;
+            r[SSC_kv_max]         = kv_max;
+            if (s->has_disk) {
+                const server_prompt_disk_stats & d = s->disk;
+                r[SSC_disk_find]          = (double) d.n_find;
+                r[SSC_disk_find_hit]      = (double) d.n_find_hit;
+                r[SSC_disk_save]          = (double) d.n_save;
+                r[SSC_disk_save_bytes]    = (double) d.save_bytes;
+                r[SSC_disk_restore]       = (double) d.n_restore;
+                r[SSC_disk_restore_bytes] = (double) d.restore_bytes;
+                r[SSC_disk_evict]         = (double) (d.n_evict_expired + d.n_evict_space + d.n_superseded);
+                r[SSC_disk_bytes]         = (double) s->disk_bytes;
+                r[SSC_disk_entries]       = (double) s->disk_entries;
+            }
+        }
+
+        llama_moe_cache_stats h = {};
+        if (llama_moe_cache_get_stats(&h, nullptr, 0, nullptr, 0)) {
+            sampler_moe_layers.resize((size_t) std::max(0, h.n_layer));
+            llama_moe_cache_get_stats(&h, sampler_moe_layers.data(), sampler_moe_layers.size(), nullptr, 0);
+            double resident = 0;
+            for (const auto & l : sampler_moe_layers) {
+                resident += l.n_resident;
+            }
+            r[SSC_moe_t_us]                 = (double) h.t_us;
+            r[SSC_moe_steps]                = (double) h.n_steps;
+            r[SSC_moe_hit]                  = (double) h.n_hit;
+            r[SSC_moe_miss]                 = (double) h.n_miss;
+            r[SSC_moe_refused]              = (double) h.n_refused;
+            r[SSC_moe_upload]               = (double) h.n_upload;
+            r[SSC_moe_upload_bytes]         = (double) h.upload_bytes;
+            r[SSC_moe_upload_bytes_warm]    = (double) h.upload_bytes_warm;
+            r[SSC_moe_evict]                = (double) h.n_evict;
+            r[SSC_moe_readmit]              = (double) h.n_readmit;
+            r[SSC_moe_resident]             = resident;
+        }
+    }
+
     bool stats_publishing() const {
         return (params_base.endpoint_metrics || params_base.endpoint_slots) && stats_plane.period() > 0;
     }
@@ -5212,6 +5309,60 @@ void server_routes::init_routes() {
 
         // the latest snapshot the main loop published: no task, no lock shared with the decode path
         res->ok(ctx_server.stats_json(max_tasks));
+        return res;
+    };
+
+    this->get_stats_history = [this](const server_http_req & req) {
+        auto res = create_response(true);
+        if (!params.endpoint_metrics) {
+            res->error(format_error_response("This server does not support the stats endpoint. Start it with `--metrics`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        // ?tier=s (every sample, default) or m (one row a minute); ?since_us=T: rows sampled after T (t_us); ?cols=a,b
+        const std::string tier = req.get_param("tier", "s");
+        if (tier != "s" && tier != "m") {
+            res->error(format_error_response("tier must be s or m", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        double since_us = -INFINITY;
+        const std::string since = req.get_param("since_us");
+        if (!since.empty()) {
+            try {
+                since_us = std::stod(since);
+            } catch (const std::exception &) {
+                res->error(format_error_response("since_us must be a number", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        std::vector<int> cols;
+        for (const std::string & name : string_split<std::string>(req.get_param("cols"), ',')) {
+            if (name.empty()) {
+                continue;
+            }
+            int c = 0;
+            while (c < SSC_COUNT && name != server_stats_col_name(c)) {
+                c++;
+            }
+            if (c == SSC_COUNT) {
+                res->error(format_error_response("unknown column: " + name, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (c != SSC_t_us && cols.empty()) {
+                cols.push_back(SSC_t_us); // rows are keyed by their sample time
+            }
+            if (std::find(cols.begin(), cols.end(), c) == cols.end()) {
+                cols.push_back(c);
+            }
+        }
+
+        // the sampler's latest published rows: no task, no lock of the main loop
+        const auto v = ctx_server.stats_history();
+        json j = v ? (tier == "m" ? v->minute : v->sec).to_json(tier.c_str(), since_us, cols) : json { { "tier", tier }, { "n", 0 } };
+        j["schema"]     = 1;
+        j["enabled"]    = v != nullptr;
+        j["t_serve_us"] = ggml_time_us();
+        res->ok(j);
         return res;
     };
 
