@@ -406,3 +406,157 @@ void server_stats::publish(int64_t t_now_us, const std::function<void(server_sta
 std::shared_ptr<const server_stats_snapshot> server_stats::latest() const {
     return std::atomic_load(&snap);
 }
+
+//
+// history
+//
+
+static const char * k_col_names[SSC_COUNT] = {
+#define X(name, kind) #name,
+    SERVER_STATS_HISTORY_COLUMNS(X)
+#undef X
+};
+
+static const bool k_col_gauge[SSC_COUNT] = {
+#define C false
+#define G true
+#define X(name, kind) kind,
+    SERVER_STATS_HISTORY_COLUMNS(X)
+#undef X
+#undef G
+#undef C
+};
+
+server_stats_row server_stats_row_empty() {
+    server_stats_row r;
+    r.fill(NAN);
+    return r;
+}
+
+const char * server_stats_col_name(int col) {
+    return col >= 0 && col < SSC_COUNT ? k_col_names[col] : "";
+}
+
+bool server_stats_col_gauge(int col) {
+    return col >= 0 && col < SSC_COUNT && k_col_gauge[col];
+}
+
+size_t server_stats_history::tier_view::size() const {
+    size_t n = 0;
+    for (const auto & s : segs) {
+        n += s->size();
+    }
+    return n;
+}
+
+json server_stats_history::tier_view::to_json(const char * name, double since_us, const std::vector<int> & cols_in) const {
+    std::vector<int> cols = cols_in;
+    if (cols.empty()) {
+        for (int c = 0; c < SSC_COUNT; ++c) {
+            cols.push_back(c);
+        }
+    }
+    std::vector<json> out(cols.size(), json::array());
+
+    const size_t total = size();
+    const size_t skip  = total > cap ? total - cap : 0;
+    size_t i = 0, n = 0;
+    for (const auto & s : segs) {
+        for (const server_stats_row & r : *s) {
+            if (i++ < skip || !(r[SSC_t_us] > since_us)) {
+                continue;
+            }
+            for (size_t k = 0; k < cols.size(); ++k) {
+                const double x = r[cols[k]];
+                out[k].push_back(std::isnan(x) ? json(nullptr) : json(x));
+            }
+            n++;
+        }
+    }
+
+    json j_cols = json::object();
+    for (size_t k = 0; k < cols.size(); ++k) {
+        j_cols[k_col_names[cols[k]]] = std::move(out[k]);
+    }
+    return json {
+        { "tier",      name                 },
+        { "period_ms", period_us / 1000.0   },
+        { "cap",       cap                  },
+        { "n",         n                    },
+        { "cols",      std::move(j_cols)    },
+    };
+}
+
+void server_stats_history::tier::push(const server_stats_row & r) {
+    cur.push_back(r);
+    if (cur.size() >= seg_rows) {
+        full.push_back(std::make_shared<const std::vector<server_stats_row>>(std::move(cur)));
+        cur = {};
+        cur.reserve(seg_rows);
+    }
+    // drop whole segments while the rest still holds cap rows
+    while (!full.empty() && (full.size() - 1)*seg_rows + cur.size() >= cap) {
+        full.pop_front();
+    }
+}
+
+void server_stats_history::tier::view_into(tier_view & v) const {
+    v.period_us = period_us;
+    v.cap       = cap;
+    v.segs.assign(full.begin(), full.end());
+    if (!cur.empty()) {
+        v.segs.push_back(std::make_shared<const std::vector<server_stats_row>>(cur));
+    }
+}
+
+server_stats_history::server_stats_history(int64_t period_us, size_t n_sec, size_t n_min, size_t n_per_min, size_t seg_rows) :
+    sec    { period_us,             std::max<size_t>(1, n_sec), std::max<size_t>(1, seg_rows), {}, {} },
+    minute { period_us * (int64_t) std::max<size_t>(1, n_per_min), std::max<size_t>(1, n_min), std::max<size_t>(1, seg_rows), {}, {} },
+    n_per_min(std::max<size_t>(1, n_per_min)) {
+    acc_last = server_stats_row_empty();
+    acc_sum.fill(0.0);
+    auto v = std::make_shared<view>();
+    sec.view_into(v->sec);
+    minute.view_into(v->minute);
+    std::atomic_store(&snap, std::shared_ptr<const view>(std::move(v)));
+}
+
+void server_stats_history::append(const server_stats_row & r) {
+    sec.push(r);
+
+    acc_last = r;
+    for (int c = 0; c < SSC_COUNT; ++c) {
+        if (k_col_gauge[c] && !std::isnan(r[c])) {
+            acc_sum[c] += r[c];
+            acc_n[c]++;
+        }
+    }
+    bool min_row = false;
+    if (++acc_rows >= n_per_min) {
+        server_stats_row m = acc_last;
+        for (int c = 0; c < SSC_COUNT; ++c) {
+            if (k_col_gauge[c]) {
+                m[c] = acc_n[c] > 0 ? acc_sum[c] / acc_n[c] : NAN;
+            }
+        }
+        minute.push(m);
+        acc_sum.fill(0.0);
+        acc_n.fill(0);
+        acc_rows = 0;
+        min_row  = true;
+    }
+
+    // the minute tier's segments did not change unless a minute row was added: reuse them
+    auto v = std::make_shared<view>();
+    sec.view_into(v->sec);
+    if (min_row) {
+        minute.view_into(v->minute);
+    } else {
+        v->minute = std::atomic_load(&snap)->minute;
+    }
+    std::atomic_store(&snap, std::shared_ptr<const view>(std::move(v)));
+}
+
+std::shared_ptr<const server_stats_history::view> server_stats_history::latest() const {
+    return std::atomic_load(&snap);
+}

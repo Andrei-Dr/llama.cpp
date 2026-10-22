@@ -202,6 +202,60 @@ static void test_json_shape(testing & t) {
     t.assert_equal((uint64_t) 1, j.at("selection").at("lcp").get<uint64_t>());
 }
 
+static server_stats_row history_row(int i) {
+    server_stats_row r = server_stats_row_empty();
+    r[SSC_t_us]       = i + 1;
+    r[SSC_gen_tokens] = 10.0 * i;
+    r[SSC_gpu_util]   = i;
+    return r;
+}
+
+static void test_history(testing & t) {
+    t.assert_equal(std::string("t_us"), std::string(server_stats_col_name(SSC_t_us)));
+    t.assert_true("gauge", server_stats_col_gauge(SSC_gpu_util));
+    t.assert_true("counter", !server_stats_col_gauge(SSC_gen_tokens));
+
+    // 10 rows per second tier, 3 minute rows of 4 samples each, segments of 3 rows
+    server_stats_history h(1000, 10, 3, 4, 3);
+    t.assert_equal((size_t) 0, h.latest()->sec.size());
+
+    for (int i = 0; i < 25; ++i) {
+        h.append(history_row(i));
+    }
+    const auto v = h.latest();
+    t.assert_true("held rows within a segment of cap", v->sec.size() >= 10 && v->sec.size() < 13);
+
+    const json s = v->sec.to_json("s", -INFINITY, {});
+    t.assert_equal((size_t) 10, s.at("n").get<size_t>());
+    t.assert_equal(1.0, s.at("period_ms").get<double>());
+    const json & ts = s.at("cols").at("t_us");
+    t.assert_equal(16.0, ts.front().get<double>());
+    t.assert_equal(25.0, ts.back().get<double>());
+    t.assert_true("never-measured columns are null", s.at("cols").at("vram_used").front().is_null());
+    t.assert_equal((size_t) SSC_COUNT, s.at("cols").size());
+
+    const json since = v->sec.to_json("s", 20.0, { SSC_t_us, SSC_gpu_util });
+    t.assert_equal((size_t) 5, since.at("n").get<size_t>());
+    t.assert_equal((size_t) 2, since.at("cols").size());
+    t.assert_equal(21.0, since.at("cols").at("t_us").front().get<double>());
+
+    // minute rows: counters from the minute's last sample, gauges the minute's mean; 25 samples = 6 minutes, 3 kept
+    const json m = v->minute.to_json("m", -INFINITY, {});
+    t.assert_equal((size_t) 3, m.at("n").get<size_t>());
+    t.assert_equal(4.0, m.at("period_ms").get<double>());
+    t.assert_equal(24.0,  m.at("cols").at("t_us").back().get<double>());
+    t.assert_equal(230.0, m.at("cols").at("gen_tokens").back().get<double>());
+    t.assert_equal(21.5,  m.at("cols").at("gpu_util").back().get<double>());
+    t.assert_equal(13.5,  m.at("cols").at("gpu_util").front().get<double>());
+
+    // a published view does not change under later appends
+    for (int i = 25; i < 40; ++i) {
+        h.append(history_row(i));
+    }
+    t.assert_equal(25.0, v->sec.to_json("s", -INFINITY, {}).at("cols").at("t_us").back().get<double>());
+    t.assert_equal(40.0, h.latest()->sec.to_json("s", -INFINITY, {}).at("cols").at("t_us").back().get<double>());
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -218,6 +272,7 @@ int main(int argc, char ** argv) {
     t.test("json_shape",         test_json_shape);
     t.test("done_shared",        test_done_shared);
     t.test("slot_row_json",      test_slot_row_json);
+    t.test("history",            test_history);
 
     return t.summary();
 }

@@ -11,6 +11,7 @@
 #include "server-common.h"
 #include "server-prompt-disk.h"
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -199,6 +200,139 @@ struct server_stats_snapshot {
     json to_json(int max_tasks = -1) const;
     json disk_json() const;
     json phase_json() const;
+};
+
+// GET /stats/history: one row of scalars per sampler period (server-sampler.h), on the sampler's thread, never the main
+// loop's. Counters (C) are cumulative, so a reader derives any rate from two rows and a coarser tier loses nothing; gauges
+// (G) are values at the sample, and a minute row holds their mean. NaN = not measured (no GPU library, no expert cache).
+// Server counters carry the time of the snapshot they come from (snap_t_us) and the expert cache's the time of its own
+// (moe_t_us): a rate uses that clock, not the sampler's.
+#define SERVER_STATS_HISTORY_COLUMNS(X) \
+    X(t_us,                  C) /* sampler clock (ggml_time_us)                                       */ \
+    X(unix_ms,               C) /* wall clock at the sample                                           */ \
+    X(t_start_us,            C) /* the server instance (/stats t_start_us)                            */ \
+    X(snap_t_us,             C) /* the /stats snapshot the server columns come from                   */ \
+    X(gen_tokens,            C) /* generated, the live slots included                                 */ \
+    X(draft_tokens,          C) \
+    X(draft_accepted,        C) \
+    X(prompt_tokens,         C) \
+    X(prompt_us,             C) \
+    X(prompt_cached,         C) \
+    X(tasks,                 C) \
+    X(n_decode,              C) \
+    X(step_n,                C) /* generation steps (/stats decode.step_gen)                           */ \
+    X(step_us,               C) \
+    X(decode_n,              C) /* target decodes of the generation (/stats decode.gen)               */ \
+    X(decode_us,             C) \
+    X(phase_graphs,          C) /* /stats phase                                                       */ \
+    X(phase_cpu_us,          C) \
+    X(publish_n,             C) /* the snapshots' own cost                                            */ \
+    X(publish_us,            C) \
+    X(n_busy,                G) /* slots processing a task                                            */ \
+    X(n_deferred,            G) \
+    X(kv_used,               G) /* tokens in the slots                                                */ \
+    X(kv_max,                G) \
+    X(moe_t_us,              C) /* the expert cache's snapshot                                        */ \
+    X(moe_steps,             C) \
+    X(moe_hit,               C) \
+    X(moe_miss,              C) \
+    X(moe_refused,           C) \
+    X(moe_upload,            C) \
+    X(moe_upload_bytes,      C) \
+    X(moe_upload_bytes_warm, C) \
+    X(moe_evict,             C) \
+    X(moe_readmit,           C) \
+    X(moe_resident,          G) /* experts in VRAM, all layers                                        */ \
+    X(disk_find,             C) /* the prompt cache disk tier                                         */ \
+    X(disk_find_hit,         C) \
+    X(disk_save,             C) \
+    X(disk_save_bytes,       C) \
+    X(disk_restore,          C) \
+    X(disk_restore_bytes,    C) \
+    X(disk_evict,            C) \
+    X(disk_bytes,            G) \
+    X(disk_entries,          G) \
+    X(gpu_util,              G) /* %, mean over the GPUs                                               */ \
+    X(gpu_mem_util,          G) /* % of time device memory was read or written, mean                   */ \
+    X(vram_used,             G) /* bytes, all GPUs                                                    */ \
+    X(vram_total,            G) \
+    X(pcie_rx,               G) /* bytes/s host -> GPU, all GPUs, NVML's 20 ms window at the sample   */ \
+    X(pcie_tx,               G) /* bytes/s GPU -> host, same                                          */ \
+    X(gpu_temp_c,            G) /* hottest GPU                                                        */ \
+    X(gpu_power_w,           G) /* all GPUs                                                           */ \
+    X(gpu_clock_mhz,         G) /* SM clock, mean                                                     */ \
+    X(proc_cpu_us,           C) /* this process, user + system                                        */ \
+    X(host_busy_us,          C) /* all cores, not idle and not I/O wait                               */ \
+    X(host_total_us,         C) \
+    X(host_iowait_us,        C) \
+    X(mem_avail,             G) /* bytes                                                              */ \
+    X(mem_total,             G) \
+    X(swap_used,             G) \
+    X(sample_us,             G) /* the sampler's own time for this row                                */
+
+enum server_stats_col : int {
+#define X(name, kind) SSC_##name,
+    SERVER_STATS_HISTORY_COLUMNS(X)
+#undef X
+    SSC_COUNT,
+};
+
+using server_stats_row = std::array<double, SSC_COUNT>;
+
+// a row of NaN (nothing measured)
+server_stats_row server_stats_row_empty();
+
+const char * server_stats_col_name(int col);
+bool         server_stats_col_gauge(int col);
+
+// two tiers of rows: "s" (every sample) and "m" (one row per n_per_min samples). Rows are kept in segments of seg_rows;
+// a full segment is immutable and shared by every published view, so a publish copies only the partial segment and the
+// segment pointers. One writer thread (append); readers take latest() from any thread
+class server_stats_history {
+public:
+    struct tier_view {
+        int64_t period_us = 0;
+        size_t  cap       = 0; // the newest rows a reader returns
+        std::vector<std::shared_ptr<const std::vector<server_stats_row>>> segs; // oldest first, the last one partial
+
+        size_t size() const; // rows held (may exceed cap by less than a segment)
+        // columnar JSON of the newest min(cap, rows) rows with t_us > since_us; cols empty = every column
+        json to_json(const char * name, double since_us, const std::vector<int> & cols) const;
+    };
+    struct view {
+        tier_view sec;
+        tier_view minute;
+    };
+
+    server_stats_history(int64_t period_us, size_t n_sec = 900, size_t n_min = 1440, size_t n_per_min = 60, size_t seg_rows = 60);
+
+    void append(const server_stats_row & r);
+
+    std::shared_ptr<const view> latest() const;
+
+private:
+    struct tier {
+        int64_t period_us;
+        size_t  cap;
+        size_t  seg_rows;
+        std::deque<std::shared_ptr<const std::vector<server_stats_row>>> full;
+        std::vector<server_stats_row> cur;
+
+        void push(const server_stats_row & r);
+        void view_into(tier_view & v) const;
+    };
+
+    tier   sec;
+    tier   minute;
+    size_t n_per_min;
+
+    // the minute being accumulated: the newest row (its counters), gauge sums and counts (NaN skipped)
+    server_stats_row acc_last;
+    server_stats_row acc_sum;
+    std::array<uint32_t, SSC_COUNT> acc_n {};
+    size_t acc_rows = 0;
+
+    std::shared_ptr<const view> snap; // std::atomic_load / std::atomic_store only
 };
 
 // the MoE expert cache's latest snapshot (llama_moe_cache_get_stats), or null without a cache. Any thread: reads the
