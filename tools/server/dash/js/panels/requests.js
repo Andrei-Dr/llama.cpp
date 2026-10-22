@@ -69,8 +69,9 @@ export function render(st) {
     tr.insertCell().textContent = isNum(t.t_end_us) && t.instance === store.instance ? dur(1000 * (now - t.t_end_us / 1e6)) : "—";
     frag.appendChild(tr);
   }
+  const any = frag.childNodes.length > 0; // replaceChildren empties the fragment
   $("req-body").replaceChildren(frag);
-  $("req-empty").hidden = frag.childNodes.length > 0;
+  $("req-empty").hidden = any;
   const dec = live.filter((s) => s.state === "generating").length;
   txt("req-meta", dec + " decoding · " + (live.length - dec) + " prefill · " + (st.n_deferred || 0) + " waiting · " + store.tasks.length + " shown");
 }

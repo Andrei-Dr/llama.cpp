@@ -112,7 +112,7 @@
   </section>
 
   <section class="panel" id="p-pcache">
-    <div class="phead"><span class="cap">Prompt cache</span><span class="aside" id="pc-meta" title="slots hold prompts in RAM; the disk tier keeps evicted ones on the SSD">RAM slots + SSD</span></div>
+    <div class="phead"><span class="cap">Prompt cache</span><span class="aside" id="pc-meta" title="slots hold prompts in their KV cache (and the RAM prompt cache when on); the disk tier keeps evicted ones on the SSD">RAM slots + SSD</span></div>
     <div class="pbody">
       <div class="m"><div class="meter"><span title="Share of all prompt tokens a slot already held or a disk restore loaded, so they were not processed again">Reused, not processed</span><b id="m-prefix">—</b></div><div class="bar"><i id="m-prefix-bar" class="fg"></i></div></div>
       <div id="ssd" hidden>
@@ -120,7 +120,7 @@
         <div class="cols">
           <div class="grp"><h3>Prompt tokens</h3>
             <div class="kvrows">
-              <div class="kv" title="Prompt tokens a slot already held in RAM (not from a disk restore)"><span>Reused (RAM)</span><b id="d-reused">—</b></div>
+              <div class="kv" title="Prompt tokens a slot already held, or the RAM prompt cache restored (not from a disk restore)"><span>Reused (slot / RAM cache)</span><b id="d-reused">—</b></div>
               <div class="kv" title="Prompt tokens reused from a restore off the SSD tier, and how many the restores loaded"><span>Restored (SSD)</span><b id="d-restored">—</b></div>
               <div class="kv" title="Prompt tokens the model processed"><span>Recomputed</span><b id="d-recomp">—</b></div>
               <div class="kv" title="Estimate: the reused restored tokens at the measured prefill rate, minus the time the restores took"><span>Time saved (est.)</span><b id="d-saved">—</b></div>
@@ -160,7 +160,7 @@
           <div class="layers" id="x-res"></div>
         </div>
         <div>
-          <div class="meter"><span title="Hit rate per layer">Hit rate per layer</span><b id="x-layer-meta">—</b></div>
+          <div class="meter"><span title="Hit rate per layer">Hit rate per layer <i id="x-layer-win">last 60 s</i></span><b id="x-layer-meta">—</b></div>
           <div class="layers" id="x-layers"></div>
           <div class="axis"><span id="x-l0">L0</span><span id="x-ln">—</span></div>
         </div>

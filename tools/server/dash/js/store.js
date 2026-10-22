@@ -3,7 +3,7 @@
 // Every request goes to this server, relative to /dash/ (so an --api-prefix works); an API key, when the server needs
 // one, comes from the page's #key=... fragment once and stays in this tab's sessionStorage.
 
-import { rowsOf, deriveAll, mergeTasks, LayerWindow, PhaseWindow, isNum } from "./derive.js";
+import { rowsOf, deriveAll, mergeTasks, LayerWindow, PhaseWindow, isNum, uptimeS } from "./derive.js";
 
 const KEEP_TASKS = 60;
 const KEEP_EVENTS = 50;
@@ -94,7 +94,7 @@ export async function poll() {
     store.historyOn ? getJSON("stats/history" + (last ? "?since_us=" + last.t_us : "")) : Promise.resolve(null),
   ]);
   if (store.instance !== null && st.t_start_us && st.t_start_us !== store.instance) {
-    event("server restarted", "up " + Math.round(st.uptime_s || 0) + " s");
+    event("server restarted", "up " + Math.round(uptimeS(st) || 0) + " s");
     store.layers = new LayerWindow(60);
     store.phase = new PhaseWindow(60);
   }

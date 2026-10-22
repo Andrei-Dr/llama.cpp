@@ -3,6 +3,7 @@
 
 import { $, txt, dur, show, tidy } from "./util.js";
 import { store, poll, failed, pollMinutes, pollProps, HttpError } from "./store.js";
+import { uptimeS } from "./derive.js";
 import * as cards from "./panels/cards.js";
 import * as timeline from "./panels/timeline.js";
 import * as requests from "./panels/requests.js";
@@ -20,7 +21,7 @@ function header() {
   txt("chip-build", p.build_info || "—");
   txt("chip-model", (p.model_ftype || "—") + (p.is_sleeping ? " · sleeping" : ""));
   if (store.ok && st) {
-    txt("hdr-right", st.seq ? "up " + dur(1000 * st.uptime_s) + " · snapshot " + st.seq + " · " + new Date().toLocaleTimeString() : "no snapshot yet");
+    txt("hdr-right", st.seq ? "up " + dur(1000 * uptimeS(st)) + " · snapshot " + st.seq + " · " + new Date().toLocaleTimeString() : "no snapshot yet");
   }
   const e = store.error, auth = e instanceof HttpError && e.status === 401, off = e instanceof HttpError && e.status === 501;
   show("banner-auth", auth);

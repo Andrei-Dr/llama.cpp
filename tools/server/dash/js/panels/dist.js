@@ -4,7 +4,7 @@ import { $, txt, num, el, sized } from "../util.js";
 
 const ms = (v) => (v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 0 : 1) + " s" : v.toFixed(0) + " ms");
 
-// one histogram: bars on the largest bucket (a used bucket is never thinner than 2 px), three axis ticks, and a summary line
+// one histogram: bars on the largest bucket (a used bucket is never shorter than 3%), three axis ticks, and a summary line
 function hist(id, sid, lid, h, fmt) {
   if (!h) return;
   const box = $(id), n = h.n || 0;

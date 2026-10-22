@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { rowsOf, derive, deriveAll, mergeTasks, LayerWindow, PhaseWindow, pcieCeilingGBs, diskSavedS } from "../../dash/js/derive.js";
+import { rowsOf, derive, deriveAll, mergeTasks, LayerWindow, PhaseWindow, pcieCeilingGBs, diskSavedS, uptimeS } from "../../dash/js/derive.js";
 
 function row(over = {}) {
   return {
@@ -159,8 +159,16 @@ test("the disk tier: restore and prefill speed and the time the reused restores 
   assert.equal(diskSavedS(0, 0, 400, 0.5e6), null);
   const none = derive(null, row({ prompt_tokens: 1000, prompt_us: 10e6, prompt_cached_disk: 0, disk_restore_tokens: 0, disk_restore_us: 0 }));
   assert.equal(none.disk_restore_tps_avg, null);
-  assert.equal(none.disk_saved_s, 0);
+  assert.equal(none.disk_saved_s, null);
   const old = derive(null, row({ prompt_tokens: 1000, prompt_us: 10e6 }));
   assert.equal(old.disk_saved_s, null);
   assert.equal(old.disk_restore_tps_avg, null);
+});
+
+test("uptime at serve time, not at the last snapshot; prompt reuse since start", () => {
+  assert.equal(uptimeS({ t_start_us: 5e6, t_us: 6e6, t_serve_us: 25e6, uptime_s: 1 }), 20);
+  assert.equal(uptimeS({ uptime_s: 3 }), 3);
+  const s = derive(null, row({ prompt_cached: 600, prompt_tokens: 400 }));
+  assert.equal(s.prompt_reuse_avg, 0.6);
+  assert.equal(derive(null, row({ prompt_cached: 0, prompt_tokens: 0 })).prompt_reuse_avg, null);
 });

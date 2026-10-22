@@ -43,12 +43,18 @@ function rateOver(d, dt, busy) {
   return d === 0 && !busy ? 0 : null;
 }
 
+// the server's uptime at the time it answered (t_serve_us), not at its last snapshot: an idle server stops publishing, so
+// /stats uptime_s stands still between requests
+export function uptimeS(st) {
+  return st && isNum(st.t_serve_us) && isNum(st.t_start_us) && st.t_start_us > 0 ? (st.t_serve_us - st.t_start_us) / 1e6 : st && st.uptime_s;
+}
+
 // seconds of prompt processing the disk tier saved: the reused tokens that came from a restore (prompt_tokens_cached_disk) at
 // the measured prefill rate, less the time the restores took (all of them, also those that reused nothing). Inputs are
 // cumulative counters of one server; null unless the prefill rate is known and the disk counters exist.
 export function diskSavedS(promptTokens, promptUs, cachedDisk, restoreUs) {
   if (!isNum(promptTokens) || !isNum(promptUs) || promptTokens <= 0 || promptUs <= 0) return null;
-  if (!isNum(cachedDisk) || !isNum(restoreUs)) return null;
+  if (!isNum(cachedDisk) || !isNum(restoreUs) || restoreUs <= 0) return null; // no restore yet: nothing saved or spent
   return (cachedDisk * promptUs) / promptTokens / 1e6 - restoreUs / 1e6;
 }
 
@@ -75,6 +81,10 @@ export function derive(p, c) {
     kv_fill_pct: ratio(scale(100, c.kv_used), c.kv_max),
     // since the server started (cumulative counters of this row): the disk tier against prefill
     prefill_tps_avg: ratio(scale(1e6, c.prompt_tokens), c.prompt_us),
+    // the share of the prompt tokens not processed again (a slot held them or a disk restore loaded them). Since start:
+    // the reuse is counted when a prompt starts and its processed tokens as they are computed, so a per-interval ratio
+    // of the two jumps to ~100% and then reads 0% while a long remainder is processed
+    prompt_reuse_avg: ratio(c.prompt_cached, isNum(c.prompt_cached) && isNum(c.prompt_tokens) ? c.prompt_cached + c.prompt_tokens : null),
     disk_restore_tps_avg: ratio(scale(1e6, c.disk_restore_tokens), c.disk_restore_us),
     disk_saved_s: diskSavedS(c.prompt_tokens, c.prompt_us, c.prompt_cached_disk, c.disk_restore_us),
   };
