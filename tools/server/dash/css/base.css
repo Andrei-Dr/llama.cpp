@@ -35,10 +35,3 @@ h1 { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; mi
 .cap { font-size: 10.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 .aside { font: 11.5px var(--mono); color: var(--dim); text-align: right; }
 .pbody { padding: 14px 16px 16px; flex: 1 1 auto; min-width: 0; }
-
-
-/* the layout switcher (under review) */
-.vsw { display: inline-flex; border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; margin-left: 4px; }
-.vsw a { font: 11px var(--mono); color: var(--dim); padding: 3px 9px; text-decoration: none; }
-.vsw a + a { border-left: 1px solid var(--edge); }
-.vsw a.on { color: var(--fg); background: var(--hover); }

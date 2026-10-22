@@ -80,8 +80,6 @@ export function tidy() {
   for (const g of document.querySelectorAll(".grp")) {
     g.hidden = !g.querySelector(".kv:not([hidden]), .plotbox");
   }
-  // a section heading with every panel under it hidden is hidden too
-  for (const b of document.querySelectorAll(".band")) b.dataset.empty = b.dataset.for.split(" ").every((id) => $(id).hidden) ? "1" : "";
 }
 
 // a big figure with its unit in a <small>; a stat with no value has no source and is hidden
