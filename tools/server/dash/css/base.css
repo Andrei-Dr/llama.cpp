@@ -1,0 +1,44 @@
+/* the dashboard: layout, palette and panel chrome. Dark, dense, monospace numbers; palette after radiance's dashboard. */
+:root {
+  --bg: #000; --card: #0a0a0a; --edge: #1c1c1c; --rule: #151515; --hover: #101010;
+  --fg: #f5f5f5; --dim: #7b7b7b; --faint: #4d4d4d; --ghost: #2b2b2b; --track: #1e1e1e;
+  --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --cool: #60a5fa; --pink: #f472b6; --mid: #6b6b73;
+  --ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --r: 12px;
+}
+/* the scrollbar is part of the layout: panels appear as the first poll reveals them, and a gutter that comes and goes
+   would move every panel sideways */
+html { overflow-y: scroll; scrollbar-gutter: stable; }
+* { box-sizing: border-box; }
+html, body { background: var(--bg); }
+body { margin: 0; color: var(--fg); font: 400 13px/1.5 var(--ui); -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 1440px; margin: 0 auto; padding: 24px 24px 80px; }
+[hidden] { display: none !important; }
+
+header { display: flex; align-items: center; gap: 10px; padding-bottom: 16px; flex-wrap: wrap; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--faint); flex: none; }
+.dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(74, 222, 128, .12); }
+.dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(248, 113, 113, .12); }
+h1 { margin: 0; font-size: 13.5px; font-weight: 600; letter-spacing: -.005em; min-width: 0; overflow-wrap: anywhere; }
+.chip { color: var(--dim); font: 11px var(--mono); padding: 3px 7px; border: 1px solid var(--edge); border-radius: 5px; }
+.ver { margin-left: auto; color: var(--faint); font: 11.5px var(--mono); }
+.banner { margin: 0 0 12px; padding: 8px 12px; border-radius: 8px; font: 12px var(--mono); }
+.banner.bad { background: #2a0f11; color: var(--bad); }
+.banner.warn { background: #2a2109; color: var(--warn); }
+
+.panel { background: var(--card); border: 1px solid var(--edge); border-radius: var(--r); min-width: 0; }
+.phead { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 13px 16px 12px;
+         border-bottom: 1px solid var(--rule); }
+.cap { font-size: 10.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
+.aside { font: 11.5px var(--mono); color: var(--dim); text-align: right; }
+.pbody { padding: 14px 16px 16px; }
+
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); grid-auto-flow: row dense; gap: 14px; margin-top: 14px; }
+.panel.w2 { grid-column: span 2; }
+.panel.w3 { grid-column: span 3; }
+
+@media (max-width: 1100px) {
+  .grid { grid-template-columns: 1fr; }
+  .panel.w2, .panel.w3 { grid-column: auto; }
+}

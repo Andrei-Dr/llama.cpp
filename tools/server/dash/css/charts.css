@@ -1,0 +1,36 @@
+/* the timeline: a grid of small charts, one y axis each, a crosshair shared by all of them */
+.panel.timeline { margin-top: 14px; }
+.tlgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 18px 22px; }
+@media (max-width: 1100px) { .tlgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 640px) { .tlgrid { grid-template-columns: minmax(0, 1fr); } }
+
+figure.tl { margin: 0; min-width: 0; }
+figure.tl figcaption { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+figure.tl .cap { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+figure.tl .vals { font: 12px var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; display: flex; gap: 8px;
+                  align-items: baseline; }
+figure.tl .vals b { font-weight: 400; }
+figure.tl .vals small { color: var(--dim); font-size: 10.5px; }
+.tlbody { display: grid; grid-template-columns: 34px minmax(0, 1fr); column-gap: 6px; }
+.tlbody .yax { display: flex; flex-direction: column; justify-content: space-between; height: 80px; text-align: right;
+               font: 9.5px/1 var(--mono); color: var(--faint); font-variant-numeric: tabular-nums; }
+.tlbody .xax { display: flex; justify-content: space-between; font: 9.5px/1 var(--mono); color: var(--faint); padding-top: 4px; }
+svg.plot { width: 100%; height: 80px; display: block; border-bottom: 1px solid var(--edge); overflow: visible; cursor: crosshair;
+           touch-action: none; }
+svg.plot path { fill: none; stroke-width: 1.25; vector-effect: non-scaling-stroke; stroke-linejoin: round; }
+svg.plot line.rule { stroke: var(--rule); vector-effect: non-scaling-stroke; }
+svg.plot line.cursor { stroke: var(--faint); vector-effect: non-scaling-stroke; visibility: hidden; }
+svg.plot line.cursor.on { visibility: visible; }
+.tlkey { font: 9.5px var(--mono); color: var(--faint); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.s-fg { stroke: var(--fg); } .s-warn { stroke: var(--warn); } .s-ok { stroke: var(--ok); } .s-cool { stroke: var(--cool); }
+.s-pink { stroke: var(--pink); } .s-bad { stroke: var(--bad); }
+.c-fg { color: var(--fg); } .c-warn { color: var(--warn); } .c-ok { color: var(--ok); } .c-cool { color: var(--cool); }
+.c-pink { color: var(--pink); } .c-bad { color: var(--bad); }
+
+/* the range switch */
+.seg { display: inline-flex; margin-left: 12px; border: 1px solid var(--edge); border-radius: 6px; overflow: hidden; vertical-align: middle; }
+.seg button { font: 11px var(--mono); color: var(--dim); background: none; border: 0; padding: 3px 9px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--edge); }
+.seg button.on { color: var(--fg); background: var(--hover); }
+.seg button:focus-visible { outline: 1px solid var(--cool); outline-offset: -1px; }
