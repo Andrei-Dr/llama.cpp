@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { rowsOf, derive, deriveAll, mergeTasks, LayerWindow, PhaseWindow, pcieCeilingGBs } from "../../dash/js/derive.js";
+import { rowsOf, derive, deriveAll, mergeTasks, LayerWindow, PhaseWindow, pcieCeilingGBs, diskSavedS } from "../../dash/js/derive.js";
 
 function row(over = {}) {
   return {
@@ -142,4 +142,25 @@ test("the prompt cache: disk hit rate and prompt reuse per interval, KV fill as 
   assert.equal(idle.disk_hit_rate, null);
   assert.equal(idle.prompt_reuse, null);
   assert.equal(derive(null, row({ kv_used: 1, kv_max: 0 })).kv_fill_pct, null);
+});
+
+test("the disk tier: restore and prefill speed and the time the reused restores saved, since the server started", () => {
+  // prefill 1000 tokens in 10 s = 100 tok/s; 400 reused tokens came from restores that took 0.5 s in all (2000 tokens loaded)
+  const c = row({ prompt_tokens: 1000, prompt_us: 10e6, prompt_cached: 600, prompt_cached_disk: 400,
+    disk_restore_tokens: 2000, disk_restore_us: 0.5e6 });
+  const s = derive(null, c);
+  assert.equal(s.prefill_tps_avg, 100);
+  assert.equal(s.disk_restore_tps_avg, 4000);
+  assert.equal(s.disk_saved_s, 3.5);
+  assert.equal(diskSavedS(1000, 10e6, 400, 0.5e6), 3.5);
+  // restores that reused nothing cost their own time
+  assert.equal(diskSavedS(1000, 10e6, 0, 0.5e6), -0.5);
+  // no prefill measured yet, no restore yet, or a server without the columns: unknown, never a zero
+  assert.equal(diskSavedS(0, 0, 400, 0.5e6), null);
+  const none = derive(null, row({ prompt_tokens: 1000, prompt_us: 10e6, prompt_cached_disk: 0, disk_restore_tokens: 0, disk_restore_us: 0 }));
+  assert.equal(none.disk_restore_tps_avg, null);
+  assert.equal(none.disk_saved_s, 0);
+  const old = derive(null, row({ prompt_tokens: 1000, prompt_us: 10e6 }));
+  assert.equal(old.disk_saved_s, null);
+  assert.equal(old.disk_restore_tps_avg, null);
 });

@@ -2,6 +2,7 @@
 
 import { isNum, txt, num, pct, bytes, dur, compact, width, show, val } from "../util.js";
 import { sum } from "../store.js";
+import { diskSavedS } from "../derive.js";
 
 export function render(st) {
   const gpus = (st.machine && st.machine.gpus) || [];
@@ -27,14 +28,16 @@ export function render(st) {
   if (!dc) return;
   val("d-bytes", bytes(dc.bytes), dc.limit_bytes ? "/ " + bytes(dc.limit_bytes) : null);
   width("d-bar", dc.limit_bytes ? dc.bytes / dc.limit_bytes : 0);
-  val("d-reused", [compact(c.prompt_tokens_cached), "tok"]);
-  val("d-restored", dc.restore ? [compact(dc.restore_tokens), "tok"] : null, dc.restore ? bytes(dc.restore_bytes) : null);
+  // three disjoint parts of every prompt token: reused from what a slot held (RAM), reused from a disk restore (the server
+  // counts those inside prompt_tokens_cached, and apart in prompt_tokens_cached_disk), and processed
+  const fromDisk = isNum(c.prompt_tokens_cached_disk) ? c.prompt_tokens_cached_disk : null;
+  val("d-reused", isNum(fromDisk) ? [compact(c.prompt_tokens_cached - fromDisk), "tok"] : null);
+  val("d-restored", isNum(fromDisk) ? [compact(fromDisk), "tok"] : null,
+    dc.restore ? "of " + compact(dc.restore_tokens) + " loaded · " + bytes(dc.restore_bytes) : null);
   val("d-recomp", [compact(c.prompt_tokens), "tok"]);
-  // restoring replaces processing: the saved time is what the restored tokens would have cost at the measured prefill
-  // rate, less the restores' own time; unknown unless both rates exist
-  const tps = c.prompt_us > 0 ? (1e6 * c.prompt_tokens) / c.prompt_us : null;
-  const saved = dc.restore && dc.restore_tokens > 0 && isNum(tps) && tps > 0 ? (1000 * dc.restore_tokens) / tps - dc.restore_us / 1000 : null;
-  val("d-saved", isNum(saved) ? dur(Math.abs(saved)) : null, isNum(saved) && saved < 0 ? "slower than recomputing" : null);
+  // restoring replaces processing: the reused restored tokens at the measured prefill rate, less the restores' own time
+  const saved = dc.restore ? diskSavedS(c.prompt_tokens, c.prompt_us, fromDisk, dc.restore_us) : null;
+  val("d-saved", isNum(saved) ? dur(Math.abs(saved) * 1000) : null, isNum(saved) && saved < 0 ? "slower than recomputing" : null);
   val("d-entries", num(dc.entries));
   val("d-find", num(dc.find_hit) + (dc.find ? " of " + num(dc.find) : ""), dc.find ? pct(dc.find_hit / dc.find, 0) : null,
     dc.f_sim_hit >= 0 ? "last sim " + dc.f_sim_hit.toFixed(2) + " keep " + dc.f_keep_hit.toFixed(2) : null);

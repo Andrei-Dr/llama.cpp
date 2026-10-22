@@ -43,6 +43,15 @@ function rateOver(d, dt, busy) {
   return d === 0 && !busy ? 0 : null;
 }
 
+// seconds of prompt processing the disk tier saved: the reused tokens that came from a restore (prompt_tokens_cached_disk) at
+// the measured prefill rate, less the time the restores took (all of them, also those that reused nothing). Inputs are
+// cumulative counters of one server; null unless the prefill rate is known and the disk counters exist.
+export function diskSavedS(promptTokens, promptUs, cachedDisk, restoreUs) {
+  if (!isNum(promptTokens) || !isNum(promptUs) || promptTokens <= 0 || promptUs <= 0) return null;
+  if (!isNum(cachedDisk) || !isNum(restoreUs)) return null;
+  return (cachedDisk * promptUs) / promptTokens / 1e6 - restoreUs / 1e6;
+}
+
 const SERVER_KEYS = ["decode_tps", "prefill_tput", "tasks_s", "step_ms", "decode_ms", "tokens_per_step", "accept",
   "prefill_tps", "cpu_ms", "cpu_share", "publish_us", "disk_restore_mbs", "disk_save_mbs", "disk_hit_rate", "prompt_reuse"];
 const MOE_KEYS = ["moe_hit_rate", "moe_miss_s", "moe_upload_s", "moe_evict_s", "moe_upload_mbs", "moe_warm_mbs",
@@ -64,6 +73,10 @@ export function derive(p, c) {
     gpu_clock_mhz: c.gpu_clock_mhz, mem_avail: c.mem_avail, mem_total: c.mem_total, swap_used: c.swap_used,
     sample_us: c.sample_us,
     kv_fill_pct: ratio(scale(100, c.kv_used), c.kv_max),
+    // since the server started (cumulative counters of this row): the disk tier against prefill
+    prefill_tps_avg: ratio(scale(1e6, c.prompt_tokens), c.prompt_us),
+    disk_restore_tps_avg: ratio(scale(1e6, c.disk_restore_tokens), c.disk_restore_us),
+    disk_saved_s: diskSavedS(c.prompt_tokens, c.prompt_us, c.prompt_cached_disk, c.disk_restore_us),
   };
   for (const k of [...SERVER_KEYS, ...MOE_KEYS, ...MACHINE_RATE_KEYS]) s[k] = null;
   if (!p) return s;
@@ -97,7 +110,8 @@ export function derive(p, c) {
     s.disk_restore_mbs = rateOver(delta(p, c, "disk_restore_bytes"), dts, busy);
     s.disk_save_mbs = rateOver(delta(p, c, "disk_save_bytes"), dts, busy);
     s.disk_hit_rate = ratio(delta(p, c, "disk_find_hit"), delta(p, c, "disk_find"));
-    // the share of the prompt tokens a slot already held, in the interval (only intervals that read a prompt count)
+    // the share of the prompt tokens not processed again (a slot held them or a disk restore loaded them), in the interval
+    // (only intervals that read a prompt count)
     const dCached = delta(p, c, "prompt_cached");
     s.prompt_reuse = ratio(dCached, isNum(dCached) && isNum(dPrompt) ? dCached + dPrompt : null);
     if (isNum(s.disk_restore_mbs)) s.disk_restore_mbs /= 1e6;
