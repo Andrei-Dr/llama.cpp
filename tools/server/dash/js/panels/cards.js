@@ -1,6 +1,6 @@
-// the six cards along the top: decode step, decode, prefill, in flight, kv / context fill, MTP acceptance
+// the cards along the top: decode, prefill, the KV cache, the SSD prompt cache, then decode step, in flight, MTP acceptance
 
-import { $, isNum, txt, num, pct, compact, figure } from "../util.js";
+import { $, isNum, txt, num, pct, bytes, compact, figure, show } from "../util.js";
 import { spark } from "../spark.js";
 import { store, latest, lastNum, sum } from "../store.js";
 
@@ -30,7 +30,9 @@ export function render(st) {
 
   const kv = sum(st.slots, (s) => s.n_ctx), kvMax = sum(st.slots, (s) => s.n_ctx_max);
   figure("c-kv", compact(kv), "tok");
-  txt("c-kv-s", "of " + compact(kvMax) + " · " + pct(kvMax ? kv / kvMax : null));
+  txt("c-kv-s", "of " + compact(kvMax) + " · " + pct(kvMax ? kv / kvMax : null) + " full");
+  const all = c.prompt_tokens + c.prompt_tokens_cached;
+  txt("c-kv-s2", all ? "prompt reuse " + pct(c.prompt_tokens_cached / all) + " of " + compact(all) + " tok" : "");
   spark($("sp-kv"), S, ["kv_used"], now);
 
   const drafting = c.draft_tokens > 0 || sum(st.slots, (s) => s.n_draft) > 0;
@@ -39,4 +41,17 @@ export function render(st) {
   figure("c-acc", drafting && acc !== null ? (100 * acc).toFixed(0) : "—", "%");
   txt("c-acc-s", drafting ? "cumulative " + pct(cum) : "no drafting");
   spark($("sp-acc"), S, ["accept"], now);
+}
+
+// the SSD prompt cache: hit rate of the lookups, what it restored, how full it is, restores and saves per second
+export function renderSsd(st) {
+  const dc = st.disk_cache;
+  show("card-ssd", !!dc);
+  if (!dc) return;
+  const d = latest();
+  figure("c-ssd", dc.find ? (100 * dc.find_hit / dc.find).toFixed(0) : "—", "%");
+  const rate = isNum(d.disk_restore_mbs) && d.disk_restore_mbs > 0 ? " · now " + num(d.disk_restore_mbs, 1) + " MB/s" : "";
+  txt("c-ssd-s", dc.restore ? "restored " + compact(dc.restore_tokens) + " tok · " + bytes(dc.restore_bytes) + rate : "nothing restored yet");
+  txt("c-ssd-s2", bytes(dc.bytes) + (dc.limit_bytes ? " / " + bytes(dc.limit_bytes) : "") + " · " + num(dc.entries) + " entries");
+  spark($("sp-ssd"), store.samples, ["disk_restore_mbs", "disk_save_mbs"], store.now);
 }

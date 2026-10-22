@@ -1,23 +1,28 @@
 /* the dashboard: the pieces inside panels (cards, table, meters, key-value groups, bars, the plane, histograms).
    One vocabulary: a muted caps label, a mono tabular figure, a muted unit; green = decoding / fills, blue = prefill and
    the disk tier, amber = CPU / waiting / warm-up, white = the thing itself. */
-.cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); overflow: hidden; }
-.card { padding: 14px 16px 10px; border-right: 1px solid var(--rule); min-width: 0; }
-.card:last-child { border-right: 0; }
+/* the KPI strip: the four serving figures (decode, prefill, KV cache, SSD prompt cache) large, the rest small below them;
+   hairlines between the cards come from the gap over the strip's background, so they survive wrapping */
+.cards { display: flex; flex-direction: row; flex-wrap: wrap; gap: 1px; background: var(--rule); overflow: hidden; }
+.card { background: var(--card); padding: 14px 16px 10px; min-width: 0; }
+.card.p { flex: 1 1 calc(25% - 1px); }
+.card.q { flex: 1 1 calc(33.333% - 1px); padding-top: 12px; }
 .card .v { font: 26px/1.1 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+.card.p .v { font-size: 34px; }
 .card .v small, .big small { font-size: 12px; color: var(--dim); margin-left: 4px; }
+.card.p .v small { font-size: 13px; }
 .card .l { font: 600 10px var(--ui); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); margin-top: 6px; }
 .card .s { font: 10.5px var(--mono); color: var(--faint); min-height: 15px; margin-top: 2px; white-space: nowrap;
            overflow: hidden; text-overflow: ellipsis; }
+.card .s + .s { margin-top: 0; }
 svg.spark { width: 100%; height: 24px; display: block; margin-top: 8px; overflow: visible; }
 svg.spark.tall { height: 40px; margin-top: 0; }
 svg.spark path { fill: none; stroke: var(--fg); stroke-width: 1.25; vector-effect: non-scaling-stroke;
                   stroke-linejoin: round; }
 svg.spark path.b { stroke: var(--warn); }
-@media (max-width: 1100px) { .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); } .card:nth-child(3) { border-right: 0; }
-  .card:nth-child(-n+3) { border-bottom: 1px solid var(--rule); } }
-@media (max-width: 560px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } .card:nth-child(3) { border-right: 1px solid var(--rule); }
-  .card:nth-child(2n) { border-right: 0; } .card:nth-child(-n+4) { border-bottom: 1px solid var(--rule); } }
+.card#card-ssd svg.spark path:first-child { stroke: var(--cool); }
+@media (max-width: 1100px) { .card.p { flex-basis: calc(50% - 1px); } }
+@media (max-width: 560px) { .card.q { flex-basis: calc(50% - 1px); } .card.p .v { font-size: 28px; } }
 
 /* requests: a fixed column grid so the header and the cells line up; the header sticks to the top of the scroll box */
 #p-requests .pbody.scroll { padding: 0; overflow: auto; flex: 1 1 0; min-height: 340px; }
@@ -157,3 +162,4 @@ canvas.plane { display: block; border-radius: 3px; max-width: 100%; }
 
 .ev { font: 11px var(--mono); color: var(--dim); display: grid; gap: 4px; max-height: 240px; overflow: auto; }
 .ev b { color: var(--fg); font-weight: 400; }
+#p-pcache .cols { grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }

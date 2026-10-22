@@ -21,7 +21,8 @@
 #p-timeline { --sw: 12; }
 #p-requests { --sw: 8; }
 #st-serve { --sw: 4; }
-#p-memory, #ssd { --sw: 6; }
+#p-memory { --sw: 4; }
+#p-pcache { --sw: 8; }
 #p-experts { --sw: 7; }
 #st-exp { --sw: 5; }
 #p-link { --sw: 7; }

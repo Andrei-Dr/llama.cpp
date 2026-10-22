@@ -13,9 +13,22 @@ const hasGpu = (st) => !!(st && st.machine && st.machine.gpus && st.machine.gpus
 const hasMoe = (st) => !!(st && st.moe_cache);
 const hasHost = (st) => !!(st && st.machine && st.machine.host && st.machine.host.host_total_us !== null);
 
+const hasDisk = (st) => !!(st && st.disk_cache);
+
+// serving first (what the clients feel, the KV cache and both prompt-cache tiers), then the expert cache, the GPU and the host
 const SPECS = [
   { cap: "decode", unit: "tok/s", fmt: f1, series: [{ key: "decode_tps", cls: "fg" }] },
   { cap: "prefill", unit: "tok/s", fmt: f0, series: [{ key: "prefill_tps", cls: "cool" }] },
+  { cap: "kv cache · context fill", unit: "%", fmt: f0, hi: 100, names: "tokens held / capacity", series: [{ key: "kv_fill_pct", cls: "fg" }] },
+  { cap: "prompt reuse · slot hits", unit: "%", fmt: f0, hi: 100, names: "prompt tokens a slot already held, per interval",
+    series: [{ key: "prompt_reuse", cls: "ok", k: 100 }] },
+  { cap: "ssd restores · saves", unit: "MB/s", fmt: f1, show: hasDisk, names: "restored from disk · saved to disk",
+    series: [{ key: "disk_restore_mbs", cls: "cool", name: "restores" }, { key: "disk_save_mbs", cls: "pink", name: "saves" }] },
+  { cap: "ssd lookup hit rate", unit: "%", fmt: f0, hi: 100, show: hasDisk, names: "disk-cache lookups that found an entry, per interval",
+    series: [{ key: "disk_hit_rate", cls: "cool", k: 100 }] },
+  { cap: "ssd cache size", unit: "GiB", fmt: f2, show: hasDisk, series: [{ key: "disk_bytes", cls: "cool", k: GiB }] },
+  { cap: "requests", unit: "", fmt: f0, names: "in flight · waiting for a slot",
+    series: [{ key: "in_flight", cls: "ok", name: "in flight" }, { key: "waiting", cls: "warn", name: "waiting" }] },
   { cap: "decode step", unit: "ms", fmt: f1, names: "step · CPU experts per decode",
     series: [{ key: "step_ms", cls: "fg", name: "step" }, { key: "cpu_ms", cls: "warn", name: "CPU experts" }] },
   { cap: "draft acceptance", unit: "%", fmt: f0, hi: 100, show: (st) => st && st.counters && st.counters.draft_tokens > 0,
@@ -35,10 +48,6 @@ const SPECS = [
     series: [{ key: "cpu_pct", cls: "fg", name: "all cores" }, { key: "server_share_pct", cls: "warn", name: "server" }] },
   { cap: "host memory", unit: "GiB", fmt: f1, show: hasHost, names: "available · swap used",
     series: [{ key: "mem_avail", cls: "fg", k: GiB, name: "available" }, { key: "swap_used", cls: "warn", k: GiB, name: "swap" }] },
-  { cap: "requests", unit: "", fmt: f0, names: "in flight · waiting for a slot",
-    series: [{ key: "in_flight", cls: "ok", name: "in flight" }, { key: "waiting", cls: "warn", name: "waiting" }] },
-  { cap: "SSD tier", unit: "MB/s", fmt: f1, show: (st) => !!(st && st.disk_cache), names: "restores · saves",
-    series: [{ key: "disk_restore_mbs", cls: "cool", name: "restores" }, { key: "disk_save_mbs", cls: "pink", name: "saves" }] },
 ];
 
 let charts = null;

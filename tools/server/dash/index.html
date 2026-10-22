@@ -26,12 +26,13 @@
 <div class="banner warn" id="banner-history" hidden>No history: the server's sampler is off (LLAMA_SERVER_SAMPLE_MS=0).</div>
 
 <section class="cards panel" id="cards">
-  <div class="card"><div class="v" id="c-step">—</div><div class="l">decode step</div><div class="s" id="c-step-s"></div><svg class="spark" id="sp-step" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
-  <div class="card"><div class="v" id="c-dec">—</div><div class="l">decode</div><div class="s" id="c-dec-s"></div><svg class="spark" id="sp-dec" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
-  <div class="card"><div class="v" id="c-pf">—</div><div class="l">prefill</div><div class="s" id="c-pf-s"></div><svg class="spark" id="sp-pf" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
-  <div class="card"><div class="v" id="c-fl">—</div><div class="l">requests in flight</div><div class="s" id="c-fl-s"></div><svg class="spark" id="sp-fl" viewBox="0 0 200 24" preserveAspectRatio="none"><path/><path class="b"/></svg></div>
-  <div class="card"><div class="v" id="c-kv">—</div><div class="l">kv · context fill</div><div class="s" id="c-kv-s"></div><svg class="spark" id="sp-kv" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
-  <div class="card"><div class="v" id="c-acc">—</div><div class="l">mtp acceptance</div><div class="s" id="c-acc-s"></div><svg class="spark" id="sp-acc" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
+  <div class="card p"><div class="v" id="c-dec">—</div><div class="l">decode</div><div class="s" id="c-dec-s"></div><svg class="spark" id="sp-dec" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
+  <div class="card p"><div class="v" id="c-pf">—</div><div class="l">prefill</div><div class="s" id="c-pf-s"></div><svg class="spark" id="sp-pf" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
+  <div class="card p"><div class="v" id="c-kv">—</div><div class="l">kv cache · context fill</div><div class="s" id="c-kv-s"></div><div class="s" id="c-kv-s2"></div><svg class="spark" id="sp-kv" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
+  <div class="card p" id="card-ssd" hidden><div class="v" id="c-ssd">—</div><div class="l">ssd prompt cache · hit rate</div><div class="s" id="c-ssd-s"></div><div class="s" id="c-ssd-s2"></div><svg class="spark" id="sp-ssd" viewBox="0 0 200 24" preserveAspectRatio="none"><path/><path class="b"/></svg></div>
+  <div class="card q"><div class="v" id="c-step">—</div><div class="l">decode step</div><div class="s" id="c-step-s"></div><svg class="spark" id="sp-step" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
+  <div class="card q"><div class="v" id="c-fl">—</div><div class="l">requests in flight</div><div class="s" id="c-fl-s"></div><svg class="spark" id="sp-fl" viewBox="0 0 200 24" preserveAspectRatio="none"><path/><path class="b"/></svg></div>
+  <div class="card q"><div class="v" id="c-acc">—</div><div class="l">mtp acceptance</div><div class="s" id="c-acc-s"></div><svg class="spark" id="sp-acc" viewBox="0 0 200 24" preserveAspectRatio="none"><path/></svg></div>
 </section>
 
 <div class="grid">
@@ -107,31 +108,37 @@
     <div class="pbody meters">
       <div class="m"><div class="meter"><span>VRAM</span><b id="m-vram">—</b></div><div class="bar"><i id="m-vram-bar" class="fg"></i></div></div>
       <div class="m"><div class="meter"><span title="Tokens held in the slots' contexts against their capacity">Context (KV)</span><b id="m-kv">—</b></div><div class="bar"><i id="m-kv-bar" class="fg"></i></div></div>
-      <div class="m"><div class="meter"><span title="Share of all prompt tokens the slots already held">Prompt reuse</span><b id="m-prefix">—</b></div><div class="bar"><i id="m-prefix-bar" class="fg"></i></div></div>
     </div>
   </section>
 
-  <section class="panel" id="ssd" hidden>
-    <div class="phead"><span class="cap">SSD tier</span><span class="aside" title="the prompt disk cache">prompt disk cache</span></div>
+  <section class="panel" id="p-pcache">
+    <div class="phead"><span class="cap">Prompt cache</span><span class="aside" id="pc-meta" title="slots hold prompts in RAM; the disk tier keeps evicted ones on the SSD">RAM slots + SSD</span></div>
     <div class="pbody">
-      <div class="m"><div class="meter"><span>Used</span><b id="d-bytes">—</b></div><div class="bar"><i id="d-bar" class="cool"></i></div></div>
-      <div class="cols">
-        <div class="grp"><h3>Cache</h3>
-          <div class="kvrows">
-            <div class="kv"><span>Entries</span><b id="d-entries">—</b></div>
-            <div class="kv" title="Lookups, hits, and the similarity of the last hit"><span>Hits</span><b id="d-find">—</b></div>
+      <div class="m"><div class="meter"><span title="Share of all prompt tokens a slot already held, so they were not processed again">Reused from a slot</span><b id="m-prefix">—</b></div><div class="bar"><i id="m-prefix-bar" class="fg"></i></div></div>
+      <div id="ssd" hidden>
+        <div class="m sp"><div class="meter"><span>SSD used</span><b id="d-bytes">—</b></div><div class="bar"><i id="d-bar" class="cool"></i></div></div>
+        <div class="cols">
+          <div class="grp"><h3>Prompt tokens</h3>
+            <div class="kvrows">
+              <div class="kv" title="Prompt tokens a slot already held"><span>Reused (RAM)</span><b id="d-reused">—</b></div>
+              <div class="kv" title="Prompt tokens loaded back from the SSD tier"><span>Restored (SSD)</span><b id="d-restored">—</b></div>
+              <div class="kv" title="Prompt tokens the model processed"><span>Recomputed</span><b id="d-recomp">—</b></div>
+              <div class="kv" title="Estimate: the restored tokens at the measured prefill rate, minus the time the restores took"><span>Time saved (est.)</span><b id="d-saved">—</b></div>
+            </div>
           </div>
-        </div>
-        <div class="grp"><h3>Traffic</h3>
-          <div class="kvrows">
-            <div class="kv"><span>Restores</span><b id="d-restore">—</b></div>
-            <div class="kv"><span>Saves</span><b id="d-save">—</b></div>
+          <div class="grp"><h3>Cache</h3>
+            <div class="kvrows">
+              <div class="kv"><span>Entries</span><b id="d-entries">—</b></div>
+              <div class="kv" title="Lookups that found an entry, and the similarity of the last hit"><span>Hits</span><b id="d-find">—</b></div>
+              <div class="kv"><span>Restores</span><b id="d-restore">—</b></div>
+              <div class="kv"><span>Saves</span><b id="d-save">—</b></div>
+            </div>
           </div>
-        </div>
-        <div class="grp"><h3>Dropped</h3>
-          <div class="kvrows">
-            <div class="kv" title="Not saved: skipped · refused · cancelled · failed"><span>Not saved</span><b id="d-nosave">—</b></div>
-            <div class="kv" title="Evicted: ttl · space · superseded"><span>Evicted</span><b id="d-evict">—</b></div>
+          <div class="grp"><h3>Dropped</h3>
+            <div class="kvrows">
+              <div class="kv" title="Prompts not saved, by reason"><span>Not saved</span><b id="d-nosave">—</b></div>
+              <div class="kv" title="Entries evicted, by reason"><span>Evicted</span><b id="d-evict">—</b></div>
+            </div>
           </div>
         </div>
       </div>

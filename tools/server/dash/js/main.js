@@ -47,6 +47,7 @@ function render() {
   const st = store.stats;
   if (!st || !st.counters) return;
   guarded("cards", () => cards.render(st));
+  guarded("ssd card", () => cards.renderSsd(st));
   guarded("timeline", () => timeline.render());
   guarded("requests", () => requests.render(st));
   guarded("slots", () => slots.renderSlots(st));
