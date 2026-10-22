@@ -4422,6 +4422,13 @@ private:
     // the record stays on the slot; it is counted once, when its task is released (a deferred task can be selected
     // again, and a launch can fail)
     void stats_on_select(server_slot & slot, server_stats_selection && sel) {
+        // a task deferred right after its selection restored the slot from disk (no free slots for its children) comes back
+        // to the same slot by LCP: the slot still holds the restored prompt, so the record keeps the restore
+        if (slot.sel.id_task == sel.id_task && slot.sel.disk_restored && !sel.disk_restored) {
+            sel.disk_restored = true;
+            sel.n_disk_tokens = slot.sel.n_disk_tokens;
+            sel.f_sim_disk    = slot.sel.f_sim_disk;
+        }
         slot.sel = std::move(sel);
     }
 

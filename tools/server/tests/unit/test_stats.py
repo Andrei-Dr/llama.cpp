@@ -255,20 +255,20 @@ def test_stats_disk_cache(tmp_path):
         if (h["n"] and h["cols"]["prompt_cached_disk"][-1] == c["prompt_tokens_cached_disk"]) or time.time() > deadline:
             break
         time.sleep(0.1)
+    assert h["n"], "no history row within 5 s"
     cols = h["cols"]
     assert cols["prompt_cached_disk"][-1] == c["prompt_tokens_cached_disk"]
     assert cols["disk_restore_tokens"][-1] == d["restore_tokens"]
     assert cols["disk_restore_us"][-1] == d["restore_us"] > 0
     assert cols["disk_save_us"][-1] == d["save_us"] > 0
 
-
-def test_stats_no_disk_restore_counts_nothing_from_disk():
-    server.start()
-    complete("Once upon a time", 4)
-    complete("Once upon a time there", 4)  # reuses the slot's prefix: cached, but not from a disk
-    s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 2)
-    assert s["counters"]["prompt_tokens_cached"] > 0
-    assert s["counters"]["prompt_tokens_cached_disk"] == 0
+    # the same slot extended (a prefix hit, no restore): reused, but not from the disk
+    complete(story + " And then the cat", 4)
+    s4 = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 4)
+    assert not s4["tasks"][3]["sel"]["disk_restored"]
+    assert s4["tasks"][3]["n_prompt_cached"] > 256
+    assert s4["counters"]["prompt_tokens_cached"] == c["prompt_tokens_cached"] + s4["tasks"][3]["n_prompt_cached"]
+    assert s4["counters"]["prompt_tokens_cached_disk"] == c["prompt_tokens_cached_disk"]
 
 
 def test_stats_disk_idle_save_is_published(tmp_path):
