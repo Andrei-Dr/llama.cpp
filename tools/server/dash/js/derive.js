@@ -44,7 +44,7 @@ function rateOver(d, dt, busy) {
 }
 
 const SERVER_KEYS = ["decode_tps", "prefill_tput", "tasks_s", "step_ms", "decode_ms", "tokens_per_step", "accept",
-  "prefill_tps", "cpu_ms", "cpu_share", "publish_us", "disk_restore_mbs", "disk_save_mbs"];
+  "prefill_tps", "cpu_ms", "cpu_share", "publish_us", "disk_restore_mbs", "disk_save_mbs", "disk_hit_rate", "prompt_reuse"];
 const MOE_KEYS = ["moe_hit_rate", "moe_miss_s", "moe_upload_s", "moe_evict_s", "moe_upload_mbs", "moe_warm_mbs",
   "moe_fill_mbs", "moe_readmit_s"];
 const MACHINE_RATE_KEYS = ["cpu_pct", "iowait_pct", "server_cpu_pct", "server_share_pct"];
@@ -63,6 +63,7 @@ export function derive(p, c) {
     vram_used: c.vram_used, vram_total: c.vram_total, gpu_power_w: c.gpu_power_w, gpu_temp_c: c.gpu_temp_c,
     gpu_clock_mhz: c.gpu_clock_mhz, mem_avail: c.mem_avail, mem_total: c.mem_total, swap_used: c.swap_used,
     sample_us: c.sample_us,
+    kv_fill_pct: ratio(scale(100, c.kv_used), c.kv_max),
   };
   for (const k of [...SERVER_KEYS, ...MOE_KEYS, ...MACHINE_RATE_KEYS]) s[k] = null;
   if (!p) return s;
@@ -95,6 +96,10 @@ export function derive(p, c) {
     s.publish_us = ratio(delta(p, c, "publish_us"), delta(p, c, "publish_n"));
     s.disk_restore_mbs = rateOver(delta(p, c, "disk_restore_bytes"), dts, busy);
     s.disk_save_mbs = rateOver(delta(p, c, "disk_save_bytes"), dts, busy);
+    s.disk_hit_rate = ratio(delta(p, c, "disk_find_hit"), delta(p, c, "disk_find"));
+    // the share of the prompt tokens a slot already held, in the interval (only intervals that read a prompt count)
+    const dCached = delta(p, c, "prompt_cached");
+    s.prompt_reuse = ratio(dCached, isNum(dCached) && isNum(dPrompt) ? dCached + dPrompt : null);
     if (isNum(s.disk_restore_mbs)) s.disk_restore_mbs /= 1e6;
     if (isNum(s.disk_save_mbs)) s.disk_save_mbs /= 1e6;
   }

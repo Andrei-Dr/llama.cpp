@@ -130,3 +130,16 @@ test("PCIe ceiling from the link's generation and width", () => {
   assert.equal(pcieCeilingGBs({ pcie_gen_max: null, pcie_width_max: 16 }), null);
   assert.equal(pcieCeilingGBs(null), null);
 });
+
+test("the prompt cache: disk hit rate and prompt reuse per interval, KV fill as a gauge", () => {
+  const p = row({ disk_find: 10, disk_find_hit: 4, prompt_cached: 100, prompt_tokens: 50, kv_used: 100, kv_max: 400 });
+  const c = row({ t_us: 11e6, snap_t_us: 10.9e6, disk_find: 20, disk_find_hit: 9, prompt_cached: 160, prompt_tokens: 90, kv_used: 100, kv_max: 400 });
+  const s = derive(p, c);
+  assert.equal(s.disk_hit_rate, 0.5);
+  assert.equal(s.prompt_reuse, 0.6);
+  assert.equal(s.kv_fill_pct, 25);
+  const idle = derive(p, row({ t_us: 11e6, snap_t_us: 10.9e6, disk_find: 10, disk_find_hit: 4, prompt_cached: 100, prompt_tokens: 50 }));
+  assert.equal(idle.disk_hit_rate, null);
+  assert.equal(idle.prompt_reuse, null);
+  assert.equal(derive(null, row({ kv_used: 1, kv_max: 0 })).kv_fill_pct, null);
+});
