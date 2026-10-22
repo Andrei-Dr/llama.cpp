@@ -3631,7 +3631,8 @@ private:
                         slot.stats.n_prompt_cached    = n_past;
                         slot.stats.n_prompt_processed = 0;
 
-                        metrics.add_prompt_cached(n_past);
+                        // a disk restore at this task's slot selection replaced the slot's prompt: n_past came from the disk
+                        metrics.add_prompt_cached(n_past, slot.sel.disk_restored && slot.sel.id_task == slot.task->id);
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -4545,6 +4546,7 @@ private:
             r[SSC_prompt_tokens]  = (double) m.prompt.count;
             r[SSC_prompt_us]      = (double) m.prompt.time;
             r[SSC_prompt_cached]  = (double) m.n_prompt_cached;
+            r[SSC_prompt_cached_disk] = (double) m.n_prompt_cached_disk;
             r[SSC_tasks]          = s->done ? (double) s->done->n_tasks : 0.0;
             r[SSC_n_decode]       = (double) m.n_decode;
             r[SSC_step_n]         = (double) s->step_gen.n;
@@ -4565,8 +4567,11 @@ private:
                 r[SSC_disk_find_hit]      = (double) d.n_find_hit;
                 r[SSC_disk_save]          = (double) d.n_save;
                 r[SSC_disk_save_bytes]    = (double) d.save_bytes;
+                r[SSC_disk_save_us]       = (double) d.save_us;
                 r[SSC_disk_restore]       = (double) d.n_restore;
                 r[SSC_disk_restore_bytes] = (double) d.restore_bytes;
+                r[SSC_disk_restore_tokens] = (double) d.restore_tokens;
+                r[SSC_disk_restore_us]    = (double) d.restore_us;
                 r[SSC_disk_evict]         = (double) (d.n_evict_expired + d.n_evict_space + d.n_superseded);
                 r[SSC_disk_bytes]         = (double) s->disk_bytes;
                 r[SSC_disk_entries]       = (double) s->disk_entries;

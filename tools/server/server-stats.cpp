@@ -218,6 +218,7 @@ json server_stats_snapshot::to_json(int max_tasks) const {
             { "prompt_tokens",        m.prompt.count        },
             { "prompt_us",            m.prompt.time         },
             { "prompt_tokens_cached", m.n_prompt_cached     },
+            { "prompt_tokens_cached_disk", m.n_prompt_cached_disk },
             { "gen_tokens",           m.predict.count       },
             { "gen_steps",            m.predict.steps       },
             { "gen_us",               m.predict.time        },

@@ -240,6 +240,36 @@ def test_stats_disk_cache(tmp_path):
     assert s["tasks"][2]["n_prompt_cached"] > 256
     assert s["selection"]["disk_restored"] == 1
 
+    # the restore replaces the slot's prompt, so the reused prefix of a restored task comes from the disk and is counted in
+    # prompt_tokens_cached; prompt_tokens_cached_disk is that part (the restore may load more than the prompt reuses)
+    c = s["counters"]
+    assert c["prompt_tokens_cached_disk"] == s["tasks"][2]["n_prompt_cached"]
+    assert c["prompt_tokens_cached"] >= c["prompt_tokens_cached_disk"]
+    assert d["restore_tokens"] >= c["prompt_tokens_cached_disk"]
+
+    # the history rows carry the same counters from the sampler's next row on
+    want = "prompt_cached_disk,disk_restore_tokens,disk_restore_us,disk_save_us"
+    deadline = time.time() + 5.0
+    while True:
+        h = server.make_request("GET", "/stats/history?cols=" + want).body
+        if (h["n"] and h["cols"]["prompt_cached_disk"][-1] == c["prompt_tokens_cached_disk"]) or time.time() > deadline:
+            break
+        time.sleep(0.1)
+    cols = h["cols"]
+    assert cols["prompt_cached_disk"][-1] == c["prompt_tokens_cached_disk"]
+    assert cols["disk_restore_tokens"][-1] == d["restore_tokens"]
+    assert cols["disk_restore_us"][-1] == d["restore_us"] > 0
+    assert cols["disk_save_us"][-1] == d["save_us"] > 0
+
+
+def test_stats_no_disk_restore_counts_nothing_from_disk():
+    server.start()
+    complete("Once upon a time", 4)
+    complete("Once upon a time there", 4)  # reuses the slot's prefix: cached, but not from a disk
+    s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 2)
+    assert s["counters"]["prompt_tokens_cached"] > 0
+    assert s["counters"]["prompt_tokens_cached_disk"] == 0
+
 
 def test_stats_disk_idle_save_is_published(tmp_path):
     # an idle save runs outside the request path (the queue's idle hook): /stats must show it without another request

@@ -217,7 +217,8 @@ struct server_stats_snapshot {
     X(draft_accepted,        C) \
     X(prompt_tokens,         C) \
     X(prompt_us,             C) \
-    X(prompt_cached,         C) \
+    X(prompt_cached,         C) /* reused prompt tokens, the disk-restored ones included               */ \
+    X(prompt_cached_disk,    C) /* ... of them, reused from a prompt cache disk restore               */ \
     X(tasks,                 C) \
     X(n_decode,              C) \
     X(step_n,                C) /* generation steps (/stats decode.step_gen)                           */ \
@@ -247,8 +248,11 @@ struct server_stats_snapshot {
     X(disk_find_hit,         C) \
     X(disk_save,             C) \
     X(disk_save_bytes,       C) \
+    X(disk_save_us,          C) \
     X(disk_restore,          C) \
     X(disk_restore_bytes,    C) \
+    X(disk_restore_tokens,   C) /* tokens loaded (an entry may hold more than the prompt reuses)      */ \
+    X(disk_restore_us,       C) \
     X(disk_evict,            C) \
     X(disk_bytes,            G) \
     X(disk_entries,          G) \

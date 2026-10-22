@@ -470,6 +470,9 @@ struct server_metrics {
 
     // tokens reused from the cache need no decode, so they only have a count
     uint64_t n_prompt_cached = 0;
+    // ... of them, the ones a prompt cache disk restore put in the slot (the restore replaces the slot's prompt, so the
+    // whole reused prefix of a restored task comes from the disk)
+    uint64_t n_prompt_cached_disk = 0;
 
     uint64_t n_tokens_max = 0;
 
@@ -495,8 +498,11 @@ struct server_metrics {
         prompt_bucket.add(n_tokens, n_tokens, t_us);
     }
 
-    void add_prompt_cached(uint64_t n_tokens) {
+    void add_prompt_cached(uint64_t n_tokens, bool from_disk = false) {
         n_prompt_cached += n_tokens;
+        if (from_disk) {
+            n_prompt_cached_disk += n_tokens;
+        }
     }
 };
 
