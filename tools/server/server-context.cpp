@@ -1379,6 +1379,9 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+                // the slot is free now (reset() ran): /slots shows it at once, as the SLOT_GET task after it would
+                stats_force = true;
+                stats_publish(ggml_time_us());
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -4325,12 +4328,13 @@ private:
         metrics_queue_prompt(n_prompt_tokens);
 
         stats_on_decode(n_prompt_tokens, n_tokens, t_synced);
-        stats_publish(t_synced > 0 ? t_synced : ggml_time_us()); // a long prompt runs many decodes in one iteration
 
         if (has_output) {
             // the context is already synchronized, so the timings are correct
             metrics_flush_prompt();
         }
+
+        stats_publish(t_synced > 0 ? t_synced : ggml_time_us()); // a long prompt runs many decodes in one iteration
 
         // advance the prompt timing of the slots that had tokens in this batch
         // note: a second pass, it must run after the sync to reflect the compute

@@ -326,3 +326,22 @@ def test_slots_shows_a_running_task():
     time.sleep(0.3)
     assert server.make_request("GET", "/slots").body[0]["is_processing"] is False
     assert server.make_request("GET", "/slots?fail_on_no_slot=1").status_code == 200
+
+
+def test_slots_free_right_after_a_response_with_another_slot_busy():
+    # two slots: one generates for a while, the other finishes; a /slots read right after the short response must show
+    # the short one's slot free (the release publishes at once, not at the next period)
+    server.server_slots = True
+    server.n_slots = 2
+    server.n_predict = 400
+    server.start()
+    import threading
+    long_req = threading.Thread(target=lambda: complete("Once upon a time", 200))
+    long_req.start()
+    time.sleep(0.2)
+    for _ in range(5):
+        body = complete("The little dog", 4)
+        rows = server.make_request("GET", "/slots").body  # no sleep: right after the response
+        busy = [r for r in rows if r["is_processing"]]
+        assert len(busy) <= 1, f"the finished request's slot still shows busy: {busy}"
+    long_req.join()
