@@ -1700,6 +1700,13 @@ extern "C" {
             int32_t                            * slot_expert,
             size_t                               n_slot_expert);
 
+    // CPU-split timing of a context's graphs: with the experts on the CPU (-ot exps=CPU) this is the expert phase of each
+    // layer. llama_set_cpu_timing(ctx, true) times the graphs computed after it (a caller times only what it wants, e.g.
+    // generation steps); llama_get_cpu_timing copies the cumulative totals: total_us, n_graphs (timed graphs), layer_us
+    // (n_layer entries, may be NULL), and returns the number of layers seen (the highest layer index + 1)
+    LLAMA_API void    llama_set_cpu_timing(struct llama_context * ctx, bool on);
+    LLAMA_API int32_t llama_get_cpu_timing(const struct llama_context * ctx, int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int32_t n_layer);
+
     //
     // training
     //

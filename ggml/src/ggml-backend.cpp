@@ -805,6 +805,15 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // CPU split timing (ggml_backend_sched_set_timed / get_cpu_time)
+    bool     timed;
+    int64_t  cpu_us_total;
+    uint64_t n_graphs_timed;
+    std::vector<int64_t> * cpu_us_layer; // owned; allocated on first use
+    // which backends are CPU, decided once at creation: ggml_backend_dev_type() can be expensive (CUDA asks the driver
+    // for the device properties on every call), far too slow for the split loop
+    bool backend_is_cpu[GGML_SCHED_MAX_BACKENDS];
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -2095,6 +2104,37 @@ static void ggml_backend_sched_used_experts(const struct ggml_tensor * ids_tenso
     }
 }
 
+// the layer a split belongs to: the "-<n>" suffix of the first node name that has one (llama.cpp names its nodes so)
+static int ggml_backend_sched_split_layer(const struct ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const char * name = split->graph.nodes[i]->name;
+        const char * dash = strrchr(name, '-');
+        if (dash && dash[1] >= '0' && dash[1] <= '9') {
+            char * end = nullptr;
+            const long il = strtol(dash + 1, &end, 10);
+            if (end && *end == '\0' && il >= 0 && il < 4096) {
+                return (int) il;
+            }
+        }
+    }
+    return -1;
+}
+
+static void ggml_backend_sched_add_cpu_time(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, int64_t us) {
+    sched->cpu_us_total += us;
+    const int il = ggml_backend_sched_split_layer(split);
+    if (il < 0) {
+        return;
+    }
+    if (!sched->cpu_us_layer) {
+        sched->cpu_us_layer = new std::vector<int64_t>();
+    }
+    if ((size_t) il >= sched->cpu_us_layer->size()) {
+        sched->cpu_us_layer->resize(il + 1, 0);
+    }
+    (*sched->cpu_us_layer)[il] += us;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2400,10 +2440,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
 
         if (!sched->callback_eval) {
+            const bool cpu_timed = sched->timed && sched->backend_is_cpu[split_backend_id];
+            const int64_t t_split = cpu_timed ? ggml_time_us() : 0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 sync_copy_backends();
                 return ec;
+            }
+            if (cpu_timed) {
+                ggml_backend_sched_add_cpu_time(sched, split, ggml_time_us() - t_split);
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -2478,6 +2523,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    for (int b = 0; b < n_backends; b++) {
+        sched->backend_is_cpu[b] = ggml_backend_dev_type(ggml_backend_get_device(backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2529,6 +2577,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    delete sched->cpu_us_layer;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2647,6 +2696,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (sched->timed) {
+        sched->n_graphs_timed++;
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
@@ -3142,4 +3194,24 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+void ggml_backend_sched_set_timed(ggml_backend_sched_t sched, bool timed) {
+    sched->timed = timed;
+}
+
+int ggml_backend_sched_get_cpu_time(ggml_backend_sched_t sched, int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int n_layer) {
+    if (total_us) {
+        *total_us = sched->cpu_us_total;
+    }
+    if (n_graphs) {
+        *n_graphs = sched->n_graphs_timed;
+    }
+    const int n = sched->cpu_us_layer ? (int) sched->cpu_us_layer->size() : 0;
+    if (layer_us) {
+        for (int i = 0; i < n_layer; ++i) {
+            layer_us[i] = i < n ? (*sched->cpu_us_layer)[i] : 0;
+        }
+    }
+    return n;
 }

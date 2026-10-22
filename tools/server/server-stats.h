@@ -168,6 +168,13 @@ struct server_stats_snapshot {
     bool                         has_slot_rows = false;
     std::vector<server_slot_row> slot_rows;
 
+    // CPU-split time of the generation steps (llama_get_cpu_timing): with the experts on the CPU, the expert phase
+    struct {
+        uint64_t             n_graphs = 0; // timed graphs (one per generation step)
+        int64_t              cpu_us   = 0;
+        std::vector<int64_t> layer_us;     // by layer index; empty when no split named a layer
+    } phase;
+
     // decode wall time of one target batch with output (llama_decode + synchronize), by kind: gen = no prompt tokens.
     // prompt: only the synchronized (last) batch of a prompt is timed, and it can include earlier unsynchronized batches
     server_stats_timer decode_gen;
@@ -191,6 +198,7 @@ struct server_stats_snapshot {
     // max_tasks: the newest completed tasks to include (< 0 = the whole ring)
     json to_json(int max_tasks = -1) const;
     json disk_json() const;
+    json phase_json() const;
 };
 
 // the MoE expert cache's latest snapshot (llama_moe_cache_get_stats), or null without a cache. Any thread: reads the

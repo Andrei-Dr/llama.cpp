@@ -4796,3 +4796,11 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
 }
+
+void llama_set_cpu_timing(llama_context * ctx, bool on) {
+    ggml_backend_sched_set_timed(ctx->get_sched(), on);
+}
+
+int32_t llama_get_cpu_timing(const llama_context * ctx, int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int32_t n_layer) {
+    return ggml_backend_sched_get_cpu_time(ctx->get_sched(), total_us, n_graphs, layer_us, n_layer);
+}

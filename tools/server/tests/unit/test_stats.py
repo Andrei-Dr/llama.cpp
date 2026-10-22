@@ -345,3 +345,30 @@ def test_slots_free_right_after_a_response_with_another_slot_busy():
         busy = [r for r in rows if r["is_processing"]]
         assert len(busy) <= 1, f"the finished request's slot still shows busy: {busy}"
     long_req.join()
+
+
+def test_stats_phase_cpu_split_time():
+    # experts on the CPU: every generation step runs one CPU split per layer, timed and attributed to its layer
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU"]
+    server.start()
+    complete("Once upon a time", 32)
+    s = wait_stats(lambda s: (s.get("phase") or {}).get("steps", 0) > 0)
+    p = s["phase"]
+    if p is None:
+        pytest.skip("no CPU split (no GPU device: everything runs on the CPU backend untimed)")
+    assert p["steps"] == s["decode"]["gen"]["n"]
+    assert p["graphs"] >= p["steps"]
+    assert p["cpu_us"] > 0
+    assert len(p["cpu_us_layer"]) == len(p["il"]) > 0
+    assert sum(p["cpu_us_layer"]) <= p["cpu_us"]
+    assert all(v > 0 for v in p["cpu_us_layer"]), "every layer's experts run on the CPU"
+
+
+def test_stats_phase_no_layers_when_the_experts_are_on_the_gpu():
+    # all layers on the device: no CPU split names a layer (a small unnamed CPU part, e.g. the input rows, may remain)
+    server.n_gpu_layer = 99
+    server.start()
+    complete("Once upon a time", 16)
+    s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 1)
+    assert s["phase"] is None or s["phase"]["cpu_us_layer"] == []

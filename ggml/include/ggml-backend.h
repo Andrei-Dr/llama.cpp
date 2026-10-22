@@ -355,6 +355,13 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // CPU split timing. While timed, every split computed on a CPU backend adds its compute time (the CPU backend computes
+    // synchronously, so this is the work itself) to a total and to the layer its first node names ("<name>-<layer>").
+    // set_timed applies to the graphs computed after it; get_cpu_time copies the cumulative totals: total_us, n_graphs (the
+    // timed graphs), layer_us[0..n_layer) (may be NULL), and returns the number of layers seen (the highest index + 1)
+    GGML_API void                 ggml_backend_sched_set_timed(ggml_backend_sched_t sched, bool timed);
+    GGML_API int                  ggml_backend_sched_get_cpu_time(ggml_backend_sched_t sched, int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int n_layer);
+
     //
     // Meta backend
     //
