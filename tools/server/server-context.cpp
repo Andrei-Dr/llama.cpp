@@ -916,6 +916,7 @@ public:
         j["moe_cache"] = server_stats_moe_cache_json();
         const auto m = sampler ? sampler->latest() : nullptr;
         j["machine"] = m ? m->to_json() : json(nullptr);
+        j["queue"]   = { { "posted", queue_tasks.posted_json() } }; // tasks posted to the main loop, by type
         return j;
     }
 

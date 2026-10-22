@@ -38,9 +38,40 @@ static void stamp_posted(server_task & task) {
     }
 }
 
+static const char * task_type_name(size_t type) {
+    switch ((server_task_type) type) {
+        case SERVER_TASK_TYPE_COMPLETION:    return "completion";
+        case SERVER_TASK_TYPE_EMBEDDING:     return "embedding";
+        case SERVER_TASK_TYPE_RERANK:        return "rerank";
+        case SERVER_TASK_TYPE_INFILL:        return "infill";
+        case SERVER_TASK_TYPE_CANCEL:        return "cancel";
+        case SERVER_TASK_TYPE_CONTROL:       return "control";
+        case SERVER_TASK_TYPE_NEXT_RESPONSE: return "next_response";
+        case SERVER_TASK_TYPE_METRICS:       return "metrics";
+        case SERVER_TASK_TYPE_SLOT_GET:      return "slot_get";
+        case SERVER_TASK_TYPE_SLOT_SAVE:     return "slot_save";
+        case SERVER_TASK_TYPE_SLOT_RESTORE:  return "slot_restore";
+        case SERVER_TASK_TYPE_SLOT_ERASE:    return "slot_erase";
+        case SERVER_TASK_TYPE_GET_LORA:      return "get_lora";
+        case SERVER_TASK_TYPE_SET_LORA:      return "set_lora";
+    }
+    return "unknown";
+}
+
+json server_queue::posted_json() const {
+    json j = json::object();
+    for (size_t i = 0; i < N_TASK_TYPES; ++i) {
+        j[task_type_name(i)] = n_posted[i].load(std::memory_order_relaxed);
+    }
+    return j;
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    if ((size_t) task.type < N_TASK_TYPES) {
+        n_posted[task.type].fetch_add(1, std::memory_order_relaxed);
+    }
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
@@ -69,6 +100,9 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
             task.id = id++;
         }
         stamp_posted(task);
+        if ((size_t) task.type < N_TASK_TYPES) {
+            n_posted[task.type].fetch_add(1, std::memory_order_relaxed);
+        }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
             cleanup_pending_task(task.id_target);

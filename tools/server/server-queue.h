@@ -2,6 +2,8 @@
 
 #include "server-task.h"
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -42,6 +44,10 @@ private:
     worker_t worker;
 
     std::atomic<int64_t> t_blocking_since{0}; // blocking_since_us()
+
+    // tasks posted so far, by type (/stats "queue"): what proves that a statistics read posts none
+    static constexpr size_t N_TASK_TYPES = (size_t) SERVER_TASK_TYPE_SET_LORA + 1;
+    std::array<std::atomic<uint64_t>, N_TASK_TYPES> n_posted {};
     std::atomic<bool>    a_sleeping{false};   // sleeping_now()
 
     // callback functions
@@ -64,6 +70,9 @@ public:
 
     // Get the next id for creating a new task
     int get_new_id();
+
+    // the tasks posted so far, by type name; any thread, no lock
+    json posted_json() const;
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
