@@ -1276,6 +1276,7 @@ struct ggml_backend_sched {
 
     // upload / compute overlap (see ggml_backend_sched_set_upload_ahead)
     bool                   upload_ahead;                              // plan and run it for the graphs split from now on
+    bool                   upload_ahead_split;                        // the setting the current graph was split with
     ggml_backend_t         copy_backends[GGML_SCHED_MAX_BACKENDS];    // a second instance of the backend = a second stream
     ggml_backend_event_t   ahead_front  [GGML_SCHED_MAX_BACKENDS];    // compute-stream position an upload waits for
     ggml_backend_event_t * ahead_done;                                // [ahead_done_capacity] per target split: its uploads are done
@@ -1944,6 +1945,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->splits[i].ahead_split = -1;
         sched->splits[i].ahead_mask  = 0;
     }
+    sched->upload_ahead_split = sched->upload_ahead; // the setting this graph was split with, read by compute_splits
     if (sched->upload_ahead && sched->n_copies == 1) {
         for (int i = 1; i < sched->n_splits; i++) {
             struct ggml_backend_sched_split * split = &sched->splits[i];
@@ -2414,7 +2416,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
     // the splits whose weights were uploaded ahead on the second stream (a split on another backend may sit between the
     // uploading split and its target)
-    std::vector<bool> ahead_uploaded(sched->n_splits, false);
+    // (nothing is allocated or looked up for the graphs split without the overlap: every decode graph)
+    std::vector<bool> ahead_uploaded(sched->upload_ahead_split ? sched->n_splits : 0, false);
 
     // copies left on a stream by the previous graph (its caller synchronizes before it reads results, not necessarily before
     // the next graph writes host memory)
@@ -2463,7 +2466,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // before the weights, whose copy callback may queue large uploads
         ggml_backend_sched_prefetch_inputs(sched, split_id);
         // the weights an earlier split uploaded on the second stream: this split's stream waits for those uploads
-        const bool uploaded = ahead_uploaded[split_id];
+        const bool uploaded = sched->upload_ahead_split && ahead_uploaded[split_id];
         if (uploaded) {
             ggml_backend_event_wait(split_backend, sched->ahead_done[split_id]);
         }
@@ -2478,7 +2481,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // the weights of a later split, uploaded while this split computes
-        const int ahead_target = sched->callback_eval ? -1 : ggml_backend_sched_ahead_begin(sched, split_id);
+        const int ahead_target = !sched->upload_ahead_split || sched->callback_eval ? -1 : ggml_backend_sched_ahead_begin(sched, split_id);
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
