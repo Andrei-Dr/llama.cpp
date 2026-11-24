@@ -1073,6 +1073,15 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
     };
 
     const bool big = n_tokens_all > cparams.n_ubatch && !moe_prefill_unfit;
+
+    // diag: LLAMA_MOE_PREFILL_DIAG=N runs the whole suspend / leave path (cache freed, scheduler and pools released, cache
+    // uploaded again, scheduler reserved again) before every N-th small batch, at an unchanged ubatch: the output must not change
+    static const int diag_every = getenv("LLAMA_MOE_PREFILL_DIAG") ? atoi(getenv("LLAMA_MOE_PREFILL_DIAG")) : 0;
+    if (diag_every > 0 && !big && !moe_prefill_mode && !moe_cache->suspended() && n_decode_calls % diag_every == 0) {
+        synchronize();
+        moe_cache->suspend();
+        leave();
+    }
     if (big != moe_prefill_mode) {
         synchronize(); // nothing submitted earlier may still read the cache or the compute buffers
         if (big) {
