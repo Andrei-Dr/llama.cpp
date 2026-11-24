@@ -130,3 +130,54 @@ def test_prompt_disk_survives_a_model_reload(tmp_path):
     third = complete(STORY + " And then", 8)  # wakes the server: a fresh context, an empty slot
     assert third["timings"]["cache_n"] > 256
     assert third["timings"]["prompt_n"] < 16
+
+
+SWA_PROMPT = "The quick brown fox jumps over the lazy dog. " * 30
+
+
+def test_prompt_disk_restore_with_context_checkpoints(tmp_path):
+    # a sliding window smaller than the prompt: the memory cannot be rolled back to any position, so the slot keeps
+    # context checkpoints and a stored entry is written with them (.ckpt) and read back with them
+    def tokenize(text):
+        res = server.make_request("POST", "/tokenize", data={"content": text})
+        assert res.status_code == 200
+        return res.body["tokens"]
+
+    def ask(prompt, n_predict=8):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt, "n_predict": n_predict, "temperature": 0.0, "cache_prompt": True, "return_tokens": True})
+        assert res.status_code == 200
+        return res.body
+
+    def run(other_prompt_first):
+        global server
+        server = ServerPreset.tinygemma3()
+        server.override_kv = "gemma3.attention.sliding_window=int:64"
+        server.n_slots = 1
+        server.n_ubatch = 32
+        server.temperature = 0.0
+        server.extra_args = ["--cache-ram", "0", "--cache-disk", str(tmp_path), "--cache-disk-size", "256",
+                             "--cache-disk-reserve", "64", "--cache-disk-idle", "600000"]
+        server.start()
+        first = ask(tokenize(SWA_PROMPT))
+        # the first turn and its exact continuation, so the whole stored entry is a prefix of the next prompt
+        nxt = tokenize(SWA_PROMPT) + first["tokens"] + tokenize(" The end.")
+        n_ckpt_files = 0
+        if other_prompt_first:
+            ask("Once upon a time " * 60)  # pushes the first turn out of the slot onto disk
+            n_ckpt_files = len(glob.glob(os.path.join(str(tmp_path), "llama-pdc", "run-*", "*.ckpt")))
+        res = ask(nxt)
+        server.stop()
+        return res, n_ckpt_files, len(nxt)
+
+    direct, _, n_next = run(False)
+    restored, n_ckpt_files, _ = run(True)
+
+    assert n_ckpt_files >= 1, "the evicted prompt was stored without its context checkpoints"
+    assert n_next > 256 + 16
+    # the entry came back with its checkpoints: the same prefix is reused as when the slot never lost it, and the same
+    # tokens come out
+    assert restored["timings"]["cache_n"] > 256
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["tokens"] == direct["tokens"]
