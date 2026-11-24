@@ -1067,6 +1067,8 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         if (!moe_cache->resume()) {
             LLAMA_LOG_WARN("%s: the MoE cache does not fit back after the prefill, generation runs without it for now\n", __func__);
             moe_resume_at = n_decode_calls + 64;
+        } else {
+            LLAMA_LOG_INFO("%s: MoE prefill mode off: MoE cache resumed\n", __func__);
         }
     };
 
@@ -1075,14 +1077,29 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         synchronize(); // nothing submitted earlier may still read the cache or the compute buffers
         if (big) {
             moe_cache->suspend();
-            moe_prefill_mode   = true;
-            sched_need_reserve = true;
-            try {
-                sched_reserve();
-            } catch (const std::exception & e) {
-                // latched: retrying on every prompt would release and upload the cache twice each time
-                LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): prompts run at ubatch %u from now on\n",
-                        __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
+            moe_prefill_mode = true;
+            // a first failure may be pool growth left by the previous generation (the pools are only trimmed when the mode
+            // ends): free the scheduler and the pools, and try once more before giving up
+            bool fit = false;
+            for (int attempt = 0; attempt < 2 && !fit; ++attempt) {
+                try {
+                    sched_need_reserve = true;
+                    sched_reserve();
+                    fit = true;
+                } catch (const std::exception & e) {
+                    if (attempt == 0) {
+                        sched.reset();
+                        trim_device_pools();
+                        continue;
+                    }
+                    // latched: retrying on every prompt would release and upload the cache twice each time
+                    LLAMA_LOG_WARN("%s: prefill ubatch %u does not fit (%s): prompts run at ubatch %u from now on\n",
+                            __func__, cparams.n_ubatch_prefill, e.what(), cparams.n_ubatch);
+                }
+            }
+            if (fit) {
+                LLAMA_LOG_INFO("%s: MoE prefill mode on: ubatch %u, MoE cache suspended\n", __func__, cparams.n_ubatch_prefill);
+            } else {
                 moe_prefill_unfit = true;
                 leave();
             }
