@@ -211,7 +211,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const auto * e = disk->find(tokens_new, lora_new, f_keep_best, f_sim_best, f_keep_disk, f_sim_disk);
         if (e != nullptr) {
             SRV_TRC(" - found better prompt on disk with f_keep = %.3f, f_sim = %.3f\n", f_keep_disk, f_sim_disk);
-            if (disk->load(*e, prompt, ctx_tgt, ctx_dft, id_slot)) {
+            if (disk->load(*e, prompt, lora_new, ctx_tgt, ctx_dft, id_slot)) {
                 return true;
             }
             if (it_best == states.end()) {

@@ -1,6 +1,7 @@
 // tests for the /stats plane of llama-server (tools/server/server-stats.h): histogram buckets, the completed-task ring,
 // the publish period and the immutability of a published snapshot
 
+#include "../tools/server/server-prompt-disk.h"
 #include "../tools/server/server-stats.h"
 
 #include "testing.h"
@@ -256,6 +257,54 @@ static void test_history(testing & t) {
     t.assert_equal(40.0, h.latest()->sec.to_json("s", -INFINITY, {}).at("cols").at("t_us").back().get<double>());
 }
 
+// The lora config of a disk entry is kept by value, so an entry written before a model reload (which frees the adapters)
+// is matched against the adapters loaded afterwards without reading through a stored pointer. The adapter pointers here
+// are addresses that cannot be read: any dereference crashes the test.
+static void test_disk_lora(testing & t) {
+    auto * const before_a = (llama_adapter_lora *) 0x10;  // the adapters of the context that wrote the entry (freed)
+    auto * const before_b = (llama_adapter_lora *) 0x20;
+    auto * const after_a  = (llama_adapter_lora *) 0x30;  // the same files, loaded again
+    auto * const after_b  = (llama_adapter_lora *) 0x40;
+
+    const auto config = [](llama_adapter_lora * a, float scale_a, llama_adapter_lora * b, float scale_b) {
+        return std::vector<common_adapter_lora_info> {
+            { "a.gguf", scale_a, "", "", a },
+            { "b.gguf", scale_b, "", "", b },
+        };
+    };
+
+    const auto stored = server_prompt_disk_lora_of(config(before_a, 1.0f, before_b, 0.0f));
+    t.assert_equal("one stored adapter per adapter", (size_t) 2, stored.size());
+    t.assert_equal(std::string("a.gguf"), stored[0].path);
+    t.assert_true("scales kept", stored[0].scale == 1.0f && stored[1].scale == 0.0f);
+
+    // by value: the same files and scales are the same config, whatever the adapter addresses
+    t.assert_true("equal after a reload",
+            server_prompt_disk_lora_equal(stored, server_prompt_disk_lora_of(config(after_a, 1.0f, after_b, 0.0f))));
+    t.assert_true("another scale is another config",
+            !server_prompt_disk_lora_equal(stored, server_prompt_disk_lora_of(config(after_a, 0.5f, after_b, 0.0f))));
+    t.assert_true("no adapter is not a config with adapters", !server_prompt_disk_lora_equal(stored, {}));
+
+    // the stored config over the adapters loaded now: the current pointers, the stored scales
+    std::vector<common_adapter_lora_info> live;
+    t.assert_true("same adapter list", server_prompt_disk_lora_live(stored, config(after_a, 0.0f, after_b, 0.7f), live));
+    t.assert_true("live pointers", live.size() == 2 && live[0].ptr == after_a && live[1].ptr == after_b);
+    t.assert_true("stored scales", live[0].scale == 1.0f && live[1].scale == 0.0f);
+
+    // a request under the entry's config restores it after the reload
+    t.assert_true("usable under the same config", server_prompt_disk_lora_usable(stored, config(after_a, 1.0f, after_b, 0.0f)));
+
+    // another adapter list (count or files): the entry is skipped
+    std::vector<common_adapter_lora_info> other = config(after_a, 1.0f, after_b, 0.0f);
+    other[1].path = "c.gguf";
+    t.assert_true("other files: no live config", !server_prompt_disk_lora_live(stored, other, live));
+    t.assert_true("other files: skipped",        !server_prompt_disk_lora_usable(stored, other));
+    t.assert_true("fewer adapters: skipped",     !server_prompt_disk_lora_usable(stored, {}));
+
+    // no adapter at all (the common case): always usable, nothing compared
+    t.assert_true("no lora", server_prompt_disk_lora_usable({}, {}));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -273,6 +322,7 @@ int main(int argc, char ** argv) {
     t.test("done_shared",        test_done_shared);
     t.test("slot_row_json",      test_slot_row_json);
     t.test("history",            test_history);
+    t.test("disk_lora",          test_disk_lora);
 
     return t.summary();
 }

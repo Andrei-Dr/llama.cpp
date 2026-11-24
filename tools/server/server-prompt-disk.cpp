@@ -695,12 +695,58 @@ size_t server_prompt_disk::reusable_prompt(const server_prompt & prompt, size_t 
     return best;
 }
 
+std::vector<server_prompt_disk_lora> server_prompt_disk_lora_of(const std::vector<common_adapter_lora_info> & lora) {
+    std::vector<server_prompt_disk_lora> res;
+    res.reserve(lora.size());
+    for (const auto & la : lora) {
+        res.push_back({ la.path, la.scale });
+    }
+    return res;
+}
+
+bool server_prompt_disk_lora_equal(const std::vector<server_prompt_disk_lora> & a,
+                                   const std::vector<server_prompt_disk_lora> & b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].scale != b[i].scale || a[i].path != b[i].path) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool server_prompt_disk_lora_live(const std::vector<server_prompt_disk_lora> & stored,
+                                  const std::vector<common_adapter_lora_info> & loaded,
+                                  std::vector<common_adapter_lora_info> & live) {
+    if (stored.size() != loaded.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < stored.size(); ++i) {
+        if (stored[i].path != loaded[i].path) {
+            return false;
+        }
+    }
+    live = loaded;
+    for (size_t i = 0; i < stored.size(); ++i) {
+        live[i].scale = stored[i].scale;
+    }
+    return true;
+}
+
+bool server_prompt_disk_lora_usable(const std::vector<server_prompt_disk_lora> & stored,
+                                    const std::vector<common_adapter_lora_info> & lora_new) {
+    std::vector<common_adapter_lora_info> live;
+    return server_prompt_disk_lora_live(stored, lora_new, live) && !lora_should_clear_cache(live, lora_new);
+}
+
 // entry e restores `tokens` exactly: tokens is e's prompt, or a prefix e can be rolled back to, made with the same
 // lora config
 bool server_prompt_disk::covers(const server_prompt_disk_entry & e, const server_tokens & tokens,
-                                const std::vector<common_adapter_lora_info> & lora) const {
+                                const std::vector<server_prompt_disk_lora> & lora) const {
     const size_t n = tokens.size();
-    if (!are_lora_equal(e.lora, lora)) {
+    if (!server_prompt_disk_lora_equal(e.lora, lora)) {
         return false;
     }
     if (n > e.tokens.size() || server_tokens(e.tokens, false).get_common_prefix(tokens) != n) {
@@ -714,7 +760,7 @@ bool server_prompt_disk::covers(const server_prompt_disk_entry & e, const server
 
 // share of old entry o that newer entry n reproduces: n's reusable prefix within their common prefix, over |o|
 float server_prompt_disk::redundancy(const server_prompt_disk_entry & o, const server_prompt_disk_entry & n) const {
-    if (o.tokens.empty() || !are_lora_equal(o.lora, n.lora)) {
+    if (o.tokens.empty() || !server_prompt_disk_lora_equal(o.lora, n.lora)) {
         return 0.0f;
     }
     const size_t lcp = server_tokens(n.tokens, false).get_common_prefix(server_tokens(o.tokens, false));
@@ -740,8 +786,9 @@ std::list<server_prompt_disk_entry>::iterator server_prompt_disk::victim() {
 }
 
 bool server_prompt_disk::stored(const server_prompt & prompt) {
+    const auto lora = server_prompt_disk_lora_of(prompt.lora);
     for (auto it = entries.begin(); it != entries.end(); ++it) {
-        if (!expired(*it) && covers(*it, prompt.tokens, prompt.lora)) {
+        if (!expired(*it) && covers(*it, prompt.tokens, lora)) {
             touch(it);
             return true;
         }
@@ -861,7 +908,7 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
     }
 
     e.tokens = tokens;
-    e.lora   = prompt.lora;
+    e.lora   = server_prompt_disk_lora_of(prompt.lora);
     for (const auto & c : prompt.checkpoints) {
         e.ckpt_tokens.push_back(c->n_tokens);
     }
@@ -908,7 +955,7 @@ const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & 
     }
     stats.n_find++;
     for (const auto & e : entries) {
-        if (expired(e) || lora_should_clear_cache(e.lora, lora_new)) {
+        if (expired(e) || !server_prompt_disk_lora_usable(e.lora, lora_new)) {
             continue;
         }
         const size_t lcp   = server_tokens(e.tokens, false).get_common_prefix(tokens_new);
@@ -936,6 +983,7 @@ const server_prompt_disk_entry * server_prompt_disk::find(const server_tokens & 
 }
 
 bool server_prompt_disk::load(const server_prompt_disk_entry & entry, server_prompt & prompt,
+                              const std::vector<common_adapter_lora_info> & lora_loaded,
                               llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq) {
     auto it = entries.begin();
     while (it != entries.end() && &*it != &entry) {
@@ -945,7 +993,7 @@ bool server_prompt_disk::load(const server_prompt_disk_entry & entry, server_pro
         return false;
     }
     try {
-        if (load_impl(it, prompt, ctx_tgt, ctx_dft, seq)) {
+        if (load_impl(it, prompt, lora_loaded, ctx_tgt, ctx_dft, seq)) {
             return true;
         }
     } catch (const std::exception & e) {
@@ -962,8 +1010,16 @@ bool server_prompt_disk::load(const server_prompt_disk_entry & entry, server_pro
 }
 
 bool server_prompt_disk::load_impl(std::list<server_prompt_disk_entry>::iterator it, server_prompt & prompt,
+                                   const std::vector<common_adapter_lora_info> & lora_loaded,
                                    llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq) {
     const int64_t t0 = ggml_time_us();
+
+    // the entry's lora config over the adapters loaded now; an entry made with other adapters is not restored
+    // (find() does not return one)
+    std::vector<common_adapter_lora_info> lora_live;
+    if (!server_prompt_disk_lora_live(it->lora, lora_loaded, lora_live)) {
+        return false;
+    }
 
     // the outgoing checkpoints are already stored or being replaced: free them before reading the new ones, so the
     // two sets are never in RAM together
@@ -982,7 +1038,7 @@ bool server_prompt_disk::load_impl(std::list<server_prompt_disk_entry>::iterator
     // keep the slot's multimodal flag: an mmproj server's slot must stay able to take media next
     prompt.tokens      = server_tokens(it->tokens, prompt.tokens.has_mtmd);
     prompt.checkpoints = std::move(ckpts);
-    prompt.lora        = it->lora;
+    prompt.lora        = std::move(lora_live);
     touch(it);
 
     const int64_t t_restore = ggml_time_us() - t0;

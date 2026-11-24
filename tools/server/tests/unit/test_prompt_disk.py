@@ -132,6 +132,62 @@ def test_prompt_disk_survives_a_model_reload(tmp_path):
     assert third["timings"]["prompt_n"] < 16
 
 
+LORA_FILE_URL = "https://huggingface.co/ggml-org-dev/stories15M_MOE/resolve/main/moe_shakespeare15M.gguf"
+
+
+def test_prompt_disk_survives_a_model_reload_with_a_lora_adapter(tmp_path):
+    # a reload frees the adapters and loads them again: an entry keeps its lora config by value (file and scale), so
+    # the entry written before the sleep is found under the same config after the wake, and not under another scale
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.lora_files = [download_file(LORA_FILE_URL)]
+    # the only test adapter is for stories15M, whose 256-token context is below what the tier restores (>= 256 reused
+    # tokens): run it with a longer one
+    server.override_kv = "llama.context_length=int:2048"
+    server.sleep_idle_seconds = 1
+    server.extra_args = ["--cache-ram", "0", "--cache-disk", str(tmp_path), "--cache-disk-size", "256",
+                         "--cache-disk-reserve", "64", "--cache-disk-idle", "600000"]
+    server.start()
+
+    def ask(prompt, n_predict, scale=None):
+        data = {"prompt": prompt, "n_predict": n_predict, "temperature": 0.0, "cache_prompt": True}
+        if scale is not None:
+            data["lora"] = [{"id": 0, "scale": scale}]
+        res = server.make_request("POST", "/completion", data=data)
+        assert res.status_code == 200
+        return res.body
+
+    def wait_sleeping():
+        deadline = time.time() + 10
+        while not server.make_request("GET", "/props").body.get("is_sleeping") and time.time() < deadline:
+            time.sleep(0.1)
+        assert server.make_request("GET", "/props").body.get("is_sleeping")
+
+    ask(STORY + " The end.", 4)
+    ask(OTHER + " The end.", 4)  # pushes the first prompt out of the slot onto disk
+    assert len(entry_files(tmp_path)) == 1
+    wait_sleeping()
+
+    # the adapter at another scale: the stored state was not computed under this config
+    other_scale = ask(STORY + " And then", 8, scale=0.5)
+    assert other_scale["timings"]["cache_n"] == 0
+    wait_sleeping()
+
+    # the config of the entry (the adapter at its startup scale): restored
+    same = ask(STORY + " And then", 8)
+    assert same["timings"]["cache_n"] > 256
+    assert same["timings"]["prompt_n"] < 16
+
+    # and it computes what a server that never stored anything computes under that config
+    server.stop()
+    server.sleep_idle_seconds = None
+    server.extra_args = ["--cache-ram", "0"]
+    server.start()
+    fresh = ask(STORY + " And then", 8)
+    assert fresh["timings"]["cache_n"] == 0
+    assert fresh["content"] == same["content"]
+
+
 SWA_PROMPT = "The quick brown fox jumps over the lazy dog. " * 30
 
 

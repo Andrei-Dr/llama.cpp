@@ -13,7 +13,8 @@
 // run keeps flock()ed. At startup, run directories that carry the marker and whose lock can be taken are removed;
 // nothing without the marker is ever touched. The index (tokens, checkpoint positions, sizes, last use) lives in
 // memory only. A new entry replaces older ones it reproduces >= 90% of (the same conversation, one turn later).
-// An entry keeps the lora config its state was computed with: like the RAM tier, a request made under another config
+// An entry keeps the lora config its state was computed with, by value (adapter paths and scales: the adapters
+// themselves are freed by a model reload, the entries are not): like the RAM tier, a request made under another config
 // (aloras aside) never restores it.
 // Entries expire after a TTL; under the byte cap or the free-space reserve, old entries largely reproduced by newer
 // ones go first, then the least recently used.
@@ -30,11 +31,36 @@
 
 struct server_prompt;
 
+// One adapter of a stored lora config. No llama_adapter_lora pointer: an entry outlives the adapters.
+struct server_prompt_disk_lora {
+    std::string path;
+    float       scale = 0.0f;
+};
+
+// The value identity of a config: the path and scale of every adapter, in order. Reads no adapter.
+std::vector<server_prompt_disk_lora> server_prompt_disk_lora_of(const std::vector<common_adapter_lora_info> & lora);
+
+// The same adapters in the same order with the same scales.
+bool server_prompt_disk_lora_equal(const std::vector<server_prompt_disk_lora> & a,
+                                   const std::vector<server_prompt_disk_lora> & b);
+
+// A stored config over the adapters loaded now: `loaded` (any config of the current adapters, its pointers are live)
+// with the stored scales. false when the adapter list is not the stored one (count or paths): the state then belongs to
+// no config a request can ask for. Reads no adapter.
+bool server_prompt_disk_lora_live(const std::vector<server_prompt_disk_lora> & stored,
+                                  const std::vector<common_adapter_lora_info> & loaded,
+                                  std::vector<common_adapter_lora_info> & live);
+
+// Whether a request under lora_new may restore a state stored under `stored` (the RAM tier's rule,
+// lora_should_clear_cache, applied to the stored config over the adapters loaded now).
+bool server_prompt_disk_lora_usable(const std::vector<server_prompt_disk_lora> & stored,
+                                    const std::vector<common_adapter_lora_info> & lora_new);
+
 struct server_prompt_disk_entry {
     std::string          id;           // hex hash of the tokens: identical prompts share one entry
     llama_tokens         tokens;
     std::vector<int64_t> ckpt_tokens;  // n_tokens of each stored context checkpoint
-    std::vector<common_adapter_lora_info> lora;  // the lora config the state was computed with
+    std::vector<server_prompt_disk_lora> lora;  // the lora config the state was computed with
     size_t               bytes = 0;
     std::chrono::steady_clock::time_point t_used;  // last save or restore
 };
@@ -100,9 +126,11 @@ struct server_prompt_disk {
                                           float f_keep_base, float f_sim_base,
                                           float & f_keep_out, float & f_sim_out) const;
 
-    // Restore an entry into `seq` and replace `prompt` (tokens, checkpoints, lora). On failure the entry is deleted and
-    // `seq` is cleared; the caller must clear the slot.
+    // Restore an entry into `seq` and replace `prompt` (tokens, checkpoints, lora). lora_loaded: any config of the
+    // adapters loaded now (the request's), from which the prompt's lora config gets its adapters. On failure the entry
+    // is deleted and `seq` is cleared; the caller must clear the slot.
     bool load(const server_prompt_disk_entry & entry, server_prompt & prompt,
+              const std::vector<common_adapter_lora_info> & lora_loaded,
               llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 
     // Drop expired entries, then (near-duplicates first, else least recently used) until the cap and reserve hold.
@@ -132,7 +160,7 @@ private:
     const uint8_t * key_ptr() const { return encrypt ? key : nullptr; }
     std::filesystem::path path(const std::string & id, const char * ext) const;
     bool   covers(const server_prompt_disk_entry & e, const server_tokens & tokens,
-                  const std::vector<common_adapter_lora_info> & lora) const;
+                  const std::vector<server_prompt_disk_lora> & lora) const;
     size_t reusable(const server_prompt_disk_entry & e, size_t lcp) const;
     void   remove_stale_runs(const std::filesystem::path & base) const;
     size_t remove(std::list<server_prompt_disk_entry>::iterator it);
@@ -144,6 +172,7 @@ private:
     float  redundancy(const server_prompt_disk_entry & o, const server_prompt_disk_entry & n) const;
     std::list<server_prompt_disk_entry>::iterator victim();
     bool   load_impl(std::list<server_prompt_disk_entry>::iterator it, server_prompt & prompt,
+                     const std::vector<common_adapter_lora_info> & lora_loaded,
                      llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq);
 };
 
