@@ -109,3 +109,24 @@ def test_prompt_disk_needs_a_usable_directory(tmp_path):
     server.extra_args = ["--cache-disk", str(blocker)]
     with pytest.raises(RuntimeError):
         server.start(timeout_seconds=15)
+
+
+def test_prompt_disk_survives_a_model_reload(tmp_path):
+    # the tier belongs to the server, not to the loaded model: entries written before a sleep restore after the wake
+    server.sleep_idle_seconds = 1
+    server.extra_args = ["--cache-ram", "0", "--cache-disk", str(tmp_path), "--cache-disk-size", "256",
+                         "--cache-disk-reserve", "64", "--cache-disk-idle", "600000"]
+    server.start()
+    complete(STORY + " The end.", 4)
+    complete(OTHER + " The end.", 4)  # pushes the first prompt out of the slot onto disk
+    assert len(entry_files(tmp_path)) == 1
+
+    deadline = time.time() + 10
+    while not server.make_request("GET", "/props").body.get("is_sleeping") and time.time() < deadline:
+        time.sleep(0.1)
+    assert server.make_request("GET", "/props").body.get("is_sleeping")
+    assert len(entry_files(tmp_path)) == 1  # the model is gone, the entry is not
+
+    third = complete(STORY + " And then", 8)  # wakes the server: a fresh context, an empty slot
+    assert third["timings"]["cache_n"] > 256
+    assert third["timings"]["prompt_n"] < 16
