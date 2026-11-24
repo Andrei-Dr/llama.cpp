@@ -1260,6 +1260,12 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    // set by a model before build_moe_ffn: builds (and adds to the graph) work that depends only on the layer input and runs
+    // on the device, e.g. a shared expert. build_moe_ffn calls it once, between the cached experts and the misses computed
+    // on the CPU (see llama_moe_cache::build_experts), so the device computes it while the CPU computes the misses.
+    // Not called when the layer has no CPU part: the model builds the work itself after build_moe_ffn, and resets the hook.
+    mutable std::function<void()> moe_overlap;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

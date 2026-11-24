@@ -550,23 +550,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps);
-    cb(moe_out, "ffn_moe_out", il);
-
-    // Add shared experts if present - following Qwen3Next reference implementation
-    if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
+    // Shared expert - following Qwen3Next reference implementation. It depends only on the layer input: when the MoE
+    // cache computes part of the misses on the CPU, build_moe_ffn builds it next to the cached experts (see
+    // llm_graph_context::moe_overlap), so the device computes it while the CPU computes the misses.
+    ggml_tensor * ffn_shexp = nullptr;
+    const auto build_shexp = [&]() {
+        ffn_shexp =
             build_ffn(cur,
                 model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
                 model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
@@ -585,10 +574,42 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         shared_gate = ggml_sigmoid(ctx0, shared_gate);
         cb(shared_gate, "shared_expert_gate_sigmoid", il);
 
-
         // Apply the gate to the shared expert output
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
+    };
+    const bool has_shexp = model.layers[il].ffn_up_shexp != nullptr;
+    // LLAMA_MOE_SHEXP_OVERLAP=0 builds the shared expert after the MoE FFN, as before (A/B switch; the result is the same)
+    static const bool shexp_overlap = [] {
+        const char * env = getenv("LLAMA_MOE_SHEXP_OVERLAP");
+        return !(env != nullptr && atoi(env) == 0);
+    }();
+    if (has_shexp && shexp_overlap) {
+        moe_overlap = [&]() {
+            build_shexp();
+            ggml_build_forward_expand(gf, ffn_shexp);
+        };
+    }
+
+    ggml_tensor * moe_out =
+        build_moe_ffn(cur,
+            model.layers[il].ffn_gate_inp,
+            model.layers[il].ffn_up_exps,
+            model.layers[il].ffn_gate_exps,
+            model.layers[il].ffn_down_exps,
+            nullptr,
+            n_expert, n_expert_used,
+            LLM_FFN_SILU, true,
+            hparams.expert_weights_scale,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+            nullptr, model.layers[il].ffn_gate_up_exps);
+    cb(moe_out, "ffn_moe_out", il);
+    moe_overlap = nullptr; // not taken: no CPU part on this layer / batch
+
+    if (has_shexp) {
+        if (ffn_shexp == nullptr) {
+            build_shexp(); // here, as before
+        }
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

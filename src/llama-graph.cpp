@@ -2560,6 +2560,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
     auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
+        if (!cached && moe_overlap) {
+            // the misses computed on the CPU are built last: the cached experts are in the graph already, the device work
+            // of the model that only needs the layer input goes between them (see llm_graph_context::moe_overlap)
+            auto overlap = std::move(moe_overlap);
+            moe_overlap = nullptr;
+            overlap();
+        }
+
         ggml_tensor * up = nullptr;
 
         if (gate_up_exps) {
