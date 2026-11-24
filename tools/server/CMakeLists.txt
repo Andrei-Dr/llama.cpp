@@ -65,6 +65,8 @@ set(TARGET llama-server-impl)
 
 add_library(${TARGET}
     server.cpp
+    server-dash.cpp
+    server-dash.h
     server-connect.cpp
     server-connect.h
     server-http.cpp

@@ -1,0 +1,29 @@
+/* the page grid: 12 units a row. Every panel declares its desktop span (--sw); a row is a wrapping flex line whose items
+   grow in proportion to their span, so a row always fills and its panels share one height, and a panel that is hidden
+   (no expert cache, no disk tier, no drafting) gives its units to the others. Narrow screens halve or stack the spans. */
+.grid { display: flex; flex-wrap: wrap; gap: var(--gap); margin-top: var(--gap); }
+.grid > .panel, .grid > .stack { --s: var(--sw, 12);
+  flex: var(--s) 1 calc(var(--s) / 12 * 100% - var(--gap) * (12 - var(--s)) / 12 - 1px); min-width: 0; }
+.stack { display: flex; flex-direction: column; gap: var(--gap); }
+.stack > .panel { flex: 1 1 auto; }
+@media (max-width: 1100px) {
+  .grid > .panel, .grid > .stack { --s: clamp(6, (var(--sw, 12) - 6) * 100, 12); }
+  .grid > .stack { --s: 12; flex-direction: row; flex-wrap: wrap; }
+  .stack > .panel { flex: 1 1 320px; }
+}
+@media (max-width: 720px) {
+  .grid > .panel, .grid > .stack { --s: 12; }
+  .wrap { padding: 16px 12px 64px; }
+}
+
+/* topic pairs: requests beside slots and speculation, memory with the disk tier, the expert cache beside the critical
+   link and its counters, the interconnect beside the machine */
+#p-timeline { --sw: 12; }
+#p-requests { --sw: 8; }
+#st-serve { --sw: 4; }
+#p-memory { --sw: 4; }
+#p-pcache { --sw: 8; }
+#p-experts { --sw: 7; }
+#st-exp { --sw: 5; }
+#p-link { --sw: 7; }
+#p-machine { --sw: 5; }

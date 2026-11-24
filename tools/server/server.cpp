@@ -1,5 +1,6 @@
 #include "server-connect.h"
 #include "server-context.h"
+#include "server-dash.h"
 #include "server-http.h"
 #include "server-models.h"
 #include "server-cors-proxy.h"
@@ -559,6 +560,10 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     ctx_http.get ("/models/sse",           ex_wrapper(models_routes->get_router_models_sse));
     ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
 
+    if (!params.dash_path.empty()) {
+        SRV_WRN("%s", "--dash-path is ignored in router mode (the statistics are the model instances')\n");
+    }
+
     server_register_routes(ctx_http, routes);
     server_register_stream_routes(ctx_http,
         models_routes->router_stream_get,
@@ -668,6 +673,19 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     server_register_routes(ctx_http, routes);
+    if (!params.dash_path.empty()) {
+        // the dashboard's static files, read by the HTTP thread (public, like the UI's assets: they hold no data)
+        std::shared_ptr<const server_dash_assets> dash;
+        try {
+            dash = std::make_shared<const server_dash_assets>(params.dash_path);
+        } catch (const std::exception & e) {
+            SRV_ERR("%s\n", e.what());
+            return 1;
+        }
+        ctx_http.get("/dash",                  ex_wrapper(server_dash_redirect(params.api_prefix)));
+        ctx_http.get("/dash/(.*)",             ex_wrapper(server_dash_handler(dash, params.api_prefix)));
+        SRV_INF("dashboard: %s at %s/dash/\n", params.dash_path.c_str(), params.api_prefix.c_str());
+    }
     server_register_stream_routes(ctx_http,
         server_stream_make_get_handler(),
         server_stream_make_lookup_handler(),

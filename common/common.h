@@ -696,6 +696,7 @@ struct common_params {
     std::string server_connect_code = "";
 
     std::string public_path   = "";                                                                         // NOLINT
+    std::string dash_path     = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     std::vector<std::string> hostnames = {"127.0.0.1"};
