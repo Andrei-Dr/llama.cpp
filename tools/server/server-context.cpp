@@ -2750,13 +2750,19 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = *slot.prompt.checkpoints.front();
+            // make room for the new checkpoint, if needed. Keep the first one (at the first user message: the end of
+            // the system prompt + tools) while any other can go: it is the one a new or compacted conversation with
+            // the same system prompt restores
+            auto it = slot.prompt.checkpoints.begin();
+            if (slot.prompt.checkpoints.size() > 1) {
+                ++it;
+            }
+            const auto & cur = **it;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
