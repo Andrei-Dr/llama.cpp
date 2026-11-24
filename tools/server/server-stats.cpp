@@ -1,0 +1,503 @@
+#include "server-stats.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+
+// histogram edges: TTFT runs from a cached prompt (tens of ms) to a cold 128k-token prompt (minutes); decode per token
+// and per step around 20-60 ms; acceptance in tenths
+static const std::vector<double> k_edges_ttft_ms   = { 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 300000 };
+static const std::vector<double> k_edges_ms_per_tk = { 10, 15, 20, 25, 30, 35, 40, 50, 60, 80, 100, 150, 250, 500 };
+static const std::vector<double> k_edges_step_ms   = { 10, 20, 30, 40, 50, 60, 70, 80, 100, 125, 150, 200, 300, 500, 1000 };
+static const std::vector<double> k_edges_accept    = { 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0 };
+
+// JSON: nlohmann writes NaN (a rate that was never measured) as null
+
+static json counts_to_json(const std::map<std::string, uint64_t> & m) {
+    json j = json::object();
+    for (const auto & [k, v] : m) {
+        j[k] = v;
+    }
+    return j;
+}
+
+server_stats_hist::server_stats_hist(std::vector<double> edges) : edges(std::move(edges)) {
+    counts.assign(this->edges.size() + 1, 0);
+}
+
+void server_stats_hist::add(double v) {
+    if (std::isnan(v)) {
+        return;
+    }
+    const size_t i = std::lower_bound(edges.begin(), edges.end(), v) - edges.begin();
+    counts[i]++;
+    n++;
+    sum += v;
+}
+
+json server_stats_hist::to_json() const {
+    return json {
+        { "edges",  edges  },
+        { "counts", counts },
+        { "n",      n      },
+        { "sum",    sum    },
+    };
+}
+
+void server_stats_timer::add(uint64_t us) {
+    ema_us  = n == 0 ? (double) us : ema_us + ((double) us - ema_us) / 16.0;
+    n      += 1;
+    sum_us += us;
+    last_us = us;
+    max_us  = std::max(max_us, us);
+}
+
+json server_stats_timer::to_json() const {
+    return json {
+        { "n",       n       },
+        { "sum_us",  sum_us  },
+        { "last_us", last_us },
+        { "max_us",  max_us  },
+        { "ema_us",  ema_us  },
+    };
+}
+
+json server_stats_selection::to_json() const {
+    return json {
+        { "id_task",       id_task       },
+        { "how",           how           },
+        { "f_sim",         f_sim         },
+        { "f_keep",        f_keep        },
+        { "cache_update",  cache_update  },
+        { "disk_restored", disk_restored },
+        { "n_disk_tokens", n_disk_tokens },
+        { "f_sim_disk",    f_sim_disk    },
+        { "t_cache_ms",    t_cache_ms    },
+    };
+}
+
+double server_stats_task::ttft_ms() const {
+    if (n_gen <= 0) {
+        return NAN; // cancelled or failed before the first token, or an embedding / rerank task
+    }
+    return (std::isnan(t_queue_ms) ? 0.0 : t_queue_ms) + t_prompt_ms;
+}
+
+double server_stats_task::gen_ms_per_token() const {
+    return n_gen_steps > 0 ? t_gen_ms / n_gen_steps : NAN;
+}
+
+double server_stats_task::accept_rate() const {
+    return n_draft > 0 ? (double) n_draft_accepted / n_draft : NAN;
+}
+
+json server_stats_task::to_json() const {
+    return json {
+        { "id",                  id                                  },
+        { "id_slot",             id_slot                             },
+        { "t_end_us",            t_end_us                            },
+        { "t_queue_ms",          t_queue_ms                          },
+        { "t_prompt_ms",         t_prompt_ms                         },
+        { "t_gen_ms",            t_gen_ms                            },
+        { "ttft_ms",             ttft_ms()                           },
+        { "gen_ms_per_token",    gen_ms_per_token()                  },
+        { "n_prompt",            n_prompt                            },
+        { "n_prompt_cached",     n_prompt_cached                     },
+        { "n_prompt_processed",  n_prompt_processed                  },
+        { "n_gen",               n_gen                               },
+        { "n_gen_steps",         n_gen_steps                         },
+        { "n_ctx",               n_ctx                               },
+        { "truncated",           truncated                           },
+        { "n_draft",             n_draft                             },
+        { "n_draft_accepted",    n_draft_accepted                    },
+        { "n_draft_verif_steps", n_draft_verif_steps                 },
+        { "accept_rate",         accept_rate()                       },
+        { "accepted_per_pos",    accepted_per_pos                    },
+        { "n_graphs_reused",     n_graphs_reused                     },
+        { "stop",                stop                                },
+        { "sel",                 sel.to_json()                       },
+    };
+}
+
+json server_stats_slot::to_json() const {
+    return json {
+        { "id",                 id                 },
+        { "id_task",            id_task            },
+        { "state",              std::string(state) },
+        { "n_prompt",           n_prompt           },
+        { "n_prompt_cached",    n_prompt_cached    },
+        { "n_prompt_processed", n_prompt_processed },
+        { "n_gen",              n_gen              },
+        { "n_ctx",              n_ctx              },
+        { "n_ctx_max",          n_ctx_max          },
+        { "n_draft",            n_draft            },
+        { "n_draft_accepted",   n_draft_accepted   },
+        { "t_queue_ms",         t_queue_ms         },
+        { "t_age_ms",           t_age_ms           },
+        { "t_prompt_ms",        t_prompt_ms        },
+        { "t_gen_ms",           t_gen_ms           },
+    };
+}
+
+json server_stats_snapshot::moe_json() const {
+    const auto counters = [](const llama_moe_cache_counters & c) {
+        return json {
+            { "hit",          c.n_hit                 },
+            { "miss",         c.n_miss                },
+            { "miss_cpu",     c.n_miss_cpu            },
+            { "upload",       c.n_miss - c.n_miss_cpu },
+            { "upload_bytes", c.upload_bytes          },
+        };
+    };
+    const llama_moe_cache_counters & a = moe.ubatch_small;
+    const llama_moe_cache_counters & b = moe.ubatch_large;
+    json all = counters({ a.n_hit + b.n_hit, a.n_miss + b.n_miss, a.n_miss_cpu + b.n_miss_cpu, a.upload_bytes + b.upload_bytes });
+    all["copy"]       = moe.n_copy;
+    all["copy_bytes"] = moe.copy_bytes;
+    return json {
+        { "t_us",         t_us             },
+        { "suspended",    moe.suspended    },
+        { "n_layer",      moe.n_layer      },
+        { "n_expert",     moe.n_expert     },
+        { "n_slots",      moe.n_slots      },
+        { "n_resident",   moe.n_resident   },
+        { "device_bytes", moe.device_bytes },
+        { "counters",     all              },
+        { "ubatch_small", counters(a)      }, // ubatches of up to 8 tokens: the generation steps
+        { "ubatch_large", counters(b)      },
+    };
+}
+
+json server_stats_snapshot::disk_json() const {
+    const server_prompt_disk_stats & d = disk;
+    return json {
+        { "entries",             disk_entries          },
+        { "bytes",               disk_bytes            },
+        { "limit_bytes",         disk_limit            },
+        { "find",                d.n_find              },
+        { "find_hit",            d.n_find_hit          },
+        { "f_keep_hit",          d.f_keep_hit          },
+        { "f_sim_hit",           d.f_sim_hit           },
+        { "save",                d.n_save              },
+        { "save_skipped",        d.n_save_skipped      },
+        { "save_refused",        d.n_save_refused      },
+        { "save_cancelled",      d.n_save_cancelled    },
+        { "save_failed",         d.n_save_failed       },
+        { "save_tokens",         d.save_tokens         },
+        { "save_bytes",          d.save_bytes          },
+        { "save_us",             d.save_us             },
+        { "restore",             d.n_restore           },
+        { "restore_failed",      d.n_restore_failed    },
+        { "restore_tokens",      d.restore_tokens      },
+        { "restore_bytes",       d.restore_bytes       },
+        { "restore_us",          d.restore_us          },
+        { "evict_expired",       d.n_evict_expired     },
+        { "evict_space",         d.n_evict_space       },
+        { "superseded",          d.n_superseded        },
+        { "evict_bytes",         d.evict_bytes         },
+    };
+}
+
+json server_stats_snapshot::to_json(int max_tasks) const {
+    const server_metrics & m = metrics;
+
+    json slots_j = json::array();
+    for (const auto & s : slots) {
+        slots_j.push_back(s.to_json());
+    }
+    static const server_stats_done none;
+    const server_stats_done & dn = done ? *done : none;
+    json tasks_j = json::array();
+    {
+        const size_t n     = dn.tasks.size();
+        const size_t first = max_tasks < 0 || (size_t) max_tasks >= n ? 0 : n - (size_t) max_tasks;
+        for (size_t i = first; i < n; ++i) {
+            tasks_j.push_back(dn.tasks[i].to_json());
+        }
+    }
+
+    return json {
+        { "schema",   1                                    },
+        { "seq",      seq                                  },
+        { "t_us",     t_us                                 },
+        { "t_start_us", t_start_us                         },
+        { "uptime_s", t_start_us > 0 ? (t_us - t_start_us) / 1e6 : 0.0 },
+        { "n_slots",  n_slots                              },
+        { "n_deferred", n_deferred                         },
+        { "counters", {
+            { "prompt_tokens",        m.prompt.count        },
+            { "prompt_us",            m.prompt.time         },
+            { "prompt_tokens_cached", m.n_prompt_cached     },
+            { "prompt_tokens_cached_disk", m.n_prompt_cached_disk },
+            { "gen_tokens",           m.predict.count       },
+            { "gen_steps",            m.predict.steps       },
+            { "gen_us",               m.predict.time        },
+            { "n_decode",             m.n_decode            },
+            { "n_busy_slots",         m.n_busy_slots        },
+            { "n_tokens_max",         m.n_tokens_max        },
+            { "draft_tokens",         m.n_draft_tokens      },
+            { "draft_accepted",       m.n_draft_accepted    },
+            { "draft_verif_steps",    m.n_draft_verif_steps },
+            { "accepted_per_pos",     m.n_accepted_per_pos  },
+            { "tasks",                dn.n_tasks            },
+            { "truncated",            dn.n_truncated        },
+            { "stop",                 counts_to_json(dn.n_stop) },
+        }},
+        { "decode", {
+            { "gen",      decode_gen.to_json()    },
+            { "prompt",   decode_prompt.to_json() },
+            { "step_gen", step_gen.to_json()      },
+        }},
+        { "hist", {
+            { "ttft_ms",          dn.h_ttft_ms.to_json()        },
+            { "gen_ms_per_token", dn.h_gen_ms_per_tok.to_json() },
+            { "accept",           dn.h_accept.to_json()         },
+            { "step_ms",          h_step_ms.to_json()        },
+        }},
+        { "selection",  counts_to_json(dn.n_sel) },
+        { "slots",      slots_j           },
+        { "tasks",      tasks_j           },
+        { "disk_cache", has_disk ? disk_json() : json(nullptr) },
+        { "moe_cache",  has_moe ? moe_json() : json(nullptr) },
+        // the CPU-split time of each layer: no source on this tree (it needs a hook in the graph scheduler); readers
+        // treat null as "not measured"
+        { "phase",      nullptr },
+        { "publish",    publish.to_json() },
+    };
+}
+
+json server_slot_row_json(const server_slot_row & r) {
+    json res = {
+        {"id",            r.id},
+        {"n_ctx",         r.n_ctx},
+        {"speculative",   r.speculative},
+        {"is_processing", r.is_processing},
+    };
+    if (r.has_task) {
+        res["id_task"] = r.id_task;
+        res["n_prompt_tokens"]           = r.n_prompt_tokens;
+        res["n_prompt_tokens_processed"] = r.n_prompt_tokens_processed;
+        res["n_prompt_tokens_cache"]     = r.n_prompt_tokens_cache;
+        res["params"] = r.params ? *r.params : json();
+        res["next_token"] = json::array({
+            {
+                {"has_next_token", r.has_next_token},
+                {"has_new_line",   r.has_new_line},
+                {"n_remain",       r.n_remain},
+                {"n_decoded",      r.n_decoded},
+            }
+        });
+    }
+    return res;
+}
+
+server_stats::server_stats(size_t n_ring, int64_t period_us) : n_ring(std::max<size_t>(1, n_ring)), period_us(period_us) {
+    d.h_ttft_ms        = server_stats_hist(k_edges_ttft_ms);
+    d.h_gen_ms_per_tok = server_stats_hist(k_edges_ms_per_tk);
+    d.h_accept         = server_stats_hist(k_edges_accept);
+    w.h_step_ms        = server_stats_hist(k_edges_step_ms);
+}
+
+void server_stats::add_task(server_stats_task && t) {
+    d.n_tasks++;
+    d.n_truncated += t.truncated ? 1 : 0;
+    d.n_stop[t.stop]++;
+    d.h_ttft_ms.add(t.ttft_ms());
+    d.h_gen_ms_per_tok.add(t.gen_ms_per_token());
+    d.h_accept.add(t.accept_rate());
+
+    ring.push_back(std::move(t));
+    while (ring.size() > n_ring) {
+        ring.pop_front();
+    }
+    done_dirty = true;
+}
+
+bool server_stats::due(int64_t t_now_us) const {
+    if (period_us <= 0) {
+        return false;
+    }
+    return !published || t_now_us - t_last_publish_us >= period_us;
+}
+
+void server_stats::publish(int64_t t_now_us, const std::function<void(server_stats_snapshot &)> & fill) {
+    const int64_t t0 = ggml_time_us();
+
+    if (fill) {
+        fill(w);
+    }
+    if (done_dirty || !w.done) {
+        auto nd = std::make_shared<server_stats_done>(d);
+        nd->tasks.assign(ring.begin(), ring.end());
+        w.done     = std::move(nd);
+        done_dirty = false;
+    }
+    w.seq++;
+    w.t_us = t_now_us;
+
+    std::shared_ptr<const server_stats_snapshot> s = std::make_shared<const server_stats_snapshot>(w);
+    std::atomic_store(&snap, std::move(s));
+
+    t_last_publish_us = t_now_us;
+    published         = true;
+
+    w.publish.add((uint64_t) std::max<int64_t>(0, ggml_time_us() - t0));
+}
+
+std::shared_ptr<const server_stats_snapshot> server_stats::latest() const {
+    return std::atomic_load(&snap);
+}
+
+//
+// history
+//
+
+static const char * k_col_names[SSC_COUNT] = {
+#define X(name, kind) #name,
+    SERVER_STATS_HISTORY_COLUMNS(X)
+#undef X
+};
+
+static const bool k_col_gauge[SSC_COUNT] = {
+#define C false
+#define G true
+#define X(name, kind) kind,
+    SERVER_STATS_HISTORY_COLUMNS(X)
+#undef X
+#undef G
+#undef C
+};
+
+server_stats_row server_stats_row_empty() {
+    server_stats_row r;
+    r.fill(NAN);
+    return r;
+}
+
+const char * server_stats_col_name(int col) {
+    return col >= 0 && col < SSC_COUNT ? k_col_names[col] : "";
+}
+
+bool server_stats_col_gauge(int col) {
+    return col >= 0 && col < SSC_COUNT && k_col_gauge[col];
+}
+
+size_t server_stats_history::tier_view::size() const {
+    size_t n = 0;
+    for (const auto & s : segs) {
+        n += s->size();
+    }
+    return n;
+}
+
+json server_stats_history::tier_view::to_json(const char * name, double since_us, const std::vector<int> & cols_in) const {
+    std::vector<int> cols = cols_in;
+    if (cols.empty()) {
+        for (int c = 0; c < SSC_COUNT; ++c) {
+            cols.push_back(c);
+        }
+    }
+    std::vector<json> out(cols.size(), json::array());
+
+    const size_t total = size();
+    const size_t skip  = total > cap ? total - cap : 0;
+    size_t i = 0, n = 0;
+    for (const auto & s : segs) {
+        for (const server_stats_row & r : *s) {
+            if (i++ < skip || !(r[SSC_t_us] > since_us)) {
+                continue;
+            }
+            for (size_t k = 0; k < cols.size(); ++k) {
+                const double x = r[cols[k]];
+                out[k].push_back(std::isnan(x) ? json(nullptr) : json(x));
+            }
+            n++;
+        }
+    }
+
+    json j_cols = json::object();
+    for (size_t k = 0; k < cols.size(); ++k) {
+        j_cols[k_col_names[cols[k]]] = std::move(out[k]);
+    }
+    return json {
+        { "tier",      name                 },
+        { "period_ms", period_us / 1000.0   },
+        { "cap",       cap                  },
+        { "n",         n                    },
+        { "cols",      std::move(j_cols)    },
+    };
+}
+
+void server_stats_history::tier::push(const server_stats_row & r) {
+    cur.push_back(r);
+    if (cur.size() >= seg_rows) {
+        full.push_back(std::make_shared<const std::vector<server_stats_row>>(std::move(cur)));
+        cur = {};
+        cur.reserve(seg_rows);
+    }
+    // drop whole segments while the rest still holds cap rows
+    while (!full.empty() && (full.size() - 1)*seg_rows + cur.size() >= cap) {
+        full.pop_front();
+    }
+}
+
+void server_stats_history::tier::view_into(tier_view & v) const {
+    v.period_us = period_us;
+    v.cap       = cap;
+    v.segs.assign(full.begin(), full.end());
+    if (!cur.empty()) {
+        v.segs.push_back(std::make_shared<const std::vector<server_stats_row>>(cur));
+    }
+}
+
+server_stats_history::server_stats_history(int64_t period_us, size_t n_sec, size_t n_min, size_t n_per_min, size_t seg_rows) :
+    sec    { period_us,             std::max<size_t>(1, n_sec), std::max<size_t>(1, seg_rows), {}, {} },
+    minute { period_us * (int64_t) std::max<size_t>(1, n_per_min), std::max<size_t>(1, n_min), std::max<size_t>(1, seg_rows), {}, {} },
+    n_per_min(std::max<size_t>(1, n_per_min)) {
+    acc_last = server_stats_row_empty();
+    acc_sum.fill(0.0);
+    auto v = std::make_shared<view>();
+    sec.view_into(v->sec);
+    minute.view_into(v->minute);
+    std::atomic_store(&snap, std::shared_ptr<const view>(std::move(v)));
+}
+
+void server_stats_history::append(const server_stats_row & r) {
+    sec.push(r);
+
+    acc_last = r;
+    for (int c = 0; c < SSC_COUNT; ++c) {
+        if (k_col_gauge[c] && !std::isnan(r[c])) {
+            acc_sum[c] += r[c];
+            acc_n[c]++;
+        }
+    }
+    bool min_row = false;
+    if (++acc_rows >= n_per_min) {
+        server_stats_row m = acc_last;
+        for (int c = 0; c < SSC_COUNT; ++c) {
+            if (k_col_gauge[c]) {
+                m[c] = acc_n[c] > 0 ? acc_sum[c] / acc_n[c] : NAN;
+            }
+        }
+        minute.push(m);
+        acc_sum.fill(0.0);
+        acc_n.fill(0);
+        acc_rows = 0;
+        min_row  = true;
+    }
+
+    // the minute tier's segments did not change unless a minute row was added: reuse them
+    auto v = std::make_shared<view>();
+    sec.view_into(v->sec);
+    if (min_row) {
+        minute.view_into(v->minute);
+    } else {
+        v->minute = std::atomic_load(&snap)->minute;
+    }
+    std::atomic_store(&snap, std::shared_ptr<const view>(std::move(v)));
+}
+
+std::shared_ptr<const server_stats_history::view> server_stats_history::latest() const {
+    return std::atomic_load(&snap);
+}

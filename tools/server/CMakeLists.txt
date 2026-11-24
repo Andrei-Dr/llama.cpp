@@ -28,7 +28,11 @@ add_library(${TARGET} STATIC
     server-mcp.cpp
     server-mcp.h
     server-schema.cpp
+    server-sampler.cpp
+    server-sampler.h
     server-schema.h
+    server-stats.cpp
+    server-stats.h
     server-slot-sched.cpp
     server-slot-sched.h
 )
@@ -41,6 +45,7 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(${TARGET} PRIVATE vendor::hash)
+target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS}) # server-sampler loads NVML at run time
 
 # the prompt cache disk tier encrypts with AES-256-GCM (OpenSSL libcrypto); without it only --no-cache-disk-encrypt
 # works. Not with the vendored BoringSSL/LibreSSL builds: two libcrypto implementations would clash.

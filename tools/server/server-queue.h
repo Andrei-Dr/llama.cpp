@@ -2,6 +2,8 @@
 
 #include "server-task.h"
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -42,6 +44,13 @@ private:
     };
     worker_t worker;
 
+    std::atomic<int64_t> t_blocking_since{0}; // blocking_since_us()
+    std::atomic<bool>    a_sleeping{false};   // sleeping_now()
+
+    // tasks posted so far, by type (/stats "queue"): what proves that a statistics read posts none
+    static constexpr size_t N_TASK_TYPES = (size_t) SERVER_TASK_TYPE_TTS + 1;
+    std::array<std::atomic<uint64_t>, N_TASK_TYPES> n_posted {};
+
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
@@ -63,6 +72,9 @@ public:
     // Get the next id for creating a new task
     int get_new_id();
 
+    // the tasks posted so far, by type name; any thread, no lock
+    json posted_json() const;
+
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
     void pop_deferred_task(int id_slot);
@@ -79,6 +91,12 @@ public:
         std::unique_lock<std::mutex> lock(mutex_tasks);
         return sleeping;
     }
+
+    // for readers that answer from a published snapshot instead of posting a task (/slots, /metrics), lock-free: since
+    // when the loop thread has been working without yielding to the queue (0 = waiting for tasks, or yielding while a
+    // decode runs), and whether the server sleeps
+    int64_t blocking_since_us() const { return t_blocking_since.load(std::memory_order_relaxed); }
+    bool    sleeping_now()      const { return a_sleeping.load(std::memory_order_relaxed); }
 
     // end the start_loop routine
     void terminate();

@@ -115,6 +115,8 @@ struct server_routes {
     // they won't be called until ctx_http.is_ready is set to true
     server_http_context::handler_t get_health;
     server_http_context::handler_t get_metrics;
+    server_http_context::handler_t get_stats;
+    server_http_context::handler_t get_stats_history;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
@@ -172,6 +174,10 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // /metrics from the stats snapshot: the counters at the previous scrape (the rate gauges' window)
+    std::mutex     mutex_scrape;
+    server_metrics scrape_base;
 
     // cached responses, to be used during sleep
     std::mutex     mutex_cache;

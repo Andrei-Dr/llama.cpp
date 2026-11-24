@@ -25,13 +25,62 @@ static bool task_resets_idle_timer(server_task_type type) {
     return type != SERVER_TASK_TYPE_METRICS;
 }
 
+// the queue entry time (/stats queue wait), on the task and the child tasks it carries (n_cmpl > 1)
+static void stamp_posted(server_task & task) {
+    const int64_t t = ggml_time_us();
+    if (task.t_posted_us == 0) {
+        task.t_posted_us = t;
+    }
+    for (auto & child : task.child_tasks) {
+        if (child.t_posted_us == 0) {
+            child.t_posted_us = t;
+        }
+    }
+}
+
+static const char * task_type_name(size_t type) {
+    switch ((server_task_type) type) {
+        case SERVER_TASK_TYPE_COMPLETION:    return "completion";
+        case SERVER_TASK_TYPE_EMBEDDING:     return "embedding";
+        case SERVER_TASK_TYPE_RERANK:        return "rerank";
+        case SERVER_TASK_TYPE_DECISION:      return "decision";
+        case SERVER_TASK_TYPE_INFILL:        return "infill";
+        case SERVER_TASK_TYPE_TRANSCRIBE_RT: return "transcribe_rt";
+        case SERVER_TASK_TYPE_REALTIME:      return "realtime";
+        case SERVER_TASK_TYPE_CANCEL:        return "cancel";
+        case SERVER_TASK_TYPE_CONTROL:       return "control";
+        case SERVER_TASK_TYPE_NEXT_RESPONSE: return "next_response";
+        case SERVER_TASK_TYPE_METRICS:       return "metrics";
+        case SERVER_TASK_TYPE_SLOT_GET:      return "slot_get";
+        case SERVER_TASK_TYPE_SLOT_SAVE:     return "slot_save";
+        case SERVER_TASK_TYPE_SLOT_RESTORE:  return "slot_restore";
+        case SERVER_TASK_TYPE_SLOT_ERASE:    return "slot_erase";
+        case SERVER_TASK_TYPE_GET_LORA:      return "get_lora";
+        case SERVER_TASK_TYPE_SET_LORA:      return "set_lora";
+        case SERVER_TASK_TYPE_TTS:           return "tts";
+    }
+    return "unknown";
+}
+
+json server_queue::posted_json() const {
+    json j = json::object();
+    for (size_t i = 0; i < N_TASK_TYPES; ++i) {
+        j[task_type_name(i)] = n_posted[i].load(std::memory_order_relaxed);
+    }
+    return j;
+}
+
 int server_queue::post(server_task && task, bool front) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     GGML_ASSERT(task.id != -1);
+    if ((size_t) task.type < N_TASK_TYPES) {
+        n_posted[task.type].fetch_add(1, std::memory_order_relaxed);
+    }
     // if this is cancel task make sure to clean up pending tasks
     if (task.type == SERVER_TASK_TYPE_CANCEL) {
         cleanup_pending_task(task.id_target);
     }
+    stamp_posted(task);
     const int  task_id     = task.id;
     const bool reset_timer = task_resets_idle_timer(task.type);
     QUE_DBG("new task, id = %d, front = %d\n", task_id, front);
@@ -53,6 +102,10 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     for (auto & task : tasks) {
         if (task.id == -1) {
             task.id = id++;
+        }
+        stamp_posted(task);
+        if ((size_t) task.type < N_TASK_TYPES) {
+            n_posted[task.type].fetch_add(1, std::memory_order_relaxed);
         }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
@@ -236,6 +289,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
         worker.yielding = true;
     }
     worker.cv.notify_one();
+    t_blocking_since = 0; // the worker answers tasks meanwhile
 
     // run the work on the current thread, so that all ggml compute stays on the same thread
     std::exception_ptr exception;
@@ -263,6 +317,7 @@ void server_queue::yield_to_queue(std::function<void()> && work) {
 
         // make sure to avoid idle timeout here
         time_last_task = ggml_time_ms();
+        t_blocking_since = ggml_time_us();
 
         // an exception from work() takes precedence over the one from the worker
         if (!exception) {
@@ -302,6 +357,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
     };
 
     while (true) {
+        t_blocking_since = ggml_time_us();
         QUE_DBG("%s", "processing new tasks\n");
         if (process_new_tasks(false)) {
             break; // terminate
@@ -322,6 +378,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
         }
 
         QUE_DBG("%s", "waiting for new tasks\n");
+        t_blocking_since = 0;
         while (true) {
             std::unique_lock<std::mutex> lock(mutex_tasks);
             if (!running || !queue_tasks.empty()) {
@@ -332,6 +389,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
             if (should_sleep()) {
                 QUE_INF("%s", "entering sleeping state\n");
                 sleeping = true;
+                a_sleeping = true;
                 // Call order cb0 -> cb1 -> cb{N}
                 for (auto & cb : callback_sleeping_state) {
                     cb(true);
@@ -351,6 +409,7 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                     callback_sleeping_state[i - 1](false);
                 }
                 sleeping = false;
+                a_sleeping = false;
                 time_last_task = ggml_time_ms();
                 condition_tasks.notify_all(); // notify wait_until_no_sleep()
                 break; // process new tasks
