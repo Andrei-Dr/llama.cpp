@@ -1053,7 +1053,7 @@ void llama_context::trim_device_pools() {
 // Lazy in both directions: a prompt fed in several chunks switches once.
 void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
     n_decode_calls++;
-    if (!moe_cache || cparams.n_ubatch_prefill == 0 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+    if (!moe_cache || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
         return;
     }
 
@@ -1072,7 +1072,7 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         }
     };
 
-    const bool big = n_tokens_all > cparams.n_ubatch && !moe_prefill_unfit;
+    const bool big = cparams.n_ubatch_prefill > 0 && n_tokens_all > cparams.n_ubatch && !moe_prefill_unfit;
 
     // diag: LLAMA_MOE_PREFILL_DIAG=N runs the whole suspend / leave path (cache freed, scheduler and pools released, cache
     // uploaded again, scheduler reserved again) before every N-th small batch, at an unchanged ubatch: the output must not change
@@ -1081,6 +1081,9 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         synchronize();
         moe_cache->suspend();
         leave();
+    }
+    if (cparams.n_ubatch_prefill == 0) {
+        return;
     }
     if (big != moe_prefill_mode) {
         synchronize(); // nothing submitted earlier may still read the cache or the compute buffers
