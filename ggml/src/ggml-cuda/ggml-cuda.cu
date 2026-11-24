@@ -548,6 +548,19 @@ static size_t ggml_cuda_oom_release_executables(ggml_backend_cuda_context * ctx,
 
 static const int GGML_CUDA_OOM_STEPS = 3;
 
+// diag: forced out-of-memory, to run the reclaim steps without filling the device. Each forced event fails 3 attempts,
+// so every step that gives something back is followed by a failed retry and the next step runs; a last real attempt follows.
+//   GGML_CUDA_DIAG_OOM_AFTER_TRIM=K  the K-th pool growth after the first pool trim (ggml_backend_cuda_trim_pools), once
+//   GGML_CUDA_DIAG_OOM_GRAPH=N       the N-th CUDA graph instantiation, once
+static int ggml_cuda_diag_env(const char * name) {
+    const char * e = getenv(name);
+    return e ? atoi(e) : 0;
+}
+static int ggml_cuda_diag_pool_growths = -1; // -1 until the first trim
+static int ggml_cuda_diag_pool_left    = 0;
+static int ggml_cuda_diag_graph_count  = 0;
+static int ggml_cuda_diag_graph_left   = 0;
+
 // returns the bytes given back at this step (the number of executables at step 2), 0 when there was nothing to take
 // keep: the CUDA graph being captured, its executables stay
 static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device, size_t need, int step, const ggml_cuda_graph * keep = nullptr) {
@@ -865,12 +878,30 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
-            CUresult created = cuMemCreate(&handle, reserve_size, &prop, 0);
+            static const int diag_k = ggml_cuda_diag_env("GGML_CUDA_DIAG_OOM_AFTER_TRIM");
+            if (diag_k > 0 && ggml_cuda_diag_pool_growths >= 0 && ++ggml_cuda_diag_pool_growths == diag_k) {
+                ggml_cuda_diag_pool_left = 3;
+                GGML_LOG_WARN("%s: diag: forcing out of memory on pool growth %d after the trim\n", __func__, diag_k);
+            }
+            bool forced = false;
+            const auto create = [&]() {
+                forced = ggml_cuda_diag_pool_left > 0;
+                if (forced) {
+                    ggml_cuda_diag_pool_left--;
+                    return (CUresult) CUDA_ERROR_OUT_OF_MEMORY;
+                }
+                return cuMemCreate(&handle, reserve_size, &prop, 0);
+            };
+            CUresult created = create();
             // out of device memory: take memory back from the rest of the process and retry (see ggml_cuda_oom_reclaim)
             for (int step = 0; created == CUDA_ERROR_OUT_OF_MEMORY && step < GGML_CUDA_OOM_STEPS; ++step) {
                 if (ggml_cuda_oom_reclaim(&ctx, device, reserve_size, step) > 0) {
-                    created = cuMemCreate(&handle, reserve_size, &prop, 0);
+                    created = create();
                 }
+            }
+            if (forced) { // diag: the forced failures are over, the real attempt
+                ggml_cuda_diag_pool_left = 0;
+                created = create();
             }
             CU_CHECK(created);
 
@@ -3616,7 +3647,19 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 // Out of device memory is not fatal at once: memory is taken back in steps and the instantiation retried (see
 // ggml_cuda_oom_reclaim); the executables of `graph`, the graph being captured, stay.
 static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph, cudaGraphExec_t * handle, cudaGraph_t cuda_graph) {
+    static const int diag_n = ggml_cuda_diag_env("GGML_CUDA_DIAG_OOM_GRAPH");
+    if (diag_n > 0 && ++ggml_cuda_diag_graph_count == diag_n) {
+        ggml_cuda_diag_graph_left = 3;
+        GGML_LOG_WARN("%s: diag: forcing out of memory on CUDA graph instantiation %d\n", __func__, diag_n);
+    }
+    bool forced = false;
     const auto attempt = [&]() {
+        forced = ggml_cuda_diag_graph_left > 0;
+        if (forced) {
+            ggml_cuda_diag_graph_left--;
+            *handle = nullptr;
+            return (cudaError_t) cudaErrorMemoryAllocation;
+        }
         cudaError_t err = cudaGraphInstantiate(handle, cuda_graph, nullptr, nullptr, 0);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         if (err == cudaSuccess) {
@@ -3638,6 +3681,10 @@ static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, co
         if (ggml_cuda_oom_reclaim(cuda_ctx, cuda_ctx->device, 0, step, graph) > 0) {
             err = attempt();
         }
+    }
+    if (forced) { // diag: the forced failures are over, the real attempt
+        ggml_cuda_diag_graph_left = 0;
+        err = attempt();
     }
     CUDA_CHECK(err);
 }
@@ -7275,6 +7322,9 @@ static void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
     }
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
     std::lock_guard<std::mutex> computing(ctx->compute_mutex); // a reclaim from another thread may be releasing them too
+    if (ggml_cuda_diag_pool_growths < 0) {
+        ggml_cuda_diag_pool_growths = 0; // diag: GGML_CUDA_DIAG_OOM_AFTER_TRIM counts from the first trim
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaDeviceSynchronize());
     for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
