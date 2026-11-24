@@ -7044,8 +7044,33 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// release the per-device/stream temporary pools of a CUDA backend: the VMM pool maps physical memory as a graph needs it and
+// never unmaps until the backend dies, so one large batch keeps its peak for good. Call between graphs only; the pools are
+// recreated on next use. Used by the MoE prefill mode to hand the prefill's temporaries back before the MoE cache returns.
+static void ggml_backend_cuda_trim_pools(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            ctx->pools[d][s].reset();
+        }
+    }
+#ifdef USE_CUDA_GRAPH
+    // captured graphs hold pool addresses in their kernel arguments (q8_1 activations, FA KV_max / dst_tmp, ...); a replay
+    // after the pools are gone would read or write freed memory, so every graph is captured again on its next use
+    ctx->cuda_graphs.clear();
+#endif // USE_CUDA_GRAPH
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_trim_pools") == 0) {
+        return (void *)ggml_backend_cuda_trim_pools;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

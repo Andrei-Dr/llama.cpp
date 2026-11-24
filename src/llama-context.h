@@ -407,6 +407,21 @@ private:
 
     bool sched_need_reserve = true;
 
+    // MoE prefill mode (see decode): the scheduler is reserved for n_ubatch_prefill and the MoE cache is suspended
+    bool     moe_prefill_mode   = false;
+    bool     moe_prefill_unfit  = false; // the prefill compute buffers did not fit: prompts run at n_ubatch from then on
+    uint64_t n_decode_calls     = 0;
+    uint64_t moe_resume_at      = 0;     // decode call of the next attempt to resume a MoE cache that did not fit back
+
+    // the ubatch the scheduler is reserved for and batches are split at: n_ubatch_prefill in MoE prefill mode
+    uint32_t n_ubatch_eff() const;
+
+    // enter / leave the MoE prefill mode before a batch of n_tokens_all tokens
+    void moe_prefill_switch(uint32_t n_tokens_all);
+
+    // release the temporary pools of the device backends (they never shrink by themselves)
+    void trim_device_pools();
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

@@ -1663,6 +1663,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"-ubp", "--ubatch-prefill"}, "N",
+        string_format("MoE prefill mode: a batch larger than --ubatch-size runs at this ubatch in the device memory the MoE cache "
+                      "(--moe-cache-mib) releases for its duration; the cache comes back with the same experts at the next small batch. "
+                      "Raise --batch-size too, or prompts arrive in chunks no larger than it. 0 = off (default: %d)", params.n_ubatch_prefill),
+        [](common_params & params, int value) {
+            params.n_ubatch_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_UBATCH_PREFILL"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

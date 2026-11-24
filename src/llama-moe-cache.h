@@ -60,6 +60,14 @@ public:
     // returns the number of experts copied, 0 if expert e is not in the cache
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last);
 
+    // MoE prefill mode (see llama_context::decode): a large-ubatch compute buffer and the cache take turns in the device memory
+    // suspend() frees the device memory of the cache, the slots keep their experts on record and no layer reads the cache
+    // resume() allocates it again and uploads the experts on record; returns false if the memory is not available
+    // graphs built before either call must not be computed after it (they hold the tensors of the banks)
+    void suspend();
+    bool resume();
+    bool suspended() const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

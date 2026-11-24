@@ -399,6 +399,9 @@ struct llama_moe_cache::impl {
     // views used by copy_experts
     ggml_context_ptr ctx_views;
 
+    // the device memory is released, see suspend()
+    bool suspended = false;
+
     impl(const llama_model & model, bool no_alloc, const std::vector<ggml_backend_t> & backends, const std::vector<ggml_backend_buffer_type_t> & bufts, size_t size, float cpu_share) :
             n_expert_used(model.hparams.n_expert_used_max()), layers(model.layers.size()), cpu_share(std::clamp(cpu_share, 0.0f, 1.0f)) {
         for (size_t i = 0; i < backends.size(); ++i) {
@@ -692,6 +695,9 @@ struct llama_moe_cache::impl {
         if (il < 0 || il >= (int32_t) layers.size() || layers[il].ig < 0) {
             return nullptr;
         }
+        if (suspended) {
+            return nullptr;
+        }
         const layer & l = layers[il];
 
         // large batches use most experts of a layer, so they gain little from the cache and would evict the experts used in generation
@@ -725,11 +731,17 @@ struct llama_moe_cache::impl {
     }
 
     ggml_tensor * get_experts(const ggml_tensor * w) const {
+        if (suspended) {
+            return nullptr;
+        }
         const auto it = bindings.find(w);
         return it != bindings.end() ? it->second.cached : nullptr;
     }
 
     int64_t copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
+        if (suspended) {
+            return 0;
+        }
         const auto it = bindings.find(w);
         if (it == bindings.end()) {
             return 0;
@@ -762,6 +774,90 @@ struct llama_moe_cache::impl {
         stats_copy.bytes += ggml_nbytes(src_view);
 
         return n;
+    }
+
+    void suspend() {
+        if (suspended) {
+            return;
+        }
+        for (device & d : devices) {
+            if (!d.buf) {
+                continue;
+            }
+            ggml_backend_synchronize(d.backend); // uploads in flight write to the banks
+            d.buf.reset();
+            // detach the banks and their views, so that resume() allocates them again
+            for (ggml_tensor * t = ggml_get_first_tensor(d.ctx.get()); t != nullptr; t = ggml_get_next_tensor(d.ctx.get(), t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
+        }
+        suspended = true;
+    }
+
+    bool resume() {
+        if (!suspended) {
+            return true;
+        }
+        for (device & d : devices) {
+            if (!d.ctx) {
+                continue;
+            }
+            d.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(d.ctx.get(), d.buft));
+            if (!d.buf) {
+                // stay suspended, the devices allocated so far are released again
+                for (device & o : devices) {
+                    if (!o.buf) {
+                        continue;
+                    }
+                    o.buf.reset();
+                    for (ggml_tensor * t = ggml_get_first_tensor(o.ctx.get()); t != nullptr; t = ggml_get_next_tensor(o.ctx.get(), t)) {
+                        t->buffer = nullptr;
+                        t->data   = nullptr;
+                    }
+                }
+                return false;
+            }
+            ggml_backend_buffer_clear(d.buf.get(), 0); // the zero slots and the padding
+            ggml_backend_buffer_set_usage(d.buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+
+        // upload the experts on record to their slots, consecutive experts in consecutive slots together
+        size_t bytes = 0;
+        for (group & g : groups) {
+            if (g.n_slots == 0) {
+                continue;
+            }
+            ggml_backend_t backend = devices[g.id].backend;
+            for (int32_t s = 0; s < g.n_slots;) {
+                const int32_t key = g.lru.key_of[s];
+                if (key < 0) {
+                    s++;
+                    continue;
+                }
+                const int32_t il = g.lru.key_layer(key);
+                const int32_t e  = g.lru.key_expert(key);
+                int32_t n = 1;
+                while (s + n < g.n_slots && g.lru.key_of[s + n] == key + n && g.lru.key_layer(key + n) == il) {
+                    n++;
+                }
+                const layer & l = layers[il];
+                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                    const ggml_tensor * w = l.experts[ip];
+                    ggml_backend_tensor_set_async(backend, g.banks[ip], (const uint8_t *) w->data + e*w->nb[2], s*w->nb[2], n*w->nb[2]);
+                    bytes += n*w->nb[2];
+                }
+                s += n;
+            }
+        }
+        for (device & d : devices) {
+            if (d.buf) {
+                ggml_backend_synchronize(d.backend);
+            }
+        }
+        LLAMA_LOG_DEBUG("%s: MoE cache resumed, %.2f MiB uploaded\n", __func__, bytes/1024.0/1024.0);
+        suspended = false;
+        return true;
     }
 
     bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
@@ -968,6 +1064,18 @@ bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {
     return pimpl->copy_experts(backend, w, dst, e, last);
+}
+
+void llama_moe_cache::suspend() {
+    pimpl->suspend();
+}
+
+bool llama_moe_cache::resume() {
+    return pimpl->resume();
+}
+
+bool llama_moe_cache::suspended() const {
+    return pimpl->suspended;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
