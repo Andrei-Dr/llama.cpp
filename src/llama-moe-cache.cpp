@@ -366,7 +366,9 @@ struct llama_moe_cache::impl {
         size_t bytes  = 0;
     };
 
-    static constexpr int64_t max_batch = 32;
+    // ubatches of more tokens do not read the cache
+    // diag: LLAMA_MOE_CACHE_MAX_BATCH=N overrides it (probe for prompts of 33 to ~128 tokens, see port7)
+    const int64_t max_batch = getenv("LLAMA_MOE_CACHE_MAX_BATCH") ? atoll(getenv("LLAMA_MOE_CACHE_MAX_BATCH")) : 32;
 
     int32_t n_expert_used;
 
