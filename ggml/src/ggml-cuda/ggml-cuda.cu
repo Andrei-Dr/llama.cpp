@@ -528,7 +528,11 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 //   step 0: the temporary pools and captured CUDA graphs of the other CUDA backends of the process that are not computing
 //           (a pool keeps the memory of the largest graph its backend ever computed; both are recreated on next use)
 //   step 1: the handlers registered by the application (ggml_backend_cuda_oom_handler_add): each frees device memory it
-//           owns and can rebuild later, and returns the number of bytes it gave back
+//           owns and can rebuild later, and returns the number of bytes it gave back. A handler that cannot free now (the
+//           graph being computed reads its memory) still learns of the pressure and can act at its next safe point
+//   step 2: the captured CUDA graph executables of this backend (except the one being captured) and of the backends that
+//           are not computing; they are captured again on their next use
+// A CUDA graph executable that cannot be instantiated goes through the same steps (ggml_cuda_graph_instantiate).
 // Everything submitted to the device completes before anything is freed. Nothing is reclaimed while the calling stream
 // captures a CUDA graph: no synchronization is legal there, so that growth fails as before.
 // A handler is called on the thread that ran out of memory, possibly inside a graph computation of the same application
@@ -540,14 +544,19 @@ static std::vector<ggml_backend_cuda_context *> ggml_cuda_oom_contexts;
 static std::vector<std::pair<ggml_backend_cuda_oom_handler_t, void *>> ggml_cuda_oom_handlers;
 
 static void ggml_cuda_oom_release_context(ggml_backend_cuda_context * ctx, int device);
+static size_t ggml_cuda_oom_release_executables(ggml_backend_cuda_context * ctx, const ggml_cuda_graph * keep);
 
-// returns the bytes given back at this step, 0 when there was nothing to take
-static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device, size_t need, int step) {
+static const int GGML_CUDA_OOM_STEPS = 3;
+
+// returns the bytes given back at this step (the number of executables at step 2), 0 when there was nothing to take
+// keep: the CUDA graph being captured, its executables stay
+static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device, size_t need, int step, const ggml_cuda_graph * keep = nullptr) {
 #ifdef USE_CUDA_GRAPH
 #if defined(GGML_USE_HIP)
     GGML_UNUSED(self);
     GGML_UNUSED(need);
     GGML_UNUSED(step);
+    GGML_UNUSED(keep);
     return 0; // the capture state of a stream cannot be queried through the HIP mapping
 #else
     if (self != nullptr) {
@@ -587,15 +596,50 @@ static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device
             GGML_LOG_WARN("%s: device %d out of memory growing a pool by %.1f MiB: took back %.1f MiB of pools from %d idle contexts\n",
                     __func__, device, need/1048576.0, bytes/1048576.0, n_ctx);
         }
-    } else {
+    } else if (step == 1) {
         ggml_backend_dev_t dev = ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), device);
         for (const auto & [handler, user_data] : ggml_cuda_oom_handlers) {
             bytes += handler(dev, need, user_data);
         }
         if (bytes > 0) {
             CUDA_CHECK(cudaDeviceSynchronize());
-            GGML_LOG_WARN("%s: device %d out of memory growing a pool by %.1f MiB: the application gave back %.1f MiB\n",
+            GGML_LOG_WARN("%s: device %d out of memory (%.1f MiB asked for): the application gave back %.1f MiB\n",
                     __func__, device, need/1048576.0, bytes/1048576.0);
+        }
+    } else {
+        for (ggml_backend_cuda_context * ctx : ggml_cuda_oom_contexts) {
+            if (ctx->device != device) {
+                continue;
+            }
+            if (ctx == self) {
+                bytes += ggml_cuda_oom_release_executables(ctx, keep);
+            } else if (ctx->compute_mutex.try_lock()) {
+                bytes += ggml_cuda_oom_release_executables(ctx, nullptr);
+                ctx->compute_mutex.unlock();
+            }
+        }
+        if (bytes > 0) {
+            CUDA_CHECK(cudaDeviceSynchronize()); // an executable in flight frees its memory when it completes
+            GGML_LOG_WARN("%s: device %d out of memory (%.1f MiB asked for): released %zu CUDA graph executables\n",
+                    __func__, device, need/1048576.0, bytes);
+        }
+    }
+    return bytes;
+}
+
+// device memory held by the temporary pools of every CUDA backend of the process on the device of this one
+static size_t ggml_backend_cuda_pools_size(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    const int device = ((ggml_backend_cuda_context *) backend->context)->device;
+    std::lock_guard<std::mutex> lock(ggml_cuda_oom_mutex);
+    size_t bytes = 0;
+    for (ggml_backend_cuda_context * ctx : ggml_cuda_oom_contexts) {
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (ctx->pools[device][s] != nullptr) {
+                bytes += ctx->pools[device][s]->reserved_size();
+            }
         }
     }
     return bytes;
@@ -711,7 +755,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
             // then the rest of the process (see ggml_cuda_oom_reclaim)
-            for (int step = 0; err == cudaErrorMemoryAllocation && step < 2; ++step) {
+            for (int step = 0; err == cudaErrorMemoryAllocation && step < GGML_CUDA_OOM_STEPS; ++step) {
                 (void)cudaGetLastError();
                 if (ggml_cuda_oom_reclaim(&ctx, device, look_ahead_size, step) > 0) {
                     err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
@@ -823,7 +867,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CUmemGenericAllocationHandle handle;
             CUresult created = cuMemCreate(&handle, reserve_size, &prop, 0);
             // out of device memory: take memory back from the rest of the process and retry (see ggml_cuda_oom_reclaim)
-            for (int step = 0; created == CUDA_ERROR_OUT_OF_MEMORY && step < 2; ++step) {
+            for (int step = 0; created == CUDA_ERROR_OUT_OF_MEMORY && step < GGML_CUDA_OOM_STEPS; ++step) {
                 if (ggml_cuda_oom_reclaim(&ctx, device, reserve_size, step) > 0) {
                     created = cuMemCreate(&handle, reserve_size, &prop, 0);
                 }
@@ -970,6 +1014,27 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
     concurrent_stream_context(std::make_unique<ggml_cuda_stream_context>()) {
     std::lock_guard<std::mutex> lock(ggml_cuda_oom_mutex);
     ggml_cuda_oom_contexts.push_back(this);
+}
+
+// the executables of the captured CUDA graphs of a context, except those of keep; returns how many were destroyed
+static size_t ggml_cuda_oom_release_executables(ggml_backend_cuda_context * ctx, const ggml_cuda_graph * keep) {
+    size_t n = 0;
+#ifdef USE_CUDA_GRAPH
+    for (auto & [key, graph] : ctx->cuda_graphs) {
+        if (graph.get() == keep) {
+            continue;
+        }
+        for (cudaGraphExec_t instance : graph->instances) {
+            CUDA_CHECK(cudaGraphExecDestroy(instance));
+            n++;
+        }
+        graph->instances.clear();
+    }
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(keep);
+#endif // USE_CUDA_GRAPH
+    return n;
 }
 
 // the pools of a context that is not computing (compute_mutex held by the caller) on a device, and its captured CUDA
@@ -3547,7 +3612,37 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 }
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
 
-static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
+// Instantiate a captured CUDA graph and upload it: the upload's device memory is paid here and not at the first launch.
+// Out of device memory is not fatal at once: memory is taken back in steps and the instantiation retried (see
+// ggml_cuda_oom_reclaim); the executables of `graph`, the graph being captured, stay.
+static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph, cudaGraphExec_t * handle, cudaGraph_t cuda_graph) {
+    const auto attempt = [&]() {
+        cudaError_t err = cudaGraphInstantiate(handle, cuda_graph, nullptr, nullptr, 0);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (err == cudaSuccess) {
+            err = cudaGraphUpload(*handle, cuda_ctx->stream());
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                CUDA_CHECK(cudaGraphExecDestroy(*handle));
+            }
+        }
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (err != cudaSuccess) {
+            *handle = nullptr;
+        }
+        return err;
+    };
+    cudaError_t err = attempt();
+    for (int step = 0; err == cudaErrorMemoryAllocation && step < GGML_CUDA_OOM_STEPS; ++step) {
+        (void) cudaGetLastError();
+        if (ggml_cuda_oom_reclaim(cuda_ctx, cuda_ctx->device, 0, step, graph) > 0) {
+            err = attempt();
+        }
+    }
+    CUDA_CHECK(err);
+}
+
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph, ggml_cuda_graph_instance & instance, cudaGraph_t cuda_graph, int device) {
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
     std::vector<ggml_cuda_graph_cluster> clusters = ggml_cuda_graph_get_clusters(cuda_graph, device);
     if (instance.clusters != clusters) {
@@ -3555,7 +3650,7 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
             GGML_LOG_DEBUG("%s: cluster dims changed, re-instantiating CUDA graph\n", __func__);
         }
         CUDA_CHECK(cudaGraphExecDestroy(instance));
-        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, &instance.handle, cuda_graph);
         instance.clusters = std::move(clusters);
         return;
     }
@@ -3582,7 +3677,7 @@ static void ggml_cuda_graph_update_executable(ggml_cuda_graph_instance & instanc
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(instance));
         instance.handle = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&instance.handle, cuda_graph, nullptr, nullptr, 0));
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, &instance.handle, cuda_graph);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -3603,11 +3698,11 @@ static void ggml_cuda_graph_launch_chunk(ggml_backend_cuda_context * cuda_ctx, g
     CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &cuda_graph));
 
     if (idx < graph->instances.size()) {
-        ggml_cuda_graph_update_executable(graph->instances[idx], cuda_graph, cuda_ctx->device);
+        ggml_cuda_graph_update_executable(cuda_ctx, graph, graph->instances[idx], cuda_graph, cuda_ctx->device);
     } else {
         GGML_ASSERT(idx == graph->instances.size());
         graph->instances.emplace_back();
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instances[idx].handle, cuda_graph, nullptr, nullptr, 0));
+        ggml_cuda_graph_instantiate(cuda_ctx, graph, &graph->instances[idx].handle, cuda_graph);
 #ifdef USE_CUDA_GRAPH_CLUSTER_CHECK
         graph->instances[idx].clusters = ggml_cuda_graph_get_clusters(cuda_graph, cuda_ctx->device);
 #endif // USE_CUDA_GRAPH_CLUSTER_CHECK
@@ -7216,6 +7311,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_oom_handler_remove") == 0) {
         return (void *)ggml_backend_cuda_oom_handler_remove;
+    }
+    if (strcmp(name, "ggml_backend_cuda_pools_size") == 0) {
+        return (void *)ggml_backend_cuda_pools_size;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

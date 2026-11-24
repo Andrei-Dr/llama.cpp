@@ -433,11 +433,13 @@ private:
     bool   moe_cache_in_copy      = false;               // a copy callback is reading the cache (same thread as the handler)
     std::atomic<bool> moe_cache_in_graph { false };      // the graph being computed reads the cache
     size_t moe_cache_size_cur     = 0;                   // the cache's budget now (cparams.moe_cache_size until a rebuild)
-    size_t moe_pressure_need      = 0;                   // bytes a failed device allocation asked for since the last restore
+    std::atomic<size_t> moe_pressure_need { 0 };         // a device allocation failed since the last restore: bytes asked for (at least 1)
     size_t moe_decode_compute     = 0;                   // device compute buffers of the last reserve outside the prefill mode
+    size_t moe_pool_room          = 0;                   // largest device pools seen at the end of a generation
     bool   moe_oom_handler        = false;               // registered with the device backends
 
     size_t moe_cache_give_back(ggml_backend_dev_t dev, size_t need);
+    size_t device_pools_size() const;
     bool   moe_cache_restore();
     bool   moe_cache_rebuild(size_t size, const char * why);
 
