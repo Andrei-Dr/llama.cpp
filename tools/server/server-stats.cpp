@@ -78,7 +78,7 @@ json server_stats_selection::to_json() const {
 
 double server_stats_task::ttft_ms() const {
     if (n_gen <= 0) {
-        return NAN; // cancelled or failed before the first token, or an embedding / rerank task
+        return NAN; // canceled or failed before the first token, or an embedding / rerank task
     }
     return (std::isnan(t_queue_ms) ? 0.0 : t_queue_ms) + t_prompt_ms;
 }
@@ -181,7 +181,7 @@ json server_stats_snapshot::disk_json() const {
         { "save",                d.n_save              },
         { "save_skipped",        d.n_save_skipped      },
         { "save_refused",        d.n_save_refused      },
-        { "save_cancelled",      d.n_save_cancelled    },
+        { "save_canceled",       d.n_save_canceled     },
         { "save_failed",         d.n_save_failed       },
         { "save_tokens",         d.save_tokens         },
         { "save_bytes",          d.save_bytes          },

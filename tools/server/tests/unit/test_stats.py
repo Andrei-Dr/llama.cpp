@@ -226,6 +226,7 @@ def test_stats_disk_cache(tmp_path):
     assert d["limit_bytes"] == 256 * 1024 * 1024
     assert d["find"] >= d["find_hit"] >= 1
     assert d["restore"] == 1 and d["restore_failed"] == 0
+    assert d["save_canceled"] == 0 and "save_cancelled" not in d
     assert 0.0 < d["f_sim_hit"] <= 1.0
 
     third = s["tasks"][2]["sel"]

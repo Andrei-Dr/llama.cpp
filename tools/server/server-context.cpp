@@ -2026,7 +2026,7 @@ private:
                     || now - slot.t_last_used < debounce) {
                 continue;
             }
-            // a cancelled save is retried at the next idle period
+            // a canceled save is retried at the next idle period
             if (prompt_cache->disk->save(slot.prompt, slot.ctx_tgt, slot.ctx_dft, slot.id, abort) || !abort()) {
                 slot.t_disk_offered = slot.t_last_used;
             }
@@ -5469,7 +5469,7 @@ private:
             return 0;
         }
         const server_prompt_disk_stats & d = prompt_disk->stats;
-        return d.n_save + d.n_save_skipped + d.n_save_refused + d.n_save_cancelled + d.n_save_failed + d.n_evict_expired +
+        return d.n_save + d.n_save_skipped + d.n_save_refused + d.n_save_canceled + d.n_save_failed + d.n_evict_expired +
                d.n_evict_space + d.n_superseded;
     }
 

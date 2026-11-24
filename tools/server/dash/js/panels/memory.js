@@ -49,8 +49,8 @@ export function render(st) {
     const on = pairs.filter(([, n]) => n > 0).map(([k, n]) => k + " " + num(n));
     return on.length ? on.join(" · ") : null;
   };
-  const ns = [dc.save_skipped, dc.save_refused, dc.save_cancelled, dc.save_failed].reduce((a, b) => a + (b || 0), 0);
-  val("d-nosave", num(ns), why([["skipped", dc.save_skipped], ["refused", dc.save_refused], ["cancelled", dc.save_cancelled], ["failed", dc.save_failed]]));
+  const ns = [dc.save_skipped, dc.save_refused, dc.save_canceled, dc.save_failed].reduce((a, b) => a + (b || 0), 0);
+  val("d-nosave", num(ns), why([["skipped", dc.save_skipped], ["refused", dc.save_refused], ["canceled", dc.save_canceled], ["failed", dc.save_failed]]));
   const ev = [dc.evict_expired, dc.evict_space, dc.superseded].reduce((a, b) => a + (b || 0), 0);
   val("d-evict", num(ev), why([["ttl", dc.evict_expired], ["space", dc.evict_space], ["superseded", dc.superseded]]), ev ? bytes(dc.evict_bytes) : null);
 }

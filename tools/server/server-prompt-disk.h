@@ -49,7 +49,7 @@ struct server_prompt_disk_stats {
     uint64_t n_save           = 0;
     uint64_t n_save_skipped   = 0; // already stored, or contains media
     uint64_t n_save_refused   = 0; // larger than the cap, or would break the free-space reserve
-    uint64_t n_save_cancelled = 0; // an idle save a new request interrupted
+    uint64_t n_save_canceled = 0; // an idle save a new request interrupted
     uint64_t n_save_failed    = 0;
     uint64_t save_tokens      = 0;
     uint64_t save_bytes       = 0;

@@ -87,7 +87,7 @@ static void test_task_derived(testing & t) {
     t.assert_true("acceptance", std::fabs(a.accept_rate() - 0.7) < 1e-9);
 
     server_stats_task none = make_task(3, 5.0, 45.0, 0.0, 0, 0, 0);
-    t.assert_true("no token (cancelled, failed, embedding): no ttft", std::isnan(none.ttft_ms()));
+    t.assert_true("no token (canceled, failed, embedding): no ttft", std::isnan(none.ttft_ms()));
     none.n_gen      = 1;
     none.t_queue_ms = NAN;
     t.assert_true("unknown queue wait: ttft from the prompt alone", std::fabs(none.ttft_ms() - 45.0) < 1e-9);

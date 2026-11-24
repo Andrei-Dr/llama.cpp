@@ -170,7 +170,7 @@ file_ptr open_file(const fs::path & p) {
 
 // Streaming writeback: each record's pages are handed to the disk right away (no wait), and the pages two records
 // back are waited for and dropped, so at most ~3 records (12 MiB) of this file are ever dirty in the page cache and
-// nothing waits for the whole file (no fdatasync). The box has no RAM to spare for a GB of dirty pages.
+// nothing waits for the whole file (no fdatasync). A GB of dirty pages would otherwise compete with the model for host memory.
 void writeback(FILE * f, off_t from, off_t to, bool wait) {
 #if defined(__linux__)
     if (to <= from) {
@@ -844,8 +844,8 @@ bool server_prompt_disk::save_impl(const server_prompt & prompt, llama_context *
             || write_ckpts(path(e.id, ".ckpt"), key_ptr(), e.id, prompt.checkpoints, abort));
     if (!ok) {
         if (abort && abort()) {
-            SRV_INF("prompt disk cache: idle save of %d tokens cancelled by a new request\n", (int) tokens.size());
-            stats.n_save_cancelled++;
+            SRV_INF("prompt disk cache: idle save of %d tokens canceled by a new request\n", (int) tokens.size());
+            stats.n_save_canceled++;
         } else {
             SRV_ERR("prompt disk cache: failed to write entry %s\n", e.id.c_str());
             stats.n_save_failed++;
