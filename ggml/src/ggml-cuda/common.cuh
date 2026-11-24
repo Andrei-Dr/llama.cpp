@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
@@ -1332,6 +1333,9 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // device memory the pool holds, in use or not (given back when the pool is destroyed)
+    virtual size_t reserved_size() const { return 0; }
 };
 
 template<typename T>
@@ -1432,6 +1436,10 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device);
 
     std::unique_ptr<ggml_cuda_stream_context> concurrent_stream_context;
+
+    // held while a graph is computed: an out-of-memory reclaim started by another context (ggml_cuda_oom_reclaim) only
+    // takes the pools of a context that is not computing
+    std::mutex compute_mutex;
 
     ~ggml_backend_cuda_context();
 
