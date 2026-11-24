@@ -1265,6 +1265,9 @@ struct ggml_backend_sched {
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
     int prefetch_backend_id; // the backend that copies them
+
+    // the backend with stream-ordered copies from host compute memory enqueued (see ggml_backend_sched_copy_input), or -1
+    int stream_copy_backend_id;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -2134,15 +2137,38 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // A copy from a host buffer that is enqueued on the split backend's own stream (set_tensor_async) is ordered after every
+    // earlier use of input_cpy by that stream, so it needs no host-side wait. Without events (a single copy, i.e. no pipeline
+    // parallelism) the wait below is a full ggml_backend_synchronize: the host blocks until the device drains, then enqueues
+    // the copy and the split while the device idles. Exact. GGML_SCHED_COPY_SYNC=1 restores the wait.
+    // The host source is not overwritten before the copy runs: see the wait in ggml_backend_sched_compute_splits.
+    static const bool skip_copy_sync = [] {
+        const char * env = getenv("GGML_SCHED_COPY_SYNC");
+        return !(env != nullptr && atoi(env) != 0);
+    }();
+    const bool stream_ordered = skip_copy_sync && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer) &&
+        split_backend->iface.set_tensor_async != NULL;
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-    } else {
+    } else if (!stream_ordered) {
         ggml_backend_synchronize(split_backend);
     }
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
         sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+        return;
+    }
+
+    if (stream_ordered) {
+        // host -> device (e.g. the misses of a MoE layer computed on the CPU): enqueue the upload on the split backend's own
+        // stream, before this split's compute, instead of blocking the host for the transfer
+        ggml_backend_synchronize(input_backend);
+        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        if (!ggml_backend_sched_is_host_weight(input)) {
+            sched->stream_copy_backend_id = split_backend_id;
+        }
         return;
     }
 
@@ -2226,6 +2252,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    // copies left on a stream by the previous graph (its caller synchronizes before it reads results, not necessarily before
+    // the next graph writes host memory)
+    if (sched->stream_copy_backend_id >= 0) {
+        ggml_backend_synchronize(sched->backends[sched->stream_copy_backend_id]);
+        sched->stream_copy_backend_id = -1;
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2239,6 +2272,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+        }
+
+        // stream-ordered copies read host compute memory after the host has moved on, and a split on another backend may
+        // write that memory (its input copies and its nodes reuse it), so it starts only once those copies have run:
+        // after the prefetch event if this split reads prefetched inputs (it is recorded after the copies and the split
+        // waits for it anyway), else after everything queued on that backend
+        if (sched->stream_copy_backend_id >= 0 && sched->stream_copy_backend_id != split_backend_id) {
+            if (sched->n_prefetched > 0 && sched->prefetch_split == split_id && sched->prefetch_backend_id == sched->stream_copy_backend_id) {
+                ggml_backend_event_synchronize(sched->prefetch_events[sched->prefetch_backend_id]);
+            } else {
+                ggml_backend_synchronize(sched->backends[sched->stream_copy_backend_id]);
+            }
+            sched->stream_copy_backend_id = -1;
         }
 
         // copy the input tensors to the split backend
@@ -2334,6 +2380,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    sched->stream_copy_backend_id = -1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
