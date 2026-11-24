@@ -205,6 +205,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (disk) {
+        float f_keep_disk = 0.0f;
+        float f_sim_disk  = 0.0f;
+        const auto * e = disk->find(tokens_new, lora_new, f_keep_best, f_sim_best, f_keep_disk, f_sim_disk);
+        if (e != nullptr) {
+            SRV_TRC(" - found better prompt on disk with f_keep = %.3f, f_sim = %.3f\n", f_keep_disk, f_sim_disk);
+            if (disk->load(*e, prompt, ctx_tgt, ctx_dft, id_slot)) {
+                return true;
+            }
+            if (it_best == states.end()) {
+                return false;  // the sequence was cleared: the caller clears the slot
+            }
+            // fall back to the best RAM state (it overwrites the cleared sequence)
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -256,6 +272,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    if (disk) {
+        disk->evict();
+    }
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
@@ -326,6 +346,8 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
 
     bool update_cache = false;
 
+    server_slot_plan plan;
+
     // if a specific slot is requested, use it (still goes through cache update logic below)
     if (task.id_slot != -1 && !slots.empty()) {
         // note: allow id_slot to be out of bounds (wrap around)
@@ -345,12 +367,14 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             }
 
             SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+            plan.how = "id";
         }
     }
 
     // find the slot that has at least n% prompt similarity
     if (slot_prompt_similarity != 0.0f) {
-        float f_sim_best = 0;
+        float  f_sim_best = 0;
+        size_t lcp_best   = 0;
 
         for (const auto & slot : slots) {
             if (task.id_slot != -1 && slot.id != task.id_slot) {
@@ -386,6 +410,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             // select the current slot if the criteria match
             if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
                 f_sim_best = f_sim_cur;
+                lcp_best   = lcp_len;
 
                 ret = &slot;
             }
@@ -397,7 +422,12 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             if (task.id_slot == -1) {
                 SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         f_sim_best, slot_prompt_similarity, f_keep);
+                plan.how = "lcp";
             }
+            plan.scored = true;
+            plan.n_lcp  = lcp_best;
+            plan.f_sim  = f_sim_best;
+            plan.f_keep = f_keep;
 
             // if we are about to lose a large portion of the existing context - save it in the prompt cache
             if (f_keep < 0.5f) {
@@ -414,6 +444,7 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
             ret = free_slots[0];
 
             SLT_INF(*ret, "selected slot by LRU, n_tokens = %d, t_last = %" PRId64 "\n", ret->prompt->n_tokens(), ret->t_last_used);
+            plan.how = "lru";
 
             update_cache = true;
         }
@@ -426,5 +457,8 @@ server_slot_plan server_slot_sched::select(const std::vector<server_slot_info> &
     // cache prompts only for the tasks that reuse them
     update_cache = update_cache && !task.is_stateless();
 
-    return { ret->id, update_cache };
+    plan.id_slot      = ret->id;
+    plan.update_cache = update_cache;
+
+    return plan;
 }

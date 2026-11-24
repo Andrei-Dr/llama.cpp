@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-prompt-disk.cpp
+    server-prompt-disk.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
@@ -39,6 +41,18 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(${TARGET} PRIVATE vendor::hash)
+
+# the prompt cache disk tier encrypts with AES-256-GCM (OpenSSL libcrypto); without it only --no-cache-disk-encrypt
+# works. Not with the vendored BoringSSL/LibreSSL builds: two libcrypto implementations would clash.
+if (NOT LLAMA_BUILD_BORINGSSL AND NOT LLAMA_BUILD_LIBRESSL)
+    find_package(OpenSSL COMPONENTS Crypto)
+    if (OpenSSL_FOUND)
+        target_link_libraries(${TARGET} PRIVATE OpenSSL::Crypto)
+        target_compile_definitions(${TARGET} PRIVATE LLAMA_PDC_OPENSSL)
+    else()
+        message(WARNING "OpenSSL libcrypto not found: the prompt cache disk tier will need --no-cache-disk-encrypt")
+    endif()
+endif()
 
 # llama-server-impl: server logic, reusable by app
 

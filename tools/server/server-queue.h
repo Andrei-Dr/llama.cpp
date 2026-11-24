@@ -45,6 +45,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle;
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -125,6 +126,18 @@ public:
     // note: while yielding, the callback runs on worker thread, not main thread
     void on_new_task(std::function<bool(server_task &&, bool)> callback) {
         callback_new_task = std::move(callback);
+    }
+
+    // Register a function called about once a second while no task is waiting (not while sleeping); it runs on the
+    // loop thread with no lock held and may take long, since new tasks simply wait for it
+    void on_idle(std::function<void(void)> callback) {
+        callback_idle = std::move(callback);
+    }
+
+    // true when tasks are waiting to be processed (thread-safe)
+    bool has_pending() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return !queue_tasks.empty();
     }
 
     // Register the function to be called when all slots data is ready to be processed

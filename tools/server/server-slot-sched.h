@@ -1,6 +1,7 @@
 #pragma once
 
 #include "server-common.h"
+#include "server-prompt-disk.h"
 #include "server-task.h"
 
 #include <list>
@@ -91,6 +92,12 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // false when only the disk tier is on (--cache-ram 0 --cache-disk PATH): states go straight to disk
+    bool ram = true;
+
+    // optional disk tier, consulted after the RAM states (owned by the server context: it outlives model reloads)
+    server_prompt_disk * disk = nullptr;
+
     size_t size() const;
 
     size_t n_tokens() const;
@@ -120,6 +127,16 @@ struct server_slot_plan {
 
     // save the slot state to the prompt cache, then load the best match for the task
     bool update_cache = false;
+
+    // how the slot was chosen: "id", "lcp" or "lru" ("" when no slot is available)
+    const char * how = "";
+
+    // set when the slot's prompt was scored against the task (prompt similarity on, slot not empty or asked for by id):
+    // the tokens shared with the task, their share of the task (f_sim) and of the slot's prompt (f_keep)
+    bool   scored = false;
+    size_t n_lcp  = 0;
+    float  f_sim  = 0.0f;
+    float  f_keep = 0.0f;
 };
 
 // decides only, the caller applies the plan

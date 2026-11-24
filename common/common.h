@@ -684,6 +684,12 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    std::string cache_disk_path;                // prompt cache disk tier root; empty = no disk tier
+    int32_t cache_disk_mib         = 32768;     // disk tier size cap in MiB (0 = no cap)
+    int32_t cache_disk_ttl         = 3600;      // seconds an unused entry is kept (0 = no expiry)
+    int32_t cache_disk_reserve_mib = 8192;      // free space the disk tier always leaves on its filesystem
+    bool    cache_disk_encrypt     = true;      // AES-256-GCM with a per-run key
+    int32_t cache_disk_idle_ms     = 2000;      // idle time before an idle slot is written to the disk tier
 
     // llama-connect params
     bool        server_connect      = false;
