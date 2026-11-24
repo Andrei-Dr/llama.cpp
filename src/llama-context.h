@@ -12,8 +12,10 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <atomic>
 #include <array>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -421,6 +423,23 @@ private:
 
     // release the temporary pools of the device backends (they never shrink by themselves)
     void trim_device_pools();
+
+    // Device memory pressure. With the device memory spent on purpose (the MoE cache), an allocation the startup budget
+    // does not hold (a temporary pool that grows for a batch shape or a KV length not seen before, another context's
+    // compute buffer) used to abort the process. The cache is the one large allocation that can be rebuilt, so it gives
+    // way: the device backend calls moe_cache_give_back() when a pool cannot grow, and the next small batch brings the
+    // cache back smaller (moe_cache_restore). A resume that does not fit is rebuilt at the size that fits.
+    std::recursive_mutex moe_cache_mutex;                // the scheduler copy callbacks and moe_cache_give_back()
+    bool   moe_cache_in_copy      = false;               // a copy callback is reading the cache (same thread as the handler)
+    std::atomic<bool> moe_cache_in_graph { false };      // the graph being computed reads the cache
+    size_t moe_cache_size_cur     = 0;                   // the cache's budget now (cparams.moe_cache_size until a rebuild)
+    size_t moe_pressure_need      = 0;                   // bytes a failed device allocation asked for since the last restore
+    size_t moe_decode_compute     = 0;                   // device compute buffers of the last reserve outside the prefill mode
+    bool   moe_oom_handler        = false;               // registered with the device backends
+
+    size_t moe_cache_give_back(ggml_backend_dev_t dev, size_t need);
+    bool   moe_cache_restore();
+    bool   moe_cache_rebuild(size_t size, const char * why);
 
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved

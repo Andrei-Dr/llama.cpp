@@ -68,6 +68,13 @@ public:
     bool resume();
     bool suspended() const;
 
+    // whether the graph of a ubatch of n_tokens can read the cache (false for the large ubatches, which only copy from it
+    // through copy_experts, and while suspended)
+    bool serves(int64_t n_tokens) const;
+
+    // device memory the cache holds now, on dev or on all devices (0 while suspended)
+    size_t device_size(ggml_backend_dev_t dev = nullptr) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:

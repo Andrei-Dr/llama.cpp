@@ -1080,6 +1080,20 @@ bool llama_moe_cache::suspended() const {
     return pimpl->suspended;
 }
 
+bool llama_moe_cache::serves(int64_t n_tokens) const {
+    return !pimpl->suspended && n_tokens > 0 && n_tokens <= pimpl->max_batch;
+}
+
+size_t llama_moe_cache::device_size(ggml_backend_dev_t dev) const {
+    size_t res = 0;
+    for (const auto & d : pimpl->devices) {
+        if (d.buf && (dev == nullptr || ggml_backend_buft_get_device(d.buft) == dev)) {
+            res += d.buf_size;
+        }
+    }
+    return res;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
     for (const auto & d : pimpl->devices) {

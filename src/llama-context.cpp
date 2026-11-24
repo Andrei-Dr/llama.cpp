@@ -627,6 +627,24 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
+            moe_cache_size_cur = cparams.moe_cache_size;
+
+            // the cache gives its device memory back when a temporary pool of the device cannot grow (moe_cache_give_back)
+            if (!model.no_alloc() && moe_cache->device_size() > 0) {
+                using handler_t = size_t (*)(ggml_backend_dev_t, size_t, void *);
+                using add_fn_t  = void (*)(handler_t, void *);
+                for (auto & be : backends) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+                    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    auto add = reg ? (add_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_oom_handler_add") : nullptr;
+                    if (add && !moe_oom_handler) {
+                        add([](ggml_backend_dev_t dev, size_t need, void * user_data) {
+                            return static_cast<llama_context *>(user_data)->moe_cache_give_back(dev, need);
+                        }, this);
+                        moe_oom_handler = true;
+                    }
+                }
+            }
         }
 
         sched_reserve();
@@ -652,6 +670,19 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (moe_oom_handler) {
+        using remove_fn_t = void (*)(void *);
+        for (auto & be : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto remove = reg ? (remove_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_oom_handler_remove") : nullptr;
+            if (remove) {
+                remove(this);
+                break;
+            }
+        }
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
@@ -976,6 +1007,17 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    if (!moe_prefill_mode) {
+        // what a MoE cache that is rebuilt to fit must leave to the scheduler (moe_cache_restore)
+        moe_decode_compute = 0;
+        for (auto & be : backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+            if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                moe_decode_compute += ggml_backend_sched_get_buffer_size(sched.get(), be.get());
+            }
+        }
+    }
 }
 
 void llama_context::synchronize() {
@@ -1077,7 +1119,7 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         sched.reset();
         sched_need_reserve = true;
         trim_device_pools();
-        if (!moe_cache->resume()) {
+        if (!moe_cache_restore()) {
             LLAMA_LOG_WARN("%s: the MoE cache does not fit back after the prefill, generation runs without it for now\n", __func__);
             moe_resume_at = n_decode_calls + 64;
         } else {
@@ -1094,6 +1136,13 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         synchronize();
         moe_cache->suspend();
         leave();
+    }
+    if (!big && !moe_prefill_mode && moe_cache->suspended() && n_decode_calls >= moe_resume_at) {
+        // a cache that did not fit back, or that gave its memory back under pressure (with or without --ubatch-prefill):
+        // paced retry, each one resets the scheduler
+        synchronize();
+        leave();
+        return;
     }
     if (cparams.n_ubatch_prefill == 0) {
         return;
@@ -1131,10 +1180,83 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         } else {
             leave();
         }
-    } else if (!moe_prefill_mode && moe_cache->suspended() && n_decode_calls >= moe_resume_at) {
-        // a cache that did not fit back: paced retry (each one resets the scheduler)
-        synchronize();
-        leave();
+    }
+}
+
+// Called by the device backend, on the thread whose temporary pool cannot grow (this context's or another context's, e.g.
+// the draft's), after everything submitted to the device completed. The cache's device memory is given back unless the
+// graph being computed reads it: a large ubatch does not (it copies cached experts through copy_experts, which sees the
+// suspension), a small one does. The next small batch restores the cache, smaller (moe_prefill_switch).
+size_t llama_context::moe_cache_give_back(ggml_backend_dev_t dev, size_t need) {
+    std::unique_lock<std::recursive_mutex> lock(moe_cache_mutex, std::try_to_lock);
+    if (!lock.owns_lock() || moe_cache_in_copy || moe_cache_in_graph.load() || !moe_cache || moe_cache->suspended()) {
+        return 0;
+    }
+    const size_t bytes = moe_cache->device_size(dev);
+    if (bytes == 0) {
+        return 0;
+    }
+    moe_cache->suspend();
+    moe_pressure_need = std::max(moe_pressure_need, need);
+    moe_resume_at     = n_decode_calls; // the next small batch
+    LLAMA_LOG_WARN("%s: the device is out of memory (%.1f MiB asked for): the MoE cache gave back %.1f MiB\n",
+            __func__, need/1048576.0, bytes/1048576.0);
+    return bytes;
+}
+
+// brings a suspended cache back; the scheduler is freed and the pools are trimmed by the caller, who reserves afterwards
+bool llama_context::moe_cache_restore() {
+    std::lock_guard<std::recursive_mutex> lock(moe_cache_mutex);
+    const size_t MiB = 1024*1024;
+
+    if (moe_pressure_need > 0) {
+        // an allocation failed beside the cache: the same cache would fail the same way, it comes back smaller by what was
+        // asked for (pools grow in steps, so a margin on top; several steps of pressure shrink it several times)
+        const size_t cut = std::max<size_t>(GGML_PAD(moe_pressure_need, 32*MiB) + 32*MiB, 64*MiB);
+        moe_pressure_need = 0;
+        return moe_cache_rebuild(moe_cache_size_cur > cut ? moe_cache_size_cur - cut : 0, "a device allocation failed beside it");
+    }
+
+    if (moe_cache->resume()) {
+        return true;
+    }
+
+    // it does not fit back (something else on the device grew meanwhile): the size that fits now, less what the scheduler
+    // reserves right after and a margin for the pools
+    size_t fit = moe_cache_size_cur;
+    for (auto & be : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        const size_t keep = moe_decode_compute + 64*MiB;
+        fit = std::min(fit, free > keep ? free - keep : 0);
+    }
+    return moe_cache_rebuild(fit, "it does not fit back");
+}
+
+// replaces the (suspended) cache by an empty one of the given size; false when that is too small to hold a layer's experts
+// or cannot be allocated, the old cache then stays suspended
+bool llama_context::moe_cache_rebuild(size_t size, const char * why) {
+    const size_t MiB = 1024*1024;
+    if (size < 32*MiB) {
+        return false;
+    }
+    try {
+        auto fresh = std::make_unique<llama_moe_cache>(model, false, backend_ptrs, backend_buft, size, cparams.moe_cache_cpu_share);
+        if (fresh->device_size() == 0) {
+            return false;
+        }
+        LLAMA_LOG_WARN("%s: MoE cache rebuilt at %.0f MiB (was %.0f MiB): %s. Lower --moe-cache-mib to %.0f to start there\n",
+                __func__, size/1048576.0, moe_cache_size_cur/1048576.0, why, size/1048576.0);
+        moe_cache          = std::move(fresh);
+        moe_cache_size_cur = size;
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: MoE cache of %.0f MiB not allocated (%s)\n", __func__, size/1048576.0, e.what());
+        return false;
     }
 }
 
@@ -2001,7 +2123,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // a graph that reads the MoE cache keeps it: moe_cache_give_back() refuses while it is being computed
+    moe_cache_in_graph = moe_cache && moe_cache->serves(ubatch.n_tokens);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    moe_cache_in_graph = false;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3258,6 +3383,15 @@ ggml_status llama_context::graph_compute(
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
+
+    // the cache is not given back under a copy that reads it (moe_cache_give_back)
+    std::lock_guard<std::recursive_mutex> lock(lctx->moe_cache_mutex);
+    struct in_copy_guard {
+        bool & flag;
+        bool   prev;
+        in_copy_guard(bool & flag) : flag(flag), prev(flag) { flag = true; }
+        ~in_copy_guard() { flag = prev; }
+    } in_copy(lctx->moe_cache_in_copy);
 
     // the slot maps of the MoE cache
     if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
