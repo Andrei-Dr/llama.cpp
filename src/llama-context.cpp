@@ -4545,6 +4545,14 @@ void llama_context::perf_reset() {
     // note: the reallocation counters are not reset - they track the lifetime totals for this context
 }
 
+bool llama_context::moe_cache_get_stats(llama_moe_cache_stats & stats) const {
+    if (!moe_cache) {
+        return false;
+    }
+    moe_cache->get_stats(stats);
+    return true;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -5561,6 +5569,10 @@ void llama_perf_context_print(const llama_context * ctx) {
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
     LLAMA_LOG_INFO("%s:   graph reallocs = %10d    / %5d        (same size) / (changed size)\n", __func__, data.n_reallocs_same, data.n_reallocs_diff);
+}
+
+bool llama_moe_cache_get_stats(const llama_context * ctx, llama_moe_cache_stats * stats) {
+    return stats != nullptr && ctx->moe_cache_get_stats(*stats);
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

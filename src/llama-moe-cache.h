@@ -7,6 +7,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_moe_cache_stats;
 struct llm_graph_context;
 
 // the experts of a MoE layer, as llm_graph_context::build_moe_ffn passes them to the MoE cache
@@ -76,6 +77,9 @@ public:
     size_t device_size(ggml_backend_dev_t dev = nullptr) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    // sizes and cumulative counters (llama_moe_cache_get_stats); read-only, not synchronized with copy()
+    void get_stats(llama_moe_cache_stats & stats) const;
 
 private:
     struct impl;

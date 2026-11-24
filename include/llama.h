@@ -1762,6 +1762,35 @@ extern "C" {
     LLAMA_API void                           llama_perf_sampler_reset(      struct llama_sampler * chain);
 
     //
+    // MoE cache statistics (llama_context_params.moe_cache_size)
+    //
+
+    struct llama_moe_cache_counters {
+        uint64_t n_hit;        // selected experts read from the cache
+        uint64_t n_miss;       // ... not in the cache
+        uint64_t n_miss_cpu;   // ... of the misses, computed on the CPU instead of uploaded
+        uint64_t upload_bytes; // bytes uploaded for the other misses
+    };
+
+    struct llama_moe_cache_stats {
+        bool     suspended;    // device memory released (MoE prefill mode): no layer reads the cache
+        int32_t  n_layer;      // layers whose experts the cache holds
+        int32_t  n_expert;     // experts of those layers, all layers
+        int32_t  n_slots;      // expert slots, all layers
+        int32_t  n_resident;   // slots holding an expert
+        uint64_t device_bytes; // device memory of the cache now (0 while suspended)
+        struct llama_moe_cache_counters ubatch_small; // ubatches of up to 8 tokens (generation steps)
+        struct llama_moe_cache_counters ubatch_large; // larger ubatches that read the cache
+        uint64_t n_copy;       // experts copied from the cache into the weights of a large batch
+        uint64_t copy_bytes;
+    };
+
+    // Counters are cumulative since the context was created. Not synchronized with a decode on the same context: call
+    // it between decodes, from the thread that decodes. Returns false when the context has no MoE cache (stats is then
+    // left untouched).
+    LLAMA_API bool llama_moe_cache_get_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * stats);
+
+    //
     // training
     //
 

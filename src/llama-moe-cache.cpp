@@ -1098,6 +1098,33 @@ size_t llama_moe_cache::device_size(ggml_backend_dev_t dev) const {
     return res;
 }
 
+void llama_moe_cache::get_stats(llama_moe_cache_stats & stats) const {
+    const impl & p = *pimpl;
+
+    stats = {};
+    stats.suspended = p.suspended;
+    for (const auto & l : p.layers) {
+        if (l.ig >= 0) {
+            stats.n_layer  += 1;
+            stats.n_expert += l.slot_map ? (int32_t) l.slot_map->ne[1] : 0;
+        }
+    }
+    for (const auto & g : p.groups) {
+        stats.n_slots    += g.n_slots;
+        stats.n_resident += g.lru.n_filled;
+    }
+    for (const auto & d : p.devices) {
+        stats.device_bytes += d.buf ? d.buf_size : 0;
+    }
+    const auto counters = [](const impl::stats & st) {
+        return llama_moe_cache_counters { st.hits, st.misses, st.cpu, st.bytes };
+    };
+    stats.ubatch_small = counters(p.stats_small);
+    stats.ubatch_large = counters(p.stats_large);
+    stats.n_copy       = p.stats_copy.hits;
+    stats.copy_bytes   = p.stats_copy.bytes;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> res;
     for (const auto & d : pimpl->devices) {

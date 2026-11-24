@@ -218,6 +218,9 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // false without a MoE cache
+    bool moe_cache_get_stats(llama_moe_cache_stats & stats) const;
+
     //
     // training
     //
