@@ -798,6 +798,12 @@ struct llama_moe_cache::impl {
     }
 
     bool resume() {
+        // diag: LLAMA_MOE_DIAG_RESUME_FAIL=N makes the first N resumes fail, as if the device memory were taken meanwhile
+        static int diag_fail = getenv("LLAMA_MOE_DIAG_RESUME_FAIL") ? atoi(getenv("LLAMA_MOE_DIAG_RESUME_FAIL")) : 0;
+        if (suspended && diag_fail > 0) {
+            diag_fail--;
+            return false;
+        }
         if (!suspended) {
             return true;
         }
