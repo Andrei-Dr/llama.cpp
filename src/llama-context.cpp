@@ -798,6 +798,15 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+// GGML_SCHED_MOE_PREFETCH=0 turns the upload / compute overlap of the MoE prefill mode off (A/B switch, same result)
+static bool llama_moe_upload_ahead_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_SCHED_MOE_PREFETCH");
+        return !(env != nullptr && atoi(env) == 0);
+    }();
+    return enabled;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -832,6 +841,10 @@ void llama_context::sched_reserve() {
         /*.parallel   =*/ cparams.pipeline_parallel,
         /*.op_offload =*/ cparams.op_offload,
     });
+
+    // in the MoE prefill mode the device memory of the MoE cache is free: the expert weights of a layer are uploaded while
+    // the previous split computes (the reserve below and the batches after it are split with the same setting)
+    ggml_backend_sched_set_upload_ahead(sched.get(), moe_prefill_mode && llama_moe_upload_ahead_enabled());
 
     llama_memory_context_ptr mctx;
     if (memory) {

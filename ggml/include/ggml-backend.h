@@ -390,6 +390,12 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Upload / compute overlap for host MoE weights: in the graphs split from now on, the whole weight tensor of a
+    // MUL_MAT_ID that routes >= 8 tokens per expert is uploaded on a second stream while the previous split computes.
+    // The tensor is resident one split early, so enable it only where the device memory allows (large batches).
+    // The reserve and the graphs computed after it must be split with the same setting. Off by default; CUDA only.
+    GGML_API void                 ggml_backend_sched_set_upload_ahead(ggml_backend_sched_t sched, bool enable);
+
     // Set a callback to be called when the compute buffers of a graph are being reallocated
     GGML_API void                 ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_backend_sched_realloc_callback callback, void * user_data);
 
