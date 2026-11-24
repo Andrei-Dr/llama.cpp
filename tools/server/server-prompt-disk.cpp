@@ -471,7 +471,10 @@ bool read_ckpts(const fs::path & p, const uint8_t * key, const std::string & id,
             return false;
         }
         c.update_pos(n_tokens, pos_min, pos_max);
-        c.id_task = id_task;
+        // not created by a task of this context (the model may have been reloaded since): like a checkpoint restored
+        // from a slot file it is not guaranteed to load, and a failed load falls back to processing the prompt again
+        (void) id_task;
+        c.id_task = -1;
         ckpts.push_back(std::make_shared<const common_prompt_checkpoint>(std::move(c)));
     }
     return r.at_end();

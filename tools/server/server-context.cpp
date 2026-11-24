@@ -4466,8 +4466,8 @@ private:
                                         if (cur.id_task != -1) {
                                             GGML_ABORT("failed to restore context checkpoint\n");
                                         }
-                                        // restored from a slot file, not guaranteed to load - fall back to full prompt re-processing
-                                        SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a slot file\n");
+                                        // restored from a slot file or from the prompt cache disk tier, not guaranteed to load - fall back to full prompt re-processing
+                                        SLT_WRN(slot, "%s", "failed to load context checkpoint restored from a file\n");
                                         reuse = {};
                                     } else {
                                         // restore the draft's speculative state
