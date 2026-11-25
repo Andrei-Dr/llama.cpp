@@ -593,7 +593,7 @@ static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device
             ctx->compute_mutex.unlock();
         }
         if (bytes > 0) {
-            GGML_LOG_WARN("%s: device %d out of memory growing a pool by %.1f MiB: took back %.1f MiB of pools from %d idle contexts\n",
+            GGML_LOG_WARN("%s: device %d out of memory (%.1f MiB asked for): took back %.1f MiB of pools from %d idle contexts\n",
                     __func__, device, need/1048576.0, bytes/1048576.0, n_ctx);
         }
     } else if (step == 1) {
@@ -625,6 +625,17 @@ static size_t ggml_cuda_oom_reclaim(ggml_backend_cuda_context * self, int device
         }
     }
     return bytes;
+}
+
+// The reclaim steps for an allocation the application makes itself and cannot get (a compute buffer that has to grow):
+// step 0 .. GGML_CUDA_OOM_STEPS - 1 as in ggml_cuda_oom_reclaim, called between graphs on the thread of `backend`.
+// Returns the bytes (step 2: the executables) given back, SIZE_MAX when there is no such step.
+static size_t ggml_backend_cuda_oom_reclaim(ggml_backend_t backend, size_t need, int step) {
+    if (!ggml_backend_is_cuda(backend) || step < 0 || step >= GGML_CUDA_OOM_STEPS) {
+        return SIZE_MAX;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    return ggml_cuda_oom_reclaim(cuda_ctx, cuda_ctx->device, need, step);
 }
 
 // device memory held by the temporary pools of every CUDA backend of the process on the device of this one
@@ -7314,6 +7325,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_pools_size") == 0) {
         return (void *)ggml_backend_cuda_pools_size;
+    }
+    if (strcmp(name, "ggml_backend_cuda_oom_reclaim") == 0) {
+        return (void *)ggml_backend_cuda_oom_reclaim;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

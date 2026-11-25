@@ -455,6 +455,10 @@ private:
     bool   moe_oom_handler        = false;               // registered with the device backends
 
     size_t moe_cache_give_back(ggml_backend_dev_t dev, size_t need);
+
+    // A compute buffer could not grow for the graph of a ubatch (process_ubatch): take device memory back step by step
+    // and build + allocate the graph again after each step. nullptr when nothing gave enough back.
+    ggml_cgraph * recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams);
     size_t device_pools_size() const;
     bool   moe_cache_restore();
     bool   moe_cache_rebuild(size_t size, const char * why);

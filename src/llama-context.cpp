@@ -1236,6 +1236,88 @@ size_t llama_context::moe_cache_give_back(ggml_backend_dev_t dev, size_t need) {
     return bytes;
 }
 
+// The reserve sizes each compute buffer for one worst-case graph, and ggml-alloc lays every graph shape out on its own: a
+// graph can need more than the reserve (s13 measured 230 MiB against a 160 MiB reserve for a 36-token ubatch at n_kv
+// 102.7k). The buffer then has to grow, beside a device that is full on purpose (the MoE cache), and a batch that fails
+// makes the server drop the slot with its whole prompt. The failed allocation left the old buffer freed, so each retry
+// asks for the whole new size. Memory comes back in the order of what it costs:
+//   1. this context's temporary pools and CUDA graph executables (rebuilt on demand)
+//   2. the pools of the other idle contexts of the device
+//   3. the MoE cache, of this context or of another one (a draft context has none of its own): its owner brings it
+//      back at its next batch, smaller by what was missing here (moe_cache_give_back, moe_cache_restore)
+//   4. the CUDA graph executables of every context
+ggml_cgraph * llama_context::recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams) {
+    using reclaim_fn_t = size_t (*)(ggml_backend_t, size_t, int);
+
+    auto build = [&]() -> ggml_cgraph * {
+        res->reset();
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        return model.build_graph(gparams);
+    };
+    auto rebuild = [&]() -> ggml_cgraph * {
+        ggml_cgraph * gf = build();
+        return gf && ggml_backend_sched_alloc_graph(sched.get(), gf) ? gf : nullptr;
+    };
+
+    LLAMA_LOG_WARN("%s: a compute buffer could not grow for a ubatch of %d tokens: releasing this context's pools and CUDA graphs\n",
+            __func__, (int) gparams.ubatch.n_tokens);
+    synchronize();
+    trim_device_pools();
+    if (ggml_cgraph * gf = rebuild()) {
+        LLAMA_LOG_WARN("%s: recovered after releasing this context's pools and CUDA graphs\n", __func__);
+        return gf;
+    }
+
+    // what is missing on a device: the buffer this graph needs there, less what the device has free now
+    size_t need = 0;
+    {
+        std::vector<size_t> sizes(backend_ptrs.size(), 0);
+        if (ggml_cgraph * gf = build()) {
+            ggml_backend_sched_reserve_size(sched.get(), gf, sizes.data());
+        }
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (!moe_cache_dev(dev)) {
+                continue;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            LLAMA_LOG_WARN("%s: %s needs a compute buffer of %.1f MiB, %.1f MiB free\n", __func__, ggml_backend_dev_name(dev),
+                    sizes[i]/1048576.0, free/1048576.0);
+            if (sizes[i] > free) {
+                need = std::max(need, sizes[i] - free);
+            }
+        }
+    }
+
+    for (int step = 0; ; ++step) {
+        size_t bytes = 0;
+        bool   any   = false;
+        for (ggml_backend_t be : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(be);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg ? (reclaim_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_oom_reclaim") : nullptr;
+            const size_t got = fn ? fn(be, need, step) : SIZE_MAX;
+            if (got != SIZE_MAX) {
+                any    = true;
+                bytes += got;
+            }
+        }
+        if (!any) {
+            break; // no such step on any backend
+        }
+        if (bytes == 0) {
+            continue;
+        }
+        if (ggml_cgraph * gf = rebuild()) {
+            LLAMA_LOG_WARN("%s: recovered at step %d (%.1f MiB missing)\n", __func__, step, need/1048576.0);
+            return gf;
+        }
+    }
+    return nullptr;
+}
+
 size_t llama_context::device_pools_size() const {
     using size_fn_t = size_t (*)(ggml_backend_t);
     size_t res = 0;
@@ -2172,9 +2254,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+            gf = recover_graph_alloc(res, gparams);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
         }
 
         gf_res_prev_active = res;
