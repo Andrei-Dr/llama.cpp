@@ -2253,6 +2253,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        // diag: LLAMA_DIAG_ALLOC_FAIL=N:K (target context) / LLAMA_DIAG_ALLOC_FAIL_DRAFT=N:K (any other context): the N-th
+        // graph of a ubatch of up to 8 tokens that this context allocates fails K times in a row, as a device compute
+        // buffer that cannot grow does. K = 1 recovers after this context's own pools, 2 after the idle contexts' pools
+        // (when there are any), and so on down the steps of recover_graph_alloc
+        {
+            static const char * spec_tgt = getenv("LLAMA_DIAG_ALLOC_FAIL");
+            static const char * spec_dft = getenv("LLAMA_DIAG_ALLOC_FAIL_DRAFT");
+            const char * spec = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT ? spec_tgt : spec_dft;
+            int at = 0, k = 0;
+            if (spec && sscanf(spec, "%d:%d", &at, &k) == 2 && ubatch.n_tokens <= 8 && ++n_diag_alloc == at) {
+                LLAMA_LOG_WARN("%s: diag: failing the allocation of graph %d of this context %d times\n", __func__, at, k);
+                ggml_backend_sched_diag_fail_alloc(sched.get(), k);
+            }
+        }
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             gf = recover_graph_alloc(res, gparams);
             if (!gf) {

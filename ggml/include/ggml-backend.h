@@ -401,6 +401,10 @@ extern "C" {
     };
     GGML_API void                 ggml_backend_sched_set_cpu_time(ggml_backend_sched_t sched, struct ggml_backend_sched_cpu_time * rec);
 
+    // diag: the next n graph allocations of this scheduler fail the way a device compute buffer that cannot grow does (the
+    // device buffers are freed, ggml_backend_sched_alloc_graph returns false)
+    GGML_API void                 ggml_backend_sched_diag_fail_alloc(ggml_backend_sched_t sched, int n);
+
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 

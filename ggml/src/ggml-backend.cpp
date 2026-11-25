@@ -1202,6 +1202,8 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    int diag_fail_alloc; // diag: graph allocations left to fail (ggml_backend_sched_diag_fail_alloc)
+
     // CPU split timing (ggml_backend_sched_set_cpu_time): the caller's record, NULL = not timed
     struct ggml_backend_sched_cpu_time * cpu_time;
     // which backends are CPU, filled when a record is set: ggml_backend_dev_type() can be expensive (CUDA asks the driver
@@ -2135,6 +2137,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+    if (sched->diag_fail_alloc > 0) {
+        sched->diag_fail_alloc--;
+        ggml_backend_sched_synchronize(sched);
+        ggml_gallocr_diag_drop_device_buffers(sched->galloc);
+        GGML_LOG_WARN("%s: diag: this graph allocation fails (device compute buffers freed, %d more to fail)\n", __func__, sched->diag_fail_alloc);
+        return false;
+    }
+
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -2816,6 +2826,11 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_diag_fail_alloc(ggml_backend_sched_t sched, int n) {
+    GGML_ASSERT(sched);
+    sched->diag_fail_alloc = n;
 }
 
 void ggml_backend_sched_set_cpu_time(ggml_backend_sched_t sched, struct ggml_backend_sched_cpu_time * rec) {

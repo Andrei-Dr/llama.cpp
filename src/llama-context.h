@@ -459,6 +459,7 @@ private:
     // A compute buffer could not grow for the graph of a ubatch (process_ubatch): take device memory back step by step
     // and build + allocate the graph again after each step. nullptr when nothing gave enough back.
     ggml_cgraph * recover_graph_alloc(llm_graph_result * res, const llm_graph_params & gparams);
+    int n_diag_alloc = 0; // diag: small-ubatch graphs allocated (LLAMA_DIAG_ALLOC_FAIL)
     size_t device_pools_size() const;
     bool   moe_cache_restore();
     bool   moe_cache_rebuild(size_t size, const char * why);

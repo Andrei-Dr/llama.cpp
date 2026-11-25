@@ -533,6 +533,30 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
+void ggml_gallocr_diag_drop_device_buffers(ggml_gallocr_t galloc) {
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buffers[i] != NULL && !ggml_backend_buft_is_host(galloc->bufts[i])) {
+            // a buffer type shared by two backends is one buffer: free it once
+            bool shared = false;
+            for (int j = 0; j < i; j++) {
+                if (galloc->buffers[j] == galloc->buffers[i]) {
+                    shared = true;
+                    break;
+                }
+            }
+            if (!shared) {
+                ggml_vbuffer_free(galloc->buffers[i]);
+            }
+            for (int j = i + 1; j < galloc->n_buffers; j++) {
+                if (galloc->buffers[j] == galloc->buffers[i]) {
+                    galloc->buffers[j] = NULL;
+                }
+            }
+            galloc->buffers[i] = NULL;
+        }
+    }
+}
+
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
     if (galloc == NULL) {
         return;
