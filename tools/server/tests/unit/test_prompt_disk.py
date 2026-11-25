@@ -8,20 +8,39 @@ from utils import *
 # the disk tier only restores a prompt that saves >= 256 tokens: a model with more context than stories15M's 256
 MODEL_LONG_CTX_FILE_URL = "https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_K_M.gguf"
 
+MODEL_DRAFT_FILE_URL = "https://huggingface.co/ggml-org-dev/tiny-llamas/resolve/main/stories15M-q4_0.gguf"
+
 STORY = " ".join(f"Once upon a time there was a little cat number {i} who liked to play." for i in range(30))
 OTHER = " ".join(f"The big dog {i} ran across the green field to find a bone." for i in range(30))
 
 server = ServerPreset.stories15m_moe()
 
 
+def long_ctx_server() -> ServerProcess:
+    s = ServerPreset.stories15m_moe()
+    s.model_hf_repo = None
+    s.model_hf_file = None
+    s.model_file = download_file(MODEL_LONG_CTX_FILE_URL)
+    s.model_alias = "smollm2"
+    return s
+
+
 @pytest.fixture(autouse=True)
 def create_server():
     global server
-    server = ServerPreset.stories15m_moe()
-    server.model_hf_repo = None
-    server.model_hf_file = None
-    server.model_file = download_file(MODEL_LONG_CTX_FILE_URL)
-    server.model_alias = "smollm2"
+    server = long_ctx_server()
+
+
+def disk_args(root, size_mib: int = 256) -> list:
+    # no RAM tier and no idle save: a prompt goes to disk when another one takes its slot
+    return ["--cache-ram", "0", "--cache-disk", str(root), "--cache-disk-size", str(size_mib),
+            "--cache-disk-reserve", "64", "--cache-disk-idle", "600000"]
+
+
+def disk_stats() -> dict:
+    res = server.make_request("GET", "/stats")
+    assert res.status_code == 200
+    return res.body["disk_cache"]
 
 
 def complete(prompt: str, n_predict: int) -> dict:
@@ -84,6 +103,158 @@ def test_prompt_disk_restore(tmp_path, encrypt):
     # the run directory dies with its server
     server.stop()
     assert glob.glob(os.path.join(str(tmp_path), "llama-pdc", "run-*")) == []
+
+
+def test_prompt_disk_encrypted_entry_holds_no_stored_state(tmp_path):
+    # the same prompt stored three times: twice without encryption (the state as stored reproduces byte for byte, so
+    # pieces of it are a pattern to look for) and once encrypted (none of those pieces is in the file)
+    def stored_entry(root, encrypt):
+        global server
+        server = long_ctx_server()
+        server.extra_args = disk_args(root)
+        if not encrypt:
+            server.extra_args.append("--no-cache-disk-encrypt")
+        server.start()
+        complete(STORY + " The end.", 4)
+        complete(OTHER + " The end.", 4)  # pushes the first prompt out of the slot onto disk
+        files = entry_files(root)
+        assert len(files) == 1
+        with open(files[0], "rb") as f:
+            data = f.read()
+        server.stop()
+        return data
+
+    plain = stored_entry(tmp_path / "a", False)
+    again = stored_entry(tmp_path / "b", False)
+    crypt = stored_entry(tmp_path / "c", True)
+    assert plain[:4] == again[:4] == crypt[:4] == b"PDCE"
+    assert plain[8] == 0 and again[8] == 0 and crypt[8] == 1
+    assert len(plain) > 1024 * 1024
+
+    # 32-byte pieces of the stored state, spread over the file (pieces of padding or zeros would prove nothing)
+    step = len(plain) // 64
+    pieces = [plain[o:o + 32] for o in range(4096, len(plain) - 32, step)]
+    pieces = [w for w in pieces if len(set(w)) >= 12]
+    assert len(pieces) >= 32
+    assert all(w in again for w in pieces), "the plaintext state does not reproduce: the pieces are not a usable pattern"
+    found = [w for w in pieces if w in crypt]
+    assert found == [], f"{len(found)} of {len(pieces)} pieces of the plaintext state are in the encrypted file"
+
+
+@pytest.mark.parametrize("encrypt", [True, False])
+@pytest.mark.parametrize("damage", ["truncated", "flipped"])
+def test_prompt_disk_damaged_entry_fails_the_restore_cleanly(tmp_path, encrypt, damage):
+    # a stored state that was cut short or changed on disk is rejected (authentication tag / record checksum): the
+    # entry is deleted, the slot starts empty and the request is answered by a full prefill, with the same reply
+    server.server_metrics = True
+    server.extra_args = disk_args(tmp_path)
+    if not encrypt:
+        server.extra_args.append("--no-cache-disk-encrypt")
+    server.start()
+    complete(STORY + " The end.", 4)
+    complete(OTHER + " The end.", 4)  # pushes the first prompt out of the slot onto disk
+    files = entry_files(tmp_path)
+    assert len(files) == 1
+    size = os.path.getsize(files[0])
+    assert size > 1024 * 1024
+    with open(files[0], "r+b") as f:
+        if damage == "truncated":
+            f.truncate(size // 2)
+        else:
+            f.seek(size // 2)
+            byte = f.read(1)
+            f.seek(size // 2)
+            f.write(bytes([byte[0] ^ 0x01]))
+
+    third = complete(STORY + " And then", 8)
+    assert third["timings"]["cache_n"] == 0
+    assert third["timings"]["prompt_n"] > 256
+    d = disk_stats()
+    assert d["find_hit"] == 1 and d["restore"] == 0 and d["restore_failed"] == 1
+    assert not os.path.exists(files[0])  # the damaged entry is gone
+
+    server.stop()
+    server.extra_args = ["--cache-ram", "0"]
+    server.start()
+    fresh = complete(STORY + " And then", 8)
+    assert fresh["timings"]["cache_n"] == 0
+    assert fresh["content"] == third["content"]
+
+
+def test_prompt_disk_size_cap_evicts_the_oldest_entry(tmp_path):
+    # four long prompts through one slot under a cap that holds two stored states: the oldest entry goes first
+    def story(animal):
+        return " ".join(f"Once upon a time there was a little {animal} number {i} who liked to play." for i in range(30))
+
+    server.server_metrics = True
+    server.extra_args = disk_args(tmp_path, size_mib=32)
+    server.start()
+    complete(story("cat") + " The end.", 4)
+    complete(story("dog") + " The end.", 4)   # cat goes to disk
+    one = os.path.getsize(entry_files(tmp_path)[0])
+    limit = 32 * 1024 * 1024
+    assert 2 * one <= limit < 3 * one, f"an entry of {one} bytes: the cap no longer holds exactly two"
+    complete(story("bird") + " The end.", 4)  # dog goes to disk
+    d = disk_stats()
+    assert d["entries"] == 2 and d["evict_space"] == 0
+    complete(story("fish") + " The end.", 4)  # bird goes to disk: over the cap, the oldest entry (cat) is removed
+    d = disk_stats()
+    assert d["entries"] == 2 and d["evict_space"] == 1
+    assert d["bytes"] <= d["limit_bytes"] == limit
+    assert len(entry_files(tmp_path)) == 2
+
+    # bird is still stored (saving fish's slot for it removes dog, the oldest by then); cat is not
+    bird = complete(story("bird") + " And then", 4)
+    assert bird["timings"]["cache_n"] > 256
+    cat = complete(story("cat") + " And then", 4)
+    assert cat["timings"]["cache_n"] < 64
+    d = disk_stats()
+    assert d["restore"] == 1 and d["restore_failed"] == 0
+    assert d["bytes"] <= d["limit_bytes"]
+
+
+def test_prompt_disk_restore_with_a_draft_context(tmp_path):
+    # a server with a draft model stores both contexts of a slot (.tgt and .dft) and restores both: the reply and the
+    # draft acceptance are those of a server whose slot never lost the prompt
+    def run(other_prompt_first):
+        global server
+        # the preset of test_speculative.py; stories15M's 256-token context is below what the tier restores (>= 256
+        # reused tokens), so the target runs with a longer one
+        server = ServerPreset.stories15m_moe()
+        server.override_kv = "llama.context_length=int:2048"
+        server.server_metrics = True
+        server.model_draft = download_file(MODEL_DRAFT_FILE_URL)
+        server.spec_type = "draft-simple"
+        server.spec_draft_n_min = 1
+        server.spec_draft_n_max = 4
+        server.fa = "off"
+        server.extra_args = disk_args(tmp_path)
+        server.start()
+        complete(STORY + " The end.", 4)
+        dft_bytes = 0
+        if other_prompt_first:
+            complete(OTHER + " The end.", 4)  # pushes the first prompt out of the slot onto disk
+            dft = glob.glob(os.path.join(str(tmp_path), "llama-pdc", "run-*", "*.dft"))
+            assert len(dft) == 1
+            dft_bytes = os.path.getsize(dft[0])
+        res = complete(STORY + " And then", 24)
+        stats = server.make_request("GET", "/stats").body
+        server.stop()
+        return res, stats, dft_bytes
+
+    direct, direct_stats, _ = run(False)
+    restored, restored_stats, dft_bytes = run(True)
+
+    assert dft_bytes > 256 * 1024, "the draft context's state was not stored"
+    assert restored_stats["disk_cache"]["restore"] == 1 and restored_stats["disk_cache"]["restore_failed"] == 0
+    assert restored["timings"]["cache_n"] > 256
+    assert restored["timings"]["cache_n"] == direct["timings"]["cache_n"]
+    assert restored["timings"]["prompt_n"] == direct["timings"]["prompt_n"]
+    assert restored["content"] == direct["content"]
+    # the draft works from the restored state as from the kept one
+    a, b = direct_stats["tasks"][-1], restored_stats["tasks"][-1]
+    assert a["n_draft"] > 0
+    assert (b["n_draft"], b["n_draft_accepted"]) == (a["n_draft"], a["n_draft_accepted"])
 
 
 def test_prompt_disk_idle_save(tmp_path):
