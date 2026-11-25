@@ -838,6 +838,16 @@ static bool llama_moe_upload_ahead_enabled() {
     return enabled;
 }
 
+// a device a MoE cache can live on (llama_moe_cache takes the same two types). An accelerator backend (BLAS) is a device
+// too, with no memory of its own: it reports 0 bytes free, and counting it left no room for any cache
+static bool moe_cache_dev(ggml_backend_dev_t dev) {
+    if (!dev) {
+        return false;
+    }
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+    return type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -1013,7 +1023,7 @@ void llama_context::sched_reserve() {
         moe_decode_compute = 0;
         for (auto & be : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
-            if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (moe_cache_dev(dev)) {
                 moe_decode_compute += ggml_backend_sched_get_buffer_size(sched.get(), be.get());
             }
         }
@@ -1257,7 +1267,7 @@ bool llama_context::moe_cache_restore() {
     const size_t keep      = moe_decode_compute + room;
     for (auto & be : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(be.get());
-        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (!moe_cache_dev(dev)) {
             continue;
         }
         size_t free = 0, total = 0;
