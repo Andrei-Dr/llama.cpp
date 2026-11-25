@@ -172,20 +172,18 @@ def test_stats_moe_cache_absent():
 
 def test_stats_moe_cache():
     # experts in host memory, a small device cache for them (llama_moe_cache_get_stats, read at every publish)
+    if not gpu_devices():
+        # the context refuses a MoE cache without a GPU backend (a CPU-only build)
+        pytest.skip("no GPU device: the MoE cache needs one to hold its slots")
     server.n_gpu_layer = 99
     server.extra_args = ["-ot", "exps=CPU", "--moe-cache-mib", "8"]
-    try:
-        server.start()
-    except RuntimeError:
-        # the context refuses a MoE cache without a GPU backend (a CPU-only build)
-        pytest.skip("no MoE cache: the cache needs a GPU backend to hold its slots")
+    server.start()  # with a device, a server that does not start with a MoE cache is a failure
     complete("Once upon a time", 48)
     complete("Once upon a time there was", 48)
 
     s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 2)
     m = s["moe_cache"]
-    if m is None:
-        pytest.skip("no MoE cache: the cache needs a GPU device to hold its slots")
+    assert m is not None, "the server runs with a MoE cache and /stats reports none"
     c = m["counters"]
     assert m["n_layer"] > 0 and m["n_slots"] > 0 and m["n_expert"] >= m["n_layer"]
     assert 0 < m["n_resident"] <= m["n_slots"]
