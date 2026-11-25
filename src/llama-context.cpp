@@ -1308,6 +1308,9 @@ bool llama_context::moe_cache_rebuild(size_t size, const char * why) {
         }
         LLAMA_LOG_WARN("%s: MoE cache rebuilt at %.0f MiB (was %.0f MiB): %s. Lower --moe-cache-mib to %.0f to start there\n",
                 __func__, size/1048576.0, moe_cache_size_cur/1048576.0, why, size/1048576.0);
+        if (moe_cache) {
+            fresh->carry_stats(*moe_cache); // llama_moe_cache_get_stats: cumulative since the context was created
+        }
         moe_cache          = std::move(fresh);
         moe_cache_size_cur = size;
         return true;

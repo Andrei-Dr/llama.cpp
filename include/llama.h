@@ -1777,7 +1777,7 @@ extern "C" {
         int32_t  n_layer;      // layers whose experts the cache holds
         int32_t  n_expert;     // experts of those layers, all layers
         int32_t  n_slots;      // expert slots, all layers
-        int32_t  n_resident;   // slots holding an expert
+        int32_t  n_resident;   // slots holding an expert on the device (0 while suspended)
         uint64_t device_bytes; // device memory of the cache now (0 while suspended)
         struct llama_moe_cache_counters ubatch_small; // ubatches of up to 8 tokens (generation steps)
         struct llama_moe_cache_counters ubatch_large; // larger ubatches that read the cache
@@ -1785,9 +1785,10 @@ extern "C" {
         uint64_t copy_bytes;
     };
 
-    // Counters are cumulative since the context was created. Not synchronized with a decode on the same context: call
-    // it between decodes, from the thread that decodes. Returns false when the context has no MoE cache (stats is then
-    // left untouched).
+    // Counters are cumulative since the context was created: a cache rebuilt at another size during the run keeps them.
+    // n_slots, n_resident and device_bytes describe the cache as it is now. The accessor takes no lock and is not
+    // synchronized with a decode on the same context: it is for the thread that calls llama_decode on this context,
+    // between decodes. Returns false when the context has no MoE cache (stats is then left untouched).
     LLAMA_API bool llama_moe_cache_get_stats(const struct llama_context * ctx, struct llama_moe_cache_stats * stats);
 
     // CPU-split timing of a context's graphs: with the experts on the CPU (-ot exps=CPU) this is the expert phase of each

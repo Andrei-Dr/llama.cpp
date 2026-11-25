@@ -210,6 +210,57 @@ def test_stats_moe_cache():
     assert h["cols"]["moe_resident"][-1] == m["n_resident"]
 
 
+def moe_lookups(m: dict) -> int:
+    return m["counters"]["hit"] + m["counters"]["miss"]
+
+
+def test_stats_moe_cache_suspended_holds_nothing_on_the_device(monkeypatch):
+    # diag switches of the library: the cache is suspended before the 20th small batch and every resume fails, so it
+    # stays suspended. Its slots keep their experts on record, but none is on the device and no device memory is held.
+    if not gpu_devices():
+        pytest.skip("no GPU device: the MoE cache needs one to hold its slots")
+    monkeypatch.setenv("LLAMA_MOE_PREFILL_DIAG", "20")
+    monkeypatch.setenv("LLAMA_MOE_DIAG_RESUME_FAIL", "1000000")
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU", "--moe-cache-mib", "8"]
+    server.start()
+    complete("Once upon a time", 40)
+    m = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 1)["moe_cache"]
+    assert m is not None
+    assert m["suspended"]
+    assert m["n_slots"] > 0
+    assert m["n_resident"] == 0 and m["device_bytes"] == 0
+    assert moe_lookups(m) > 0  # the steps before the suspension
+
+
+def test_stats_moe_cache_counters_survive_a_rebuild(monkeypatch, tmp_path):
+    # diag switches of the library: before the 40th small batch the cache is suspended and its first resume fails, so
+    # the context replaces it by a smaller one. The counters are cumulative since the context was created.
+    if not gpu_devices():
+        pytest.skip("no GPU device: the MoE cache needs one to hold its slots")
+    monkeypatch.setenv("LLAMA_MOE_PREFILL_DIAG", "40")
+    monkeypatch.setenv("LLAMA_MOE_DIAG_RESUME_FAIL", "1")
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU", "--moe-cache-mib", "128"]
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+
+    complete("Once upon a time", 34)  # ends before the 40th batch
+    before = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 1)["moe_cache"]
+    assert before is not None and moe_lookups(before) > 0
+    with open(server.log_path) as f:
+        assert "MoE cache rebuilt" not in f.read()
+
+    complete("Once upon a time there was", 12)  # crosses it: far fewer steps after the rebuild than before it
+    after = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 2)["moe_cache"]
+    with open(server.log_path) as f:
+        assert "MoE cache rebuilt" in f.read(), "the diag switches did not rebuild the cache: nothing was tested"
+    assert after is not None and not after["suspended"]
+    assert moe_lookups(after) > moe_lookups(before)
+    for k in ("hit", "miss", "miss_cpu", "upload", "upload_bytes"):
+        assert after["counters"][k] >= before["counters"][k], k
+
+
 def test_stats_disk_cache(tmp_path):
     # the disk tier only restores a prompt that saves >= 256 tokens: a model with more context than stories15M's 256
     server.model_hf_repo = None

@@ -1111,7 +1111,8 @@ void llama_moe_cache::get_stats(llama_moe_cache_stats & stats) const {
     }
     for (const auto & g : p.groups) {
         stats.n_slots    += g.n_slots;
-        stats.n_resident += g.lru.n_filled;
+        // while suspended the slots keep their experts on record, and none of them is on the device
+        stats.n_resident += p.suspended ? 0 : g.lru.n_filled;
     }
     for (const auto & d : p.devices) {
         stats.device_bytes += d.buf ? d.buf_size : 0;
@@ -1123,6 +1124,18 @@ void llama_moe_cache::get_stats(llama_moe_cache_stats & stats) const {
     stats.ubatch_large = counters(p.stats_large);
     stats.n_copy       = p.stats_copy.hits;
     stats.copy_bytes   = p.stats_copy.bytes;
+}
+
+void llama_moe_cache::carry_stats(const llama_moe_cache & prev) {
+    const auto add = [](impl::stats & to, const impl::stats & from) {
+        to.hits   += from.hits;
+        to.misses += from.misses;
+        to.cpu    += from.cpu;
+        to.bytes  += from.bytes;
+    };
+    add(pimpl->stats_small, prev.pimpl->stats_small);
+    add(pimpl->stats_large, prev.pimpl->stats_large);
+    add(pimpl->stats_copy,  prev.pimpl->stats_copy);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_moe_cache::memory_breakdown() const {

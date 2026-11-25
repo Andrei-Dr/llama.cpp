@@ -78,8 +78,12 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
-    // sizes and cumulative counters (llama_moe_cache_get_stats); read-only, not synchronized with copy()
+    // sizes and cumulative counters (llama_moe_cache_get_stats); read-only, takes no lock and is not synchronized with
+    // copy(): for the thread that decodes
     void get_stats(llama_moe_cache_stats & stats) const;
+
+    // adds the counters of prev, the cache this one replaces, so that they stay cumulative over a rebuild
+    void carry_stats(const llama_moe_cache & prev);
 
 private:
     struct impl;
