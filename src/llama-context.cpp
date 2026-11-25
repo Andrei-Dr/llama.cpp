@@ -1116,7 +1116,7 @@ void llama_context::trim_device_pools() {
 // a large-ubatch compute buffer is dead weight during generation, so they take turns in the device memory.
 // A batch larger than n_ubatch suspends the cache and reserves the scheduler for n_ubatch_prefill; the first batch that
 // fits n_ubatch after it frees the prefill buffers and resumes the cache with the experts it held.
-// Lazy in both directions: a prompt fed in several chunks switches once.
+// Lazy in both directions: a prompt fed in several chunks switches once, and leaves at the first chunk the cache can serve.
 void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
     n_decode_calls++;
     if (!moe_cache || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
@@ -1138,11 +1138,12 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         }
     };
 
-    // diag: LLAMA_MOE_PREFILL_STAY=N keeps the mode on for a chunk of at least N tokens that follows a large one (the tail
-    // of a prompt longer than n_batch). Without it such a chunk leaves the mode first: the cache comes back, cannot serve
-    // the chunk (it serves ubatches of up to 32 tokens), and the chunk runs on the slow path between the two
-    static const uint32_t stay_min = getenv("LLAMA_MOE_PREFILL_STAY") ? (uint32_t) atoi(getenv("LLAMA_MOE_PREFILL_STAY")) : 0;
-    const bool stay = stay_min > 0 && moe_prefill_mode && n_tokens_all >= stay_min;
+    // a chunk that follows a large one stays in the mode when the cache could not serve it anyway (it serves ubatches of up
+    // to max_batch tokens). The server cuts every long prompt 512 tokens before its end (a context checkpoint): with
+    // n_ubatch 512 that chunk is not "larger than n_ubatch", left the mode, and ran on the slow path with the cache back
+    // and unused (measured: 274 t/s outside the mode, 350 t/s in it). LLAMA_MOE_PREFILL_STAY=0 restores that.
+    static const bool stay_on = !getenv("LLAMA_MOE_PREFILL_STAY") || atoi(getenv("LLAMA_MOE_PREFILL_STAY")) != 0;
+    const bool stay = stay_on && moe_prefill_mode && (int64_t) n_tokens_all > moe_cache->max_batch();
 
     const bool big = cparams.n_ubatch_prefill > 0 && (n_tokens_all > cparams.n_ubatch || stay) && !moe_prefill_unfit;
 

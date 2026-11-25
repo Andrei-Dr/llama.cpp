@@ -1084,6 +1084,10 @@ bool llama_moe_cache::suspended() const {
     return pimpl->suspended;
 }
 
+int64_t llama_moe_cache::max_batch() const {
+    return pimpl->max_batch;
+}
+
 bool llama_moe_cache::serves(int64_t n_tokens) const {
     return !pimpl->suspended && n_tokens > 0 && n_tokens <= pimpl->max_batch;
 }

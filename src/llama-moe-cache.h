@@ -73,6 +73,9 @@ public:
     // through copy_experts, and while suspended)
     bool serves(int64_t n_tokens) const;
 
+    // the largest ubatch the cache serves
+    int64_t max_batch() const;
+
     // device memory the cache holds now, on dev or on all devices (0 while suspended)
     size_t device_size(ggml_backend_dev_t dev = nullptr) const;
 
