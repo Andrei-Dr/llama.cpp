@@ -551,7 +551,7 @@ static const int GGML_CUDA_OOM_STEPS = 3;
 // diag: forced out-of-memory, to run the reclaim steps without filling the device. Each forced event fails 3 attempts,
 // so every step that gives something back is followed by a failed retry and the next step runs; a last real attempt follows.
 //   GGML_CUDA_DIAG_OOM_AFTER_TRIM=K  the K-th pool growth after the first pool trim (ggml_backend_cuda_trim_pools), once
-//   GGML_CUDA_DIAG_OOM_GRAPH=N       the N-th CUDA graph instantiation after the first pool trim, once
+//   GGML_CUDA_DIAG_OOM_GRAPH=N       the N-th CUDA graph instantiation, once
 static int ggml_cuda_diag_env(const char * name) {
     const char * e = getenv(name);
     return e ? atoi(e) : 0;
@@ -3648,9 +3648,9 @@ static std::vector<ggml_cuda_graph_cluster> ggml_cuda_graph_get_clusters(cudaGra
 // ggml_cuda_oom_reclaim); the executables of `graph`, the graph being captured, stay.
 static void ggml_cuda_graph_instantiate(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph * graph, cudaGraphExec_t * handle, cudaGraph_t cuda_graph) {
     static const int diag_n = ggml_cuda_diag_env("GGML_CUDA_DIAG_OOM_GRAPH");
-    if (diag_n > 0 && ggml_cuda_diag_pool_growths >= 0 && ++ggml_cuda_diag_graph_count == diag_n) {
+    if (diag_n > 0 && ++ggml_cuda_diag_graph_count == diag_n) {
         ggml_cuda_diag_graph_left = 3;
-        GGML_LOG_WARN("%s: diag: forcing out of memory on CUDA graph instantiation %d after the trim (%s)\n", __func__, diag_n, cuda_ctx->name.c_str());
+        GGML_LOG_WARN("%s: diag: forcing out of memory on CUDA graph instantiation %d\n", __func__, diag_n);
     }
     bool forced = false;
     const auto attempt = [&]() {
