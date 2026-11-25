@@ -1,4 +1,4 @@
-import json, time
+import json, os, time
 
 import pytest
 from utils import *
@@ -32,6 +32,14 @@ def wait_stats(cond, timeout_s: float = 3.0) -> dict:
         if cond(s) or time.time() > deadline:
             return s
         time.sleep(0.02)
+
+
+def gpu_devices() -> list:
+    """the devices with memory of their own that this build of the server can offload to (llama-server --list-devices)"""
+    import re, subprocess
+    path = os.environ.get("LLAMA_SERVER_BIN_PATH", "../../../build/bin/llama-server")
+    out = subprocess.run([path, "--list-devices"], capture_output=True, text=True, timeout=60).stdout
+    return [name for name, mib in re.findall(r"^\s+(\S+): .*\((\d+) MiB, \d+ MiB free\)", out, re.M) if int(mib) > 0]
 
 
 def complete(prompt: str, n_predict: int) -> dict:
@@ -372,8 +380,80 @@ def test_slots_free_right_after_a_response_with_another_slot_busy():
     long_req.join()
 
 
-def test_stats_phase_is_not_measured():
-    # the CPU-split time of each layer has no source on this tree: the key stays, null
+def test_stats_phase_cpu_split_time():
+    # experts on the CPU: every generation step runs one CPU split per layer, timed and attributed to its layer
+    if not gpu_devices():
+        pytest.skip("no GPU device: the whole graph is one CPU split, there is no expert phase to separate")
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU"]
     server.start()
-    complete("Once upon a time", 4)
-    assert wait_stats(lambda s: s.get("seq", 0) > 0)["phase"] is None
+    complete("Once upon a time", 32)
+    s = wait_stats(lambda s: (s.get("phase") or {}).get("steps", 0) > 0)
+    p = s["phase"]
+    assert p is not None, "generation steps with the experts on the CPU, and no CPU split was timed"
+    assert p["steps"] == s["decode"]["gen"]["n"]
+    assert p["graphs"] >= p["steps"]
+    assert p["cpu_us"] > 0
+    assert len(p["cpu_us_layer"]) == len(p["il"]) > 0
+    assert sum(p["cpu_us_layer"]) <= p["cpu_us"]
+    assert all(v > 0 for v in p["cpu_us_layer"]), "every layer's experts run on the CPU"
+
+    # only generation steps are timed, and the totals are cumulative: a second task adds its steps
+    complete("Once upon a time there was", 16)
+    s2 = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 2)
+    p2 = s2["phase"]
+    assert p2["steps"] > p["steps"] and p2["graphs"] > p["graphs"] and p2["cpu_us"] > p["cpu_us"]
+    assert p2["graphs"] - p["graphs"] == p2["steps"] - p["steps"]
+
+    h = server.make_request("GET", "/stats/history?cols=phase_graphs,phase_cpu_us").body
+    assert {"phase_graphs", "phase_cpu_us"} <= set(h["cols"])
+
+
+def test_stats_phase_survives_a_new_scheduler(monkeypatch, tmp_path):
+    # diag switch of the library: before every 10th small batch the MoE cache is suspended and brought back, which frees
+    # the context's scheduler and creates another. The timing belongs to the context: every step stays timed and the
+    # totals stay cumulative. The cache computes its misses on the CPU here (cpu share 1), so every layer has a CPU split.
+    if not gpu_devices():
+        pytest.skip("no GPU device: the MoE cache needs one to hold its slots")
+    monkeypatch.setenv("LLAMA_MOE_PREFILL_DIAG", "10")
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU", "--moe-cache-mib", "8", "--moe-cache-cpu-share", "1.0", "-lv", "4"]
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    complete("Once upon a time", 44)
+    s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 1)
+    # the cache came back several times during the task (logged at this verbosity), each time under a new scheduler
+    with open(server.log_path) as f:
+        n_restore = f.read().count("moe_cache_restore:")
+    assert n_restore >= 3, "the diag switch did not free the scheduler during the task: nothing was tested"
+    p = s["phase"]
+    assert p is not None
+    assert p["steps"] == s["decode"]["gen"]["n"] > 40
+    assert p["graphs"] >= p["steps"], "generation steps were not timed after the scheduler was created again"
+    assert len(p["cpu_us_layer"]) == s["moe_cache"]["n_layer"] > 0
+    assert all(v > 0 for v in p["cpu_us_layer"])
+    assert s["moe_cache"]["counters"]["miss_cpu"] > 0
+
+
+def test_stats_phase_no_layers_when_the_experts_are_on_the_gpu():
+    # all layers on the device: no CPU split names a layer (a small unnamed CPU part, e.g. the input rows, may remain)
+    if not gpu_devices():
+        pytest.skip("no GPU device")
+    server.n_gpu_layer = 99
+    server.start()
+    complete("Once upon a time", 16)
+    s = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 1)
+    assert s["phase"] is None or s["phase"]["cpu_us_layer"] == []
+
+
+def test_stats_phase_cpu_only():
+    # without a device every graph is one CPU split: the time is reported, as the whole step, and never more than it
+    if gpu_devices():
+        pytest.skip("a GPU device is present")
+    server.start()
+    complete("Once upon a time", 16)
+    s = wait_stats(lambda s: (s.get("phase") or {}).get("steps", 0) > 0)
+    p = s["phase"]
+    assert p is not None
+    assert p["steps"] == s["decode"]["gen"]["n"] and p["graphs"] == p["steps"]
+    assert 0 < p["cpu_us"] <= p["step_us"]

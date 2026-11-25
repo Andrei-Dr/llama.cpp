@@ -825,6 +825,7 @@ void llama_context::sched_new(const sched_params & params) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    ggml_backend_sched_set_cpu_time(sched.get(), cpu_timing ? &cpu_time : nullptr);
 
     sched_params_cur = params;
 }
@@ -5628,4 +5629,39 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+void llama_context::set_cpu_timing(bool on) {
+    if (on && cpu_time.layer_us == nullptr) {
+        cpu_time_layer_us.assign(model.layers.size(), 0);
+        cpu_time.layer_us    = cpu_time_layer_us.data();
+        cpu_time.n_layer_max = (int) cpu_time_layer_us.size();
+    }
+    cpu_timing = on;
+    if (sched) {
+        ggml_backend_sched_set_cpu_time(sched.get(), on ? &cpu_time : nullptr);
+    }
+}
+
+int32_t llama_context::get_cpu_timing(int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int32_t n_layer) const {
+    if (total_us) {
+        *total_us = cpu_time.total_us;
+    }
+    if (n_graphs) {
+        *n_graphs = cpu_time.n_graphs;
+    }
+    if (layer_us) {
+        for (int32_t i = 0; i < n_layer; ++i) {
+            layer_us[i] = i < cpu_time.n_layer ? cpu_time_layer_us[i] : 0;
+        }
+    }
+    return cpu_time.n_layer;
+}
+
+void llama_set_cpu_timing(llama_context * ctx, bool on) {
+    ctx->set_cpu_timing(on);
+}
+
+int32_t llama_get_cpu_timing(const llama_context * ctx, int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int32_t n_layer) {
+    return ctx->get_cpu_timing(total_us, n_graphs, layer_us, n_layer);
 }

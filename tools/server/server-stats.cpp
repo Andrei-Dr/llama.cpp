@@ -168,6 +168,25 @@ json server_stats_snapshot::moe_json() const {
     };
 }
 
+json server_stats_snapshot::phase_json() const {
+    if (phase.n_graphs == 0 || phase.cpu_us <= 0) {
+        return nullptr; // nothing timed, or no CPU split (everything on the GPU)
+    }
+    json il = json::array();
+    for (size_t i = 0; i < phase.layer_us.size(); ++i) {
+        il.push_back((int) i);
+    }
+    // steps and step_us: the generation decodes (decode_gen), the same batches the CPU timing covers
+    return json {
+        { "steps",        decode_gen.n      },
+        { "step_us",      decode_gen.sum_us },
+        { "graphs",       phase.n_graphs    },
+        { "cpu_us",       phase.cpu_us      },
+        { "cpu_us_layer", phase.layer_us    },
+        { "il",           il                },
+    };
+}
+
 json server_stats_snapshot::disk_json() const {
     const server_prompt_disk_stats & d = disk;
     return json {
@@ -259,9 +278,7 @@ json server_stats_snapshot::to_json(int max_tasks) const {
         { "tasks",      tasks_j           },
         { "disk_cache", has_disk ? disk_json() : json(nullptr) },
         { "moe_cache",  has_moe ? moe_json() : json(nullptr) },
-        // the CPU-split time of each layer: no source on this tree (it needs a hook in the graph scheduler); readers
-        // treat null as "not measured"
-        { "phase",      nullptr },
+        { "phase",      phase_json() },
         { "publish",    publish.to_json() },
     };
 }

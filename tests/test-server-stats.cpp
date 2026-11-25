@@ -4,6 +4,9 @@
 #include "../tools/server/server-prompt-disk.h"
 #include "../tools/server/server-stats.h"
 
+#include "ggml.h"
+#include "ggml-backend.h"
+
 #include "testing.h"
 
 #include <cmath>
@@ -305,6 +308,90 @@ static void test_disk_lora(testing & t) {
     t.assert_true("no lora", server_prompt_disk_lora_usable({}, {}));
 }
 
+// The source of /stats "phase": the scheduler adds the compute time of its CPU splits to a record the caller owns, so
+// the totals stay cumulative when the caller frees a scheduler and creates another (llama_context does: a larger graph,
+// the MoE prefill switch).
+static void test_sched_cpu_time(testing & t) {
+    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    t.assert_true("CPU backend", cpu != nullptr);
+    if (cpu == nullptr) {
+        return;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(cpu);
+
+    // a fresh graph per compute: a tensor keeps the buffer of the scheduler that allocated it
+    const auto compute = [&](ggml_backend_sched_t sched) {
+        const int n = 96;
+        ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead(), nullptr, /*no_alloc =*/ true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_set_input(a);
+        ggml_tensor * x = a;
+        for (int i = 0; i < 4; ++i) {
+            x = ggml_mul_mat(ctx, x, a);
+            ggml_set_name(x, "ffn_out-3"); // llama.cpp names a layer's nodes "<name>-<layer>"
+        }
+        ggml_set_output(x);
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, x);
+
+        ggml_backend_sched_reset(sched);
+        bool ok = ggml_backend_sched_alloc_graph(sched, gf);
+        if (ok) {
+            const std::vector<float> values(n * n, 0.01f);
+            ggml_backend_tensor_set(a, values.data(), 0, ggml_nbytes(a));
+            ok = ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS;
+        }
+        ggml_free(ctx);
+        return ok;
+    };
+
+    int64_t layer_us[8] = {};
+    ggml_backend_sched_cpu_time rec = {};
+    rec.layer_us    = layer_us;
+    rec.n_layer_max = 8;
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(&cpu, &buft, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+
+    // not timed (the default): the record is not touched
+    t.assert_true("compute, not timed", compute(sched));
+    t.assert_true("no graph counted", rec.n_graphs == 0 && rec.total_us == 0 && rec.n_layer == 0);
+
+    ggml_backend_sched_set_cpu_time(sched, &rec);
+    t.assert_true("compute, timed", compute(sched) && compute(sched));
+    t.assert_equal("one count per timed graph", (uint64_t) 2, rec.n_graphs);
+    t.assert_true("the CPU split's time", rec.total_us > 0);
+    t.assert_equal("the layer the nodes name", 4, rec.n_layer);
+    t.assert_true("... gets the split's time", layer_us[3] == rec.total_us);
+
+    // off again: the totals stay
+    const ggml_backend_sched_cpu_time before = rec;
+    ggml_backend_sched_set_cpu_time(sched, nullptr);
+    t.assert_true("compute, timing off", compute(sched));
+    t.assert_true("unchanged while off", rec.n_graphs == before.n_graphs && rec.total_us == before.total_us);
+
+    // another scheduler, the same record: the totals continue
+    ggml_backend_sched_free(sched);
+    sched = ggml_backend_sched_new(&cpu, &buft, 1, GGML_DEFAULT_GRAPH_SIZE, false, true);
+    ggml_backend_sched_set_cpu_time(sched, &rec);
+    t.assert_true("compute on the next scheduler", compute(sched));
+    t.assert_equal("cumulative over schedulers", (uint64_t) 3, rec.n_graphs);
+    t.assert_true("... and its time", rec.total_us > before.total_us && layer_us[3] == rec.total_us);
+
+    // a record with fewer layers than the graph names: the total counts, no layer is written
+    int64_t two[2] = {};
+    ggml_backend_sched_cpu_time small = {};
+    small.layer_us    = two;
+    small.n_layer_max = 2;
+    ggml_backend_sched_set_cpu_time(sched, &small);
+    t.assert_true("compute, small record", compute(sched));
+    t.assert_true("total without a layer", small.total_us > 0 && small.n_layer == 0 && two[0] == 0 && two[1] == 0);
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -323,6 +410,7 @@ int main(int argc, char ** argv) {
     t.test("slot_row_json",      test_slot_row_json);
     t.test("history",            test_history);
     t.test("disk_lora",          test_disk_lora);
+    t.test("sched_cpu_time",     test_sched_cpu_time);
 
     return t.summary();
 }

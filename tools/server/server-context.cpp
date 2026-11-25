@@ -1220,6 +1220,7 @@ private:
     std::atomic<bool> stats_slot_prep{false};   // the prompt cache is updating a slot: its rows are about to change
     bool stats_iter_prompt = false; // this main-loop iteration decoded prompt tokens
     bool stats_iter_gen    = false; // ... generated tokens
+    bool stats_cpu_timed   = false; // the target context times its CPU splits (llama_set_cpu_timing)
 
     // the machine sampler and the history (server-sampler.h): its own thread, started by init() with --metrics. Declared
     // after stats_plane, which its thread reads
@@ -1269,6 +1270,7 @@ private:
             destroy();
             stats_slots_valid = false; // the slots go with the model; /slots takes the task path until the next publish
             stats_params_cache.clear();
+            stats_cpu_timed = false;   // the next context starts untimed
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
             if (!load_model(params_base)) {
@@ -4884,8 +4886,17 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
+        }
+
+        // /stats "phase": time the CPU splits (the expert phase) of generation steps only
+        const bool time_cpu = stats_publishing() && !has_prompt;
+        if (time_cpu != stats_cpu_timed) {
+            llama_set_cpu_timing(ctx_tgt, time_cpu);
+            stats_cpu_timed = time_cpu;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -5532,6 +5543,8 @@ private:
         r[SSC_step_us]        = (double) s->step_gen.sum_us;
         r[SSC_decode_n]       = (double) s->decode_gen.n;
         r[SSC_decode_us]      = (double) s->decode_gen.sum_us;
+        r[SSC_phase_graphs]   = (double) s->phase.n_graphs;
+        r[SSC_phase_cpu_us]   = (double) s->phase.cpu_us;
         r[SSC_publish_n]      = (double) s->publish.n;
         r[SSC_publish_us]     = (double) s->publish.sum_us;
         r[SSC_n_busy]         = (double) s->n_processing;
@@ -5588,6 +5601,13 @@ private:
             s.metrics    = metrics;
             s.t_start_us = metrics.t_start;
             s.has_moe    = ctx_tgt != nullptr && llama_moe_cache_get_stats(ctx_tgt, &s.moe);
+            // the CPU-split time of the generation steps, per layer (the expert phase with -ot exps=CPU)
+            if (ctx_tgt) {
+                const int32_t n_layer = llama_model_n_layer(model_tgt);
+                s.phase.layer_us.resize(n_layer > 0 ? n_layer : 0);
+                const int32_t n_seen = llama_get_cpu_timing(ctx_tgt, &s.phase.cpu_us, &s.phase.n_graphs, s.phase.layer_us.data(), (int32_t) s.phase.layer_us.size());
+                s.phase.layer_us.resize(std::min<size_t>(s.phase.layer_us.size(), (size_t) std::max(0, n_seen)));
+            }
             s.has_disk   = prompt_disk != nullptr;
             if (prompt_disk) {
                 s.disk         = prompt_disk->stats;

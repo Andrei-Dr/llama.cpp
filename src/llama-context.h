@@ -221,6 +221,10 @@ struct llama_context {
     // false without a MoE cache
     bool moe_cache_get_stats(llama_moe_cache_stats & stats) const;
 
+    // CPU split timing (llama_set_cpu_timing / llama_get_cpu_timing)
+    void    set_cpu_timing(bool on);
+    int32_t get_cpu_timing(int64_t * total_us, uint64_t * n_graphs, int64_t * layer_us, int32_t n_layer) const;
+
     //
     // training
     //
@@ -410,6 +414,12 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    // CPU split timing: the record belongs to the context, because the scheduler is freed and created again (a larger
+    // graph, the MoE prefill switch); sched_new() sets it on each scheduler while the timing is on
+    bool                        cpu_timing = false;
+    ggml_backend_sched_cpu_time cpu_time   = {};
+    std::vector<int64_t>        cpu_time_layer_us;
 
     sched_params sched_params_cur;
 

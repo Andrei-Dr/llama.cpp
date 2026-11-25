@@ -387,6 +387,20 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // CPU split timing. While a record is set, every split computed on a CPU backend adds its compute time (the CPU backend
+    // computes synchronously, so this is the work itself) to the record's total and to the layer its first node names
+    // ("<name>-<layer>"), and every graph computed is counted. The record belongs to the caller and outlives the
+    // scheduler: a caller that frees its scheduler and creates another sets the same record on the new one and keeps one
+    // cumulative total. NULL (the default) = not timed: a split then costs one test of this pointer.
+    struct ggml_backend_sched_cpu_time {
+        int64_t   total_us;    // compute time of the CPU splits
+        uint64_t  n_graphs;    // graphs computed while the record was set
+        int64_t * layer_us;    // [n_layer_max] by layer index, may be NULL
+        int       n_layer_max;
+        int       n_layer;     // layers seen: the highest index + 1
+    };
+    GGML_API void                 ggml_backend_sched_set_cpu_time(ggml_backend_sched_t sched, struct ggml_backend_sched_cpu_time * rec);
+
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 

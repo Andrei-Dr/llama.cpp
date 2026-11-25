@@ -1202,6 +1202,12 @@ struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
 
+    // CPU split timing (ggml_backend_sched_set_cpu_time): the caller's record, NULL = not timed
+    struct ggml_backend_sched_cpu_time * cpu_time;
+    // which backends are CPU, filled when a record is set: ggml_backend_dev_type() can be expensive (CUDA asks the driver
+    // for the device properties on every call), far too slow for the split loop
+    bool backend_is_cpu[GGML_SCHED_MAX_BACKENDS];
+
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
@@ -2409,6 +2415,54 @@ static void ggml_backend_sched_ahead_synchronize(ggml_backend_sched_t sched) {
     }
 }
 
+// the layer a split belongs to: the "-<n>" suffix of the first node name that has one (llama.cpp names its nodes so)
+static int ggml_backend_sched_split_layer(const struct ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const char * name = split->graph.nodes[i]->name;
+        const char * dash = strrchr(name, '-');
+        if (dash && dash[1] >= '0' && dash[1] <= '9') {
+            char * end = nullptr;
+            const long il = strtol(dash + 1, &end, 10);
+            if (end && *end == '\0' && il >= 0 && il < 4096) {
+                return (int) il;
+            }
+        }
+    }
+    return -1;
+}
+
+// a split's graph (or a view of it) while a CPU time record is set: a split on a CPU backend is timed
+static enum ggml_status ggml_backend_sched_compute_split_timed(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, struct ggml_cgraph * graph) {
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    if (!sched->backend_is_cpu[split->backend_id]) {
+        return ggml_backend_graph_compute_async(backend, graph);
+    }
+    const int64_t t_start = ggml_time_us();
+    const enum ggml_status ec = ggml_backend_graph_compute_async(backend, graph);
+    if (ec != GGML_STATUS_SUCCESS) {
+        return ec;
+    }
+    const int64_t us = ggml_time_us() - t_start;
+    struct ggml_backend_sched_cpu_time * rec = sched->cpu_time;
+    rec->total_us += us;
+    const int il = ggml_backend_sched_split_layer(split);
+    if (il >= 0 && rec->layer_us != NULL && il < rec->n_layer_max) {
+        rec->layer_us[il] += us;
+        if (il >= rec->n_layer) {
+            rec->n_layer = il + 1;
+        }
+    }
+    return ec;
+}
+
+// computes a split's graph (or a view of it); not timed (the default), this is the compute call behind one test
+static inline enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split, ggml_backend_t split_backend, struct ggml_cgraph * graph) {
+    if (sched->cpu_time == NULL) {
+        return ggml_backend_graph_compute_async(split_backend, graph);
+    }
+    return ggml_backend_sched_compute_split_timed(sched, split, graph);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2484,7 +2538,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int ahead_target = !sched->upload_ahead_split || sched->callback_eval ? -1 : ggml_backend_sched_ahead_begin(sched, split_id);
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = ggml_backend_sched_compute_split(sched, split, split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 ggml_backend_sched_ahead_synchronize(sched);
                 return ec;
@@ -2511,7 +2565,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
-                enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                enum ggml_status ec = ggml_backend_sched_compute_split(sched, split, split_backend, &gv);
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
@@ -2733,6 +2787,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    if (sched->cpu_time != NULL) {
+        sched->cpu_time->n_graphs++;
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 
@@ -2759,6 +2816,16 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_cpu_time(ggml_backend_sched_t sched, struct ggml_backend_sched_cpu_time * rec) {
+    GGML_ASSERT(sched);
+    if (rec != NULL) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            sched->backend_is_cpu[b] = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        }
+    }
+    sched->cpu_time = rec;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

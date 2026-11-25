@@ -169,6 +169,13 @@ struct server_stats_snapshot {
     bool                         has_slot_rows = false;
     std::vector<server_slot_row> slot_rows;
 
+    // CPU-split time of the generation steps (llama_get_cpu_timing): with the experts on the CPU, the expert phase
+    struct {
+        uint64_t             n_graphs = 0; // timed graphs (one per generation step)
+        int64_t              cpu_us   = 0;
+        std::vector<int64_t> layer_us;     // by layer index; empty when no split named a layer
+    } phase;
+
     // the MoE cache of the target context (llama_moe_cache_get_stats), read by the main loop when it publishes: the
     // cache's counters are not synchronized with a decode, so no other thread reads them
     bool                  has_moe = false;
@@ -197,6 +204,7 @@ struct server_stats_snapshot {
     // max_tasks: the newest completed tasks to include (< 0 = the whole ring)
     json to_json(int max_tasks = -1) const;
     json disk_json() const;
+    json phase_json() const;
     json moe_json() const;
 };
 
@@ -223,6 +231,8 @@ struct server_stats_snapshot {
     X(step_us,               C) \
     X(decode_n,              C) /* target decodes of the generation (/stats decode.gen)               */ \
     X(decode_us,             C) \
+    X(phase_graphs,          C) /* /stats phase                                                       */ \
+    X(phase_cpu_us,          C) \
     X(publish_n,             C) /* the snapshots' own cost                                            */ \
     X(publish_us,            C) \
     X(n_busy,                G) /* slots processing a task                                            */ \
