@@ -1138,7 +1138,13 @@ void llama_context::moe_prefill_switch(uint32_t n_tokens_all) {
         }
     };
 
-    const bool big = cparams.n_ubatch_prefill > 0 && n_tokens_all > cparams.n_ubatch && !moe_prefill_unfit;
+    // diag: LLAMA_MOE_PREFILL_STAY=N keeps the mode on for a chunk of at least N tokens that follows a large one (the tail
+    // of a prompt longer than n_batch). Without it such a chunk leaves the mode first: the cache comes back, cannot serve
+    // the chunk (it serves ubatches of up to 32 tokens), and the chunk runs on the slow path between the two
+    static const uint32_t stay_min = getenv("LLAMA_MOE_PREFILL_STAY") ? (uint32_t) atoi(getenv("LLAMA_MOE_PREFILL_STAY")) : 0;
+    const bool stay = stay_min > 0 && moe_prefill_mode && n_tokens_all >= stay_min;
+
+    const bool big = cparams.n_ubatch_prefill > 0 && (n_tokens_all > cparams.n_ubatch || stay) && !moe_prefill_unfit;
 
     // a device allocation failed under a graph that read the cache (moe_cache_give_back could not free it then): the cache
     // is given back now, and restored smaller below (or after the prefill)
