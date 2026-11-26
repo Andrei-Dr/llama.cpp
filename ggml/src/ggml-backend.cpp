@@ -1277,6 +1277,8 @@ struct ggml_backend_sched {
     struct ggml_tensor * prefetched[GGML_SCHED_MAX_SPLIT_INPUTS];
     int n_prefetched;
     int prefetch_split;     // the split that reads the prefetched inputs
+    bool prefetch_lookahead; // see ggml_backend_sched_set_prefetch_lookahead
+    uint64_t n_prefetch_lookahead; // readers that had inputs prefetched past a run of splits
     int prefetch_backend_id; // the backend that copies them
 
     // the backend with stream-ordered copies from host compute memory enqueued (see ggml_backend_sched_copy_input), or -1
@@ -2288,21 +2290,41 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
-// the inputs of the next split that are computed on the backend of this split before it, and copied to host memory,
-// are copied before this split computes, so that the next split waits for these copies instead of this split
+// the inputs of a later split that are computed on the backend of this split before it, and copied to host memory,
+// are copied before this split computes, so that the later split waits for these copies instead of this split
 // e.g. a CPU split runs while a GPU split computes, if it reads only the results of the earlier splits
+// The reader is the next split. With the lookahead (ggml_backend_sched_set_prefetch_lookahead) it is the first split on
+// another backend after a run of splits on this backend that read nothing but weights of other backends (e.g. the device
+// chain of a MoE layer that is split between the host and the device: one split per host expert tensor). Weights are
+// uploaded from memory that outlives the graph, so the reader may run on the host while that whole run computes: no
+// upload queued after the copies made here reads host compute memory.
 static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int split_id) {
-    sched->n_prefetched = 0;
-    if (split_id + 1 >= sched->n_splits) {
+    // the copies queued by an earlier split are still to be read
+    if (sched->n_prefetched > 0 && sched->prefetch_split > split_id) {
         return;
     }
+    sched->n_prefetched = 0;
     struct ggml_backend_sched_split * split = &sched->splits[split_id];
-    struct ggml_backend_sched_split * next  = &sched->splits[split_id + 1];
     const int backend_id = split->backend_id;
     ggml_backend_t backend = sched->backends[backend_id];
     if (backend->iface.get_tensor_async == NULL) {
         return;
     }
+
+    int next_id = split_id + 1;
+    while (sched->prefetch_lookahead && next_id < sched->n_splits && sched->splits[next_id].backend_id == backend_id) {
+        const struct ggml_backend_sched_split * between = &sched->splits[next_id];
+        for (int i = 0; i < between->n_inputs; i++) {
+            if (!ggml_backend_sched_is_host_weight(between->inputs[i])) {
+                return;
+            }
+        }
+        next_id++;
+    }
+    if (next_id >= sched->n_splits) {
+        return;
+    }
+    struct ggml_backend_sched_split * next = &sched->splits[next_id];
 
     for (int i = 0; i < next->n_inputs && sched->n_prefetched < GGML_SCHED_MAX_SPLIT_INPUTS; i++) {
         struct ggml_tensor * input = next->inputs[i];
@@ -2320,11 +2342,14 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
             continue;
         }
 
-        // not if this split computes or writes the input
+        // not if this split, or a split between it and the reader, computes or writes the input
         bool written = false;
-        for (int j = 0; j < split->graph.n_nodes && !written; j++) {
-            const struct ggml_tensor * node = split->graph.nodes[j];
-            written = !ggml_is_view_op(node->op) && (node == base || node->view_src == base);
+        for (int k = split_id; k < next_id && !written; k++) {
+            const struct ggml_cgraph * graph = &sched->splits[k].graph;
+            for (int j = 0; j < graph->n_nodes && !written; j++) {
+                const struct ggml_tensor * node = graph->nodes[j];
+                written = !ggml_is_view_op(node->op) && (node == base || node->view_src == base);
+            }
         }
         if (written) {
             continue;
@@ -2343,7 +2368,10 @@ static void ggml_backend_sched_prefetch_inputs(ggml_backend_sched_t sched, int s
     }
 
     if (sched->n_prefetched > 0) {
-        sched->prefetch_split      = split_id + 1;
+        if (next_id > split_id + 1) {
+            sched->n_prefetch_lookahead++;
+        }
+        sched->prefetch_split      = next_id;
         sched->prefetch_backend_id = backend_id;
         ggml_backend_event_record(sched->prefetch_events[backend_id], backend);
     }
@@ -2482,6 +2510,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // uploading split and its target)
     // (nothing is allocated or looked up for the graphs split without the overlap: every decode graph)
     std::vector<bool> ahead_uploaded(sched->upload_ahead_split ? sched->n_splits : 0, false);
+
+    // nothing is prefetched for this graph yet
+    sched->n_prefetched = 0;
 
     // copies left on a stream by the previous graph (its caller synchronizes before it reads results, not necessarily before
     // the next graph writes host memory)
@@ -2815,6 +2846,16 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_prefetch_lookahead(ggml_backend_sched_t sched, bool enable) {
+    GGML_ASSERT(sched);
+    sched->prefetch_lookahead = enable;
+}
+
+uint64_t ggml_backend_sched_get_n_prefetch_lookahead(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_prefetch_lookahead;
 }
 
 void ggml_backend_sched_set_upload_ahead(ggml_backend_sched_t sched, bool enable) {

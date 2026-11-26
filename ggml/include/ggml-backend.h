@@ -408,6 +408,14 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Prefetch lookahead: a split on another backend that follows a run of splits of one backend, each reading nothing
+    // from other backends but weights, has its inputs copied to host memory before the first split of the run computes
+    // (if they are results of earlier splits), so it runs on the host while the whole run computes on the device.
+    // Off by default: only the split right before the reader prefetches its inputs.
+    GGML_API void                 ggml_backend_sched_set_prefetch_lookahead(ggml_backend_sched_t sched, bool enable);
+    // the readers served that way since the scheduler was created
+    GGML_API uint64_t             ggml_backend_sched_get_n_prefetch_lookahead(ggml_backend_sched_t sched);
+
     // Upload / compute overlap for host MoE weights: in the graphs split from now on, the whole weight tensor of a
     // MUL_MAT_ID that routes >= 8 tokens per expert is uploaded on a second stream while the previous split computes.
     // The tensor is resident one split early, so enable it only where the device memory allows (large batches).

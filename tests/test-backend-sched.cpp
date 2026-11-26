@@ -704,6 +704,112 @@ static test_result test_inputless_splits_scheduling(ggml_backend_t gpu, ggml_bac
 }
 
 // Test that all async backends transmit their activations to the following async backend correctly. No user inputs tested.
+// prefetch lookahead (ggml_backend_sched_set_prefetch_lookahead): a CPU node reads a result the device computed before a
+// chain of device splits that read nothing from the host but weights. The value of every node is checked with the
+// lookahead off and on; with it on, the reader's input is copied before the chain where the backend can (see the note).
+//   a  = 1 + 1                 device
+//   h0 = w + w                 CPU      (host compute memory the first chain split reads, like routing ids)
+//   d1 = a + h0                device   chain split 1: reads h0
+//   d2 = d1 + w                device   chain split 2: reads only a host weight
+//   d3 = d2 + w                device   chain split 3: reads only a host weight
+//   h  = a + h1, h1 = w + w    CPU      the reader: a is a result of the split before the chain
+//   m  = d3 + h                device
+static test_result test_prefetch_lookahead(ggml_backend_t gpu, ggml_backend_t cpu, int64_t tensor_len, int n_rounds, bool use_device_host_buft) {
+    const std::vector<ggml_backend_t> backends = { gpu, cpu };
+    const size_t graph_size = 64;
+
+    backend_consts consts(backends, tensor_len);
+
+    // a weight in plain host memory: a device node that reads it starts a new split
+    ggml_init_params params_w = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_w(ggml_init(params_w));
+    ggml_tensor * w = ggml_new_tensor_1d(ctx_w.get(), GGML_TYPE_F32, tensor_len);
+    ggml_set_name(w, "w_host");
+    ggml_backend_buffer_ptr buf_w(ggml_backend_alloc_ctx_tensors(ctx_w.get(), cpu));
+    GGML_ASSERT(buf_w != nullptr);
+    ggml_backend_buffer_set_usage(buf_w.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    {
+        std::vector<float> data(tensor_len, 1.0f);
+        ggml_backend_tensor_set(w, data.data(), 0, ggml_nbytes(w));
+    }
+
+    for (int lookahead = 0; lookahead < 2; lookahead++) {
+        ggml_backend_sched_ptr sched = create_test_scheduler(backends, graph_size, use_device_host_buft);
+        ggml_backend_sched_set_prefetch_lookahead(sched.get(), lookahead != 0);
+
+        for (int round = 0; round < n_rounds; round++) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ graph_size*ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
+                /*.mem_buffer =*/ nullptr,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx(ggml_init(params));
+            ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_size, /*grads =*/ false);
+
+            struct pinned { ggml_tensor * t; ggml_backend_t backend; float expected; };
+            std::vector<pinned> nodes;
+            auto add = [&](ggml_tensor * x, ggml_tensor * y, ggml_backend_t backend, float expected, const char * name) {
+                ggml_tensor * t = ggml_add(ctx.get(), x, y);
+                ggml_set_name(t, name);
+                ggml_build_forward_expand(gf, t);
+                nodes.push_back({ t, backend, expected });
+                return t;
+            };
+            ggml_tensor * a  = add(consts.one[0], consts.one[0], gpu, 2.0f, "a");
+            ggml_tensor * h0 = add(w,  w,  cpu, 2.0f, "h0");
+            ggml_tensor * d1 = add(a,  h0, gpu, 4.0f, "d1");
+            ggml_tensor * d2 = add(d1, w,  gpu, 5.0f, "d2");
+            ggml_tensor * d3 = add(d2, w,  gpu, 6.0f, "d3");
+            ggml_tensor * h1 = add(w,  w,  cpu, 2.0f, "h1");
+            ggml_tensor * h  = add(a,  h1, cpu, 4.0f, "h");
+            ggml_tensor * m  = add(d3, h,  gpu, 10.0f, "m");
+            // only the last node is kept: the host memory of h0 is free for the reader once the chain has its copy
+            ggml_set_output(m);
+
+            if (!backend_supports_op(gpu, a)) {
+                return skip("%s does not support %s", ggml_backend_name(gpu), ggml_op_name(a->op));
+            }
+
+            ggml_backend_sched_reset(sched.get());
+            for (const pinned & n : nodes) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), n.t, n.backend);
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                return fail("failed to allocate the graph");
+            }
+            if (ggml_backend_sched_graph_compute(sched.get(), gf) != GGML_STATUS_SUCCESS) {
+                return fail("failed to compute the graph");
+            }
+
+            std::vector<float> data(tensor_len);
+            ggml_backend_tensor_get(m, data.data(), 0, ggml_nbytes(m));
+            for (int64_t i = 0; i < tensor_len; i++) {
+                if (data[i] != nodes.back().expected) {
+                    return fail("lookahead %d, round %d: m[%" PRId64 "] = %f, expected %f", lookahead, round, i, data[i], nodes.back().expected);
+                }
+            }
+        }
+
+        const uint64_t n_served = ggml_backend_sched_get_n_prefetch_lookahead(sched.get());
+        if (lookahead == 0 && n_served != 0) {
+            return fail("%" PRIu64 " readers served past a run of splits with the lookahead off", n_served);
+        }
+        if (lookahead != 0) {
+            // 0 where the device reads the host weight in place (one chain split) or has no async read
+            note("prefetch lookahead on %s: %" PRIu64 " readers served in %d rounds, %d splits", ggml_backend_name(gpu), n_served, n_rounds, ggml_backend_sched_get_n_splits(sched.get()));
+            if (n_served != 0 && n_served != (uint64_t) n_rounds) {
+                return fail("%" PRIu64 " readers served past a run of splits in %d rounds", n_served, n_rounds);
+            }
+        }
+    }
+
+    return TEST_OK;
+}
+
 static test_result test_chain_all_backends(const std::vector<ggml_backend_t> & backends, int64_t tensor_len, int32_t sleep_us,
         bool use_device_host_buft) {
 
@@ -995,6 +1101,11 @@ int main(int argc, char ** argv) {
                     case_begin("test_inputless_splits_scheduling      %-8s sleep_us = %6d, tensor_len = %4d", name_backend, sleep_us, tensor_len);
                     case_end(test_inputless_splits_scheduling(backend, cpu, tensor_len, sleep_us, use_device_host_buft));
                 }
+            }
+
+            for (int tensor_len : { 2, 4096, 1 << 20 }) {
+                case_begin("test_prefetch_lookahead               %-8s tensor_len = %7d", name_backend, tensor_len);
+                case_end(test_prefetch_lookahead(backend, cpu, tensor_len, 8, use_device_host_buft));
             }
 
             log_maybe("\n");
