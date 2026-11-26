@@ -2299,7 +2299,30 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // a graph that reads the MoE cache keeps it: moe_cache_give_back() refuses while it is being computed
     moe_cache_in_graph = moe_cache && moe_cache->serves(ubatch.n_tokens);
+    // diag: LLAMA_MOE_DIAG_BATCH=N logs, for every graph of N tokens or more, the time until its splits are submitted, the
+    // time until the device is done (a synchronize of its own) and the compute time of its CPU splits
+    static const int diag_batch = getenv("LLAMA_MOE_DIAG_BATCH") ? atoi(getenv("LLAMA_MOE_DIAG_BATCH")) : 0;
+    const bool diag = diag_batch > 0 && (int) ubatch.n_tokens >= diag_batch && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+    const bool diag_timing = cpu_timing;
+    int64_t diag_t0 = 0, diag_cpu0 = 0;
+    uint64_t diag_ahead0 = 0;
+    if (diag) {
+        synchronize();
+        set_cpu_timing(true);
+        diag_ahead0 = ggml_backend_sched_get_n_prefetch_lookahead(sched.get());
+        diag_cpu0 = cpu_time.total_us;
+        diag_t0   = ggml_time_us();
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (diag) {
+        const int64_t t1 = ggml_time_us();
+        synchronize();
+        const int64_t t2 = ggml_time_us();
+        LLAMA_LOG_WARN("%s: diag: graph of %u tokens: submitted in %.2f ms, done in %.2f ms, CPU splits %.2f ms, %llu prefetch lookaheads\n", __func__,
+                ubatch.n_tokens, (t1 - diag_t0)/1000.0, (t2 - diag_t0)/1000.0, (cpu_time.total_us - diag_cpu0)/1000.0,
+                (unsigned long long) (ggml_backend_sched_get_n_prefetch_lookahead(sched.get()) - diag_ahead0));
+        set_cpu_timing(diag_timing);
+    }
     moe_cache_in_graph = false;
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
