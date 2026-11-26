@@ -506,3 +506,69 @@ def test_stats_phase_cpu_only():
     assert p is not None
     assert p["steps"] == s["decode"]["gen"]["n"] and p["graphs"] == p["steps"]
     assert 0 < p["cpu_us"] <= p["step_us"]
+
+
+MOE_HYBRID_PROMPT = " ".join(["Tom and his friend Sam went to the park to fly a big blue kite, but the wind was very strong."] * 3)
+
+
+def moe_hybrid_run(tmp_path, name: str) -> tuple:
+    """a prompt read as one ubatch of 33..127 tokens, a short one, and the first again with a tail: texts, cache counters, log"""
+    global server
+    server = ServerPreset.stories15m_moe()
+    server.server_metrics = True
+    server.n_gpu_layer = 99
+    server.extra_args = ["-ot", "exps=CPU", "--moe-cache-mib", "20", "--moe-cache-cpu-share", "0.95", "-ub", "128", "-b", "128", "-lv", "4"]
+    server.log_path = str(tmp_path / f"{name}.log")
+    server.start()
+    texts = [complete(p, 32)["content"] for p in (MOE_HYBRID_PROMPT, "Once upon a time", MOE_HYBRID_PROMPT + " Then the kite")]
+    m = wait_stats(lambda s: s.get("counters", {}).get("tasks", 0) >= 3)["moe_cache"]
+    server.stop()
+    with open(server.log_path) as f:
+        log = f.read()
+    return texts, m["counters"], log
+
+
+def test_stats_moe_hybrid_is_off_by_default(monkeypatch, tmp_path):
+    if not gpu_devices():
+        pytest.skip("no GPU device: the hybrid needs one to compute a part of the experts")
+    monkeypatch.setenv("GGML_OP_OFFLOAD_MIN_BATCH", "128")
+    monkeypatch.delenv("LLAMA_MOE_HYBRID", raising=False)
+    plain = moe_hybrid_run(tmp_path, "plain")
+    assert "llama_moe_hybrid" not in plain[2]
+    monkeypatch.setenv("LLAMA_MOE_HYBRID", "0")
+    zero = moe_hybrid_run(tmp_path, "zero")
+    assert "llama_moe_hybrid" not in zero[2]
+    assert zero[:2] == plain[:2]
+
+
+def test_stats_moe_hybrid_splits_a_mid_size_ubatch(monkeypatch, tmp_path):
+    # the experts of the prompt ubatch run on both sides, the small ubatches read the MoE cache as before, and two runs agree
+    import re
+    if not gpu_devices():
+        pytest.skip("no GPU device: the hybrid needs one to compute a part of the experts")
+    monkeypatch.setenv("GGML_OP_OFFLOAD_MIN_BATCH", "128")
+    monkeypatch.delenv("LLAMA_MOE_HYBRID", raising=False)
+    plain = moe_hybrid_run(tmp_path, "plain")
+    monkeypatch.setenv("LLAMA_MOE_HYBRID", "1")
+    monkeypatch.setenv("LLAMA_MOE_HYBRID_COSTS", "27,40,2000,0")  # the tiny model has 4 experts per layer: keep some on the CPU
+    a = moe_hybrid_run(tmp_path, "a")
+    b = moe_hybrid_run(tmp_path, "b")
+    m = re.search(r"llama_moe_hybrid: (\d+) layer splits, experts: (\d+) on the CPU, (\d+) uploaded, (\d+) from the MoE cache", a[2])
+    assert m is not None, "no ubatch was split"
+    n_splits, n_cpu, n_upload, n_cached = (int(x) for x in m.groups())
+    assert n_splits > 0 and n_cpu > 0 and n_upload + n_cached > 0
+    assert a[:2] == b[:2], "two runs with the hybrid differ"
+    for key in ("hit", "miss", "miss_cpu", "upload"):
+        assert a[1][key] == plain[1][key], f"the hybrid changed the cache lookups ({key})"
+    assert all(len(t) > 0 for t in a[0])
+
+
+def test_stats_moe_hybrid_leaves_an_offloaded_ubatch_alone(monkeypatch, tmp_path):
+    # with the default offload threshold the device takes the whole ubatch: nothing to split
+    if not gpu_devices():
+        pytest.skip("no GPU device: the hybrid needs one to compute a part of the experts")
+    monkeypatch.delenv("GGML_OP_OFFLOAD_MIN_BATCH", raising=False)
+    monkeypatch.setenv("LLAMA_MOE_HYBRID", "1")
+    run = moe_hybrid_run(tmp_path, "offload")
+    assert "llama_moe_hybrid: ubatches of" in run[2]
+    assert "layer splits" not in run[2]
