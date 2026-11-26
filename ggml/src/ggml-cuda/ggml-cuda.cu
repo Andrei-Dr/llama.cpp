@@ -3513,6 +3513,13 @@ static bool ggml_cuda_graph_debug_enabled() {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    // GGML_CUDA_GRAPH_MAX_BATCH=N: a graph that multiplies more than N tokens at once is not captured (0 or unset: no
+    // limit). A prompt batch is computed once: its executables are captured for nothing when two batches of one size
+    // follow each other, and they hold device memory until they are evicted.
+    static const int64_t max_batch = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_MAX_BATCH");
+        return env != nullptr ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3520,6 +3527,17 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        if (max_batch > 0) {
+            const int64_t n_batch = node->op == GGML_OP_MUL_MAT ? node->ne[1] : node->op == GGML_OP_MUL_MAT_ID ? node->ne[2] : 0;
+            if (n_batch > max_batch) {
+                use_cuda_graph = false;
+                if (ggml_cuda_graph_debug_enabled()) {
+                    GGML_LOG_DEBUG("%s: not capturing a graph of %lld tokens (GGML_CUDA_GRAPH_MAX_BATCH)\n", __func__, (long long) n_batch);
+                }
+                break;
+            }
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
