@@ -29,7 +29,7 @@ struct llama_moe_hybrid_params {
     int64_t n_min         = 33;
     int64_t n_max         = 127;
     float   us_assign     = 27.0f;
-    float   us_cpu_expert = 40.0f;
+    float   us_cpu_expert = 10.0f;
     float   us_gpu_expert = 95.0f;
     float   us_gpu_cached = 10.0f;
 };

@@ -17,7 +17,7 @@ A prompt batch that is too large for the cache (over 32 tokens) and under the of
 |---|---|
 | `LLAMA_MOE_HYBRID=1` | enable the split |
 | `LLAMA_MOE_HYBRID_MIN`, `LLAMA_MOE_HYBRID_MAX` | batch sizes that are split (default: 33 and 127 tokens) |
-| `LLAMA_MOE_HYBRID_COSTS=a,c,g,h` | cost model in microseconds per layer: `a` per routed token on the CPU, `c` per expert on the CPU, `g` per uploaded expert, `h` per expert copied from the cache (default: 27,40,95,10) |
+| `LLAMA_MOE_HYBRID_COSTS=a,c,g,h` | cost model in microseconds per layer: `a` per routed token on the CPU, `c` per expert on the CPU, `g` per uploaded expert, `h` per expert copied from the cache (default: 27,10,95,10) |
 
 The rows of the experts on the CPU use the arithmetic of the CPU backend, the others the arithmetic of the device, as for a cache hit and a miss on the CPU. The split is not used while the cache is suspended (prefill mode), with expert biases, LoRA adapters, or an eval callback.
 
