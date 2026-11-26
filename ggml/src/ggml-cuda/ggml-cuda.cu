@@ -5780,7 +5780,25 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
+            // diag: GGML_CUDA_DIAG_GRAPH=1 logs every capture of a CUDA graph: which ggml graph, and the free device memory
+            // before and after its last executable is instantiated
+            static const bool diag_graph = getenv("GGML_CUDA_DIAG_GRAPH") != nullptr;
+            size_t diag_free0 = 0, diag_free1 = 0, diag_total = 0;
+            if (diag_graph) {
+                const ggml_tensor * n0 = cgraph->nodes[0];
+                const ggml_tensor * n1 = cgraph->nodes[cgraph->n_nodes - 1];
+                CUDA_CHECK(cudaMemGetInfo(&diag_free0, &diag_total));
+                GGML_LOG_WARN("%s: diag: capture: backend %s, key %p, %d nodes, %zu chunks before the last, first %s %s [%lld %lld %lld], last %s %s [%lld %lld %lld], %zu graphs cached, free %.1f MiB\n",
+                        __func__, cuda_ctx->name.c_str(), graph_key, cgraph->n_nodes, n_chunks,
+                        ggml_op_name(n0->op), n0->name, (long long) n0->ne[0], (long long) n0->ne[1], (long long) n0->ne[2],
+                        ggml_op_name(n1->op), n1->name, (long long) n1->ne[0], (long long) n1->ne[1], (long long) n1->ne[2],
+                        cuda_ctx->cuda_graphs.size(), diag_free0/1048576.0);
+            }
             ggml_cuda_graph_launch_chunk(cuda_ctx, graph, n_chunks++);
+            if (diag_graph) {
+                CUDA_CHECK(cudaMemGetInfo(&diag_free1, &diag_total));
+                GGML_LOG_WARN("%s: diag: captured: key %p, free %.1f MiB (%+.1f)\n", __func__, graph_key, diag_free1/1048576.0, ((double) diag_free1 - (double) diag_free0)/1048576.0);
+            }
 
             // drop the chunks left over from a longer graph
             for (size_t i = n_chunks; i < graph->instances.size(); ++i) {
