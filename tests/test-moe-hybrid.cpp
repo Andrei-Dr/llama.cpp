@@ -2,6 +2,7 @@
 
 #include "../src/llama-moe-hybrid.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -10,7 +11,12 @@
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "%s:%d: check failed: %s\n", __FILE__, __LINE__, #cond); exit(1); } } while (0)
 
 static void test_choose_split() {
-    llama_moe_hybrid_params p; // 27, 40, 95, 10
+    // the costs of the cases below, whatever the defaults are
+    llama_moe_hybrid_params p;
+    p.us_assign     = 27.0f;
+    p.us_cpu_expert = 40.0f;
+    p.us_gpu_expert = 95.0f;
+    p.us_gpu_cached = 10.0f;
 
     // nothing routed
     {
