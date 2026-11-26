@@ -1084,6 +1084,15 @@ bool llama_moe_cache::suspended() const {
     return pimpl->suspended;
 }
 
+const int32_t * llama_moe_cache::resident_slots(int32_t il, int32_t & n_slots) const {
+    if (pimpl->suspended || il < 0 || il >= (int32_t) pimpl->layers.size() || pimpl->layers[il].ig < 0) {
+        return nullptr;
+    }
+    const auto & g = pimpl->groups[pimpl->layers[il].ig];
+    n_slots = g.n_slots;
+    return g.lru.slot_map[il];
+}
+
 int64_t llama_moe_cache::max_batch() const {
     return pimpl->max_batch;
 }

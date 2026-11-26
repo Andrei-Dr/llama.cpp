@@ -69,6 +69,11 @@ public:
     bool resume();
     bool suspended() const;
 
+    // the slot map of layer il in host memory: expert e is in the device memory of the cache iff slots[e] < n_slots
+    // nullptr if the layer is not cached or the cache is suspended; valid until the cache is suspended or destroyed, and
+    // only changed by copy()
+    const int32_t * resident_slots(int32_t il, int32_t & n_slots) const;
+
     // whether the graph of a ubatch of n_tokens can read the cache (false for the large ubatches, which only copy from it
     // through copy_experts, and while suspended)
     bool serves(int64_t n_tokens) const;

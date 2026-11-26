@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-moe-hybrid.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -1751,6 +1752,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    moe_hybrid       (params.moe_hybrid),
     hdmd             (model.hdmd.rot.empty() ? nullptr : &model.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
     layer_inp_src    (params.layer_inp_src),
@@ -2550,6 +2552,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // a ubatch that neither reads the MoE cache nor is offloaded may split its experts between the CPU and the device (see llama_moe_hybrid)
+    // not with expert biases: a row that one side skips must stay zero
+    llama_moe_hybrid_lookup hybrid;
+    if (moe_hybrid != nullptr && cache.slots == nullptr && !up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b) {
+        // the expert input is a view, it joins the split of the tensor it views instead of opening the device chain
+        ggml_build_forward_expand(gf, cur);
+        hybrid = moe_hybrid->build_lookup(*this, { il, up_exps, gate_exps, down_exps, gate_up_exps, weight_before_ffn }, selected_experts);
+    }
+
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
@@ -2559,8 +2570,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // the experts selected by mm_ids, up to the down projection, from the MoE cache if cached
     // ids are the selected experts, for the biases and scales
-    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached) {
-        if (!cached && moe_overlap) {
+    // backend: the device that computes the expert matmuls, nullptr to leave them to the scheduler
+    auto build_experts = [&](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, ggml_backend_t backend = nullptr) {
+        // build_lora_mm_id wraps the matmul in a mul when the weight has a per-expert scale
+        auto pin = [&](ggml_tensor * res) {
+            if (backend == nullptr) {
+                return;
+            }
+            ggml_tensor * mm = res->op == GGML_OP_MUL_MAT_ID ? res : res->src[0];
+            GGML_ASSERT(mm != nullptr && mm->op == GGML_OP_MUL_MAT_ID);
+            ggml_backend_sched_set_tensor_backend(sched, mm, backend);
+        };
+
+        if (!cached && backend == nullptr && moe_overlap) {
             // the misses computed on the CPU are built last: the cached experts are in the graph already, the device work
             // of the model that only needs the layer input goes between them (see llm_graph_context::moe_overlap)
             auto overlap = std::move(moe_overlap);
@@ -2573,6 +2595,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
             ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+            pin(gate_up);
             cb(gate_up, "ffn_moe_gate_up", il);
 
             if (gate_up_exps_b) {
@@ -2588,6 +2611,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         } else {
             // separate gate and up path
             up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+            pin(up);
             cb(up, "ffn_moe_up", il);
 
             if (up_exps_b) {
@@ -2597,6 +2621,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
             if (gate_exps) {
                 cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                pin(cur);
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
@@ -2707,6 +2732,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+        pin(experts);
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -2716,12 +2742,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         return experts;
     };
 
-    ggml_tensor * experts = cache.slots == nullptr ?
-        build_experts(cur, selected_experts, nullptr, true) :
-        moe_cache->build_experts(*this, cache, cur, selected_experts,
+    ggml_tensor * experts = nullptr;
+    if (hybrid.backend != nullptr) {
+        // the device chain comes first in the graph: the scheduler queues its uploads and matmuls, then the CPU computes its
+        // experts while the device works. Each side leaves the rows of the other as zero (the device: after the mask)
+        ggml_tensor * dev = build_experts(cur, selected_experts, hybrid.dev_ids, false, hybrid.backend);
+        ggml_build_forward_expand(gf, dev);
+        experts = build_experts(cur, selected_experts, hybrid.cpu_ids, false);
+        ggml_build_forward_expand(gf, experts);
+        // the mask and the sum run on the device after the CPU part: the mask is not an input of the device chain, whose
+        // splits then read nothing from the host but the experts
+        dev = ggml_mul(ctx0, dev, hybrid.mask);
+        ggml_backend_sched_set_tensor_backend(sched, dev, hybrid.backend);
+        cb(dev, "ffn_moe_hyb_masked", il);
+        experts = ggml_add(ctx0, experts, dev);
+        ggml_backend_sched_set_tensor_backend(sched, experts, hybrid.backend);
+        cb(experts, "ffn_moe_down_merged", il);
+    } else if (cache.slots == nullptr) {
+        experts = build_experts(cur, selected_experts, nullptr, true);
+    } else {
+        experts = moe_cache->build_experts(*this, cache, cur, selected_experts,
                 [](ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * mm_ids, bool cached, void * user_data) {
                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
                 }, &build_experts);
+    }
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);

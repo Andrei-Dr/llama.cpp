@@ -625,6 +625,11 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // only the target context: a MTP draft context is not split (not tested there)
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT) {
+            moe_hybrid = llama_moe_hybrid::init_from_env(model);
+        }
+
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size, cparams.moe_cache_cpu_share);
             moe_cache_size_cur = cparams.moe_cache_size;
@@ -825,6 +830,8 @@ void llama_context::sched_new(const sched_params & params) {
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
+    // the CPU experts of a layer the hybrid splits run while its device chain computes
+    ggml_backend_sched_set_prefetch_lookahead(sched.get(), moe_hybrid != nullptr);
     ggml_backend_sched_set_cpu_time(sched.get(), cpu_timing ? &cpu_time : nullptr);
 
     sched_params_cur = params;
@@ -3487,6 +3494,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.moe_hybrid  =*/ moe_hybrid.get(),
         /*.layer_inp_dev =*/ layer_inp_dev,
         /*.layer_inp_src =*/ supports_embd_row() ? cparams.ctx_other->get_layer_inp_dev() : nullptr,
         /*.h_nextn_dev   =*/ cparams.embeddings_nextn_dev ? h_nextn_dev : nullptr,
